@@ -7,13 +7,6 @@ Outputs (in OUTPUT_DIR):
   cohort_clif.parquet   — matches MIMIC data/cohort.parquet schema
   features_clif.parquet — matches MIMIC data/features.parquet schema
 
-Then run the standard pipeline:
-  python 02_preprocess.py \
-      --features data_clif/features_clif.parquet \
-      --cohort   data_clif/cohort_clif.parquet \
-      --output-dir data_clif
-
-  python 04_evaluate.py --data-dir data_clif --results-dir results/clif_validation
 """
 
 import sys
@@ -96,10 +89,7 @@ def identify_suspected_infection(clif_dir: Path, time_window_hours: int = 24) ->
     meds_i = pd.read_parquet(clif_dir / "clif_medication_admin_intermittent.parquet")
     cultures = pd.read_parquet(clif_dir / "clif_microbiology_culture.parquet")
 
-    abx = meds_i[
-        (meds_i["med_group"] == "CMS_sepsis_qualifying_antibiotics") &
-        (meds_i["med_route_category"] == "iv")
-    ][["hospitalization_id", "admin_dttm"]].copy()
+    abx = meds_i[meds_i["med_group"] == "CMS_sepsis_qualifying_antibiotics"][["hospitalization_id", "admin_dttm"]].copy()
 
     blood_cx = cultures[
         (cultures["fluid_category"] == "blood_buffy") &
@@ -192,19 +182,35 @@ def get_demographics(clif_dir: Path, stay_ids: set) -> pd.DataFrame:
 
     demo["gender"] = demo["sex_category"].map({"Male": "M", "Female": "F"})
 
-    def _race(row):
-        eth  = (row["ethnicity_category"] or "").lower()
-        race = (row["race_category"] or "").lower()
-        if eth == "hispanic":
-            return "Hispanic"
-        if "white" in race:
-            return "White"
-        if "black" in race or "african" in race:
-            return "Black or African American"
-        return row["race_category"]
-
-    demo["race"] = demo.apply(_race, axis=1)
+    demo["race"] = demo.apply(
+        lambda r: "Hispanic" if r["ethnicity_category"] == "Hispanic" else r["race_category"],
+        axis=1,
+    )
     return demo[["stay_id", "gender", "race"]]
+
+
+def get_vaso_pretraj(clif_dir: Path, cohort: pd.DataFrame) -> pd.DataFrame:
+    """1 if vasopressin was administered in the 24h before trajectory_start, else 0."""
+    meds = pd.read_parquet(clif_dir / "clif_medication_admin_continuous.parquet")
+    vaso = meds[meds["med_category"] == "vasopressin"][
+        ["hospitalization_id", "admin_dttm"]
+    ].copy()
+    vaso = vaso.rename(columns={"hospitalization_id": "stay_id"})
+    vaso["admin_dttm"] = to_naive_utc(vaso["admin_dttm"])
+
+    bounds = cohort[["stay_id", "trajectory_start"]].copy()
+    bounds["traj_start"] = pd.to_datetime(bounds["trajectory_start"], utc=True).dt.tz_localize(None)
+    vaso = vaso.merge(bounds[["stay_id", "traj_start"]], on="stay_id", how="inner")
+
+    in_window = (
+        (vaso["admin_dttm"] >= vaso["traj_start"] - pd.Timedelta(hours=24)) &
+        (vaso["admin_dttm"] <  vaso["traj_start"])
+    )
+    pretraj_ids = set(vaso.loc[in_window, "stay_id"])
+    return pd.DataFrame({
+        "stay_id": cohort["stay_id"],
+        "vaso_before_traj": cohort["stay_id"].isin(pretraj_ids).astype(int),
+    })
 
 
 def get_weight_at_onset(clif_dir: Path, cohort: pd.DataFrame) -> pd.DataFrame:
@@ -385,6 +391,11 @@ def build_cohort(clif_dir: Path, co: ClifOrchestrator) -> tuple:
     weight_df = get_weight_at_onset(clif_dir, cohort)
     cohort = cohort.merge(weight_df, on="stay_id", how="left")
 
+    print("  Checking vasopressin in 24h before trajectory start...")
+    vaso_pretraj = get_vaso_pretraj(clif_dir, cohort)
+    cohort = cohort.merge(vaso_pretraj, on="stay_id", how="left")
+    cohort["vaso_before_traj"] = cohort["vaso_before_traj"].fillna(0).astype(int)
+
     return cohort, co
 
 
@@ -481,7 +492,7 @@ def add_mbp(grid: pd.DataFrame, clif_dir: Path) -> pd.DataFrame:
 
 def add_ventil(grid: pd.DataFrame, clif_dir: Path) -> pd.DataFrame:
     resp = pd.read_parquet(clif_dir / "clif_respiratory_support.parquet")
-    imv = resp[resp["device_category"].isin(["IMV", "Trach Collar"])][
+    imv = resp[resp["device_category"].isin(["IMV"])][
         ["hospitalization_id", "recorded_dttm"]
     ].copy()
     imv = imv.rename(columns={"hospitalization_id": "stay_id"})
@@ -721,32 +732,48 @@ def add_fluids(grid: pd.DataFrame, clif_dir: Path, cohort: pd.DataFrame) -> pd.D
       mL/hr    → volume = rate × overlap_hours
       mL/kg/hr → volume = rate × weight_kg × overlap_hours (cohort weight; 70 kg fallback)
     Multiple concurrent fluids sum independently.
+    Carry-forward: each dose runs until the next record for that (patient, med_category).
+    Stop signal: mar_action_category == 'stop' OR dose == 0.
+    end_dttm is computed over ALL records (including null-dose stops) so stop events
+    correctly terminate the preceding infusion even when dose is null.
     """
     meds = pd.read_parquet(clif_dir / "clif_medication_admin_continuous.parquet")
-    unit_norm = meds["med_dose_unit"].str.lower().str.strip()
-    fluids = meds[
-        (meds["med_group"] == "fluids_electrolytes") &
-        meds["med_dose"].notna() &
-        unit_norm.isin(["ml/hr", "ml/kg/hr"])
-    ][["hospitalization_id", "admin_dttm", "med_category", "med_dose", "med_dose_unit"]].copy()
 
-    fluids = fluids.rename(columns={"hospitalization_id": "stay_id"})
-    fluids["admin_dttm"] = to_naive_utc(fluids["admin_dttm"])
+    # All fluids_electrolytes records — needed to compute correct end_dttm via shift(-1)
+    all_fl = meds[meds["med_group"] == "fluids_electrolytes"][
+        ["hospitalization_id", "admin_dttm", "med_category",
+         "med_dose", "med_dose_unit", "mar_action_category"]
+    ].copy()
+    all_fl = all_fl.rename(columns={"hospitalization_id": "stay_id"})
+    all_fl["admin_dttm"] = to_naive_utc(all_fl["admin_dttm"])
+    all_fl = all_fl.sort_values(["stay_id", "med_category", "admin_dttm"])
+
+    # end_dttm = next record's admin_dttm within the same (patient, fluid type)
+    all_fl["end_dttm"] = (
+        all_fl.groupby(["stay_id", "med_category"])["admin_dttm"]
+        .shift(-1)
+        .fillna(pd.Timestamp("2100-01-01"))
+    )
+
+    # Terminate at stop records (mar_action_category == 'stop' or dose == 0)
+    action_lo = all_fl["mar_action_category"].str.lower().fillna("").str.strip()
+    is_stop = (action_lo == "stop") | (all_fl["med_dose"].fillna(-1) == 0.0)
+    all_fl.loc[is_stop, "end_dttm"] = all_fl.loc[is_stop, "admin_dttm"]
+
+    # Keep only valid dose records for volume calculation
+    unit_norm = all_fl["med_dose_unit"].str.lower().str.strip()
+    fluids = all_fl[
+        all_fl["med_dose"].notna() &
+        unit_norm.isin(["ml/hr", "ml/kg/hr"]) &
+        ~is_stop
+    ].copy()
 
     # Resolve mL/kg/hr → mL/hr using cohort weight (70 kg if missing)
     weight_map = cohort.set_index("stay_id")["weight"].fillna(_ASSUMED_WEIGHT_KG)
     fluids["weight_kg"] = fluids["stay_id"].map(weight_map).fillna(_ASSUMED_WEIGHT_KG)
     per_kg = fluids["med_dose_unit"].str.lower().str.strip() == "ml/kg/hr"
     fluids.loc[per_kg, "med_dose"] = fluids.loc[per_kg, "med_dose"] * fluids.loc[per_kg, "weight_kg"]
-    fluids = fluids.drop(columns=["med_dose_unit", "weight_kg"])
-
-    fluids = fluids.sort_values(["stay_id", "med_category", "admin_dttm"])
-    fluids["end_dttm"] = (
-        fluids.groupby(["stay_id", "med_category"])["admin_dttm"]
-        .shift(-1)
-        .fillna(pd.Timestamp("2100-01-01"))
-    )
-    fluids.loc[fluids["med_dose"] == 0.0, "end_dttm"] = fluids.loc[fluids["med_dose"] == 0.0, "admin_dttm"]
+    fluids = fluids.drop(columns=["med_dose_unit", "weight_kg", "mar_action_category"])
 
     g = grid[["stay_id", "time_hour", "start_time", "end_time"]]
     f_g = fluids.merge(g, on="stay_id")
@@ -1002,6 +1029,7 @@ def main():
             "first_norepi_time",
             "age", "gender", "race", "weight",
             "sepsis_onset_sofa", "initial_lactate",
+            "vaso_before_traj",
         ]]
         OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
         cohort_out.to_parquet(cohort_path, index=False)
