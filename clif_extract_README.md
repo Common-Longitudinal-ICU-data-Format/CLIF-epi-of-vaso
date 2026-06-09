@@ -1,8 +1,8 @@
 # clif_extract.py
 
-**Purpose:** CLIF 2.1.0 external validation cohort extraction. Identifies septic shock patients from a CLIF dataset and builds hourly feature tables that match the MIMIC-IV pipeline schema, enabling the trained FQI policy to be evaluated on external data without retraining.
+**Purpose:** CLIF 2.1.0 cohort extraction. Identifies septic shock patients from a CLIF site and builds hourly feature tables.
 
-Outputs drop into `data_clif/` and are consumed directly by `02_preprocess.py` and `04_evaluate.py`.
+Outputs drop into `data_clif/`.
 
 ---
 
