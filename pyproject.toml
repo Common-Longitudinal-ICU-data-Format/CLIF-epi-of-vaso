@@ -1,0 +1,17 @@
+[project]
+name = "clif-epi-of-vaso"
+version = "0.1.0"
+description = "Federated multi-site analysis of vasopressin initiation patterns in septic shock (CLIF 2.1.0)"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "clifpy>=0.3.0",
+    "pandas>=2.0.0",
+    "numpy>=2.0.0",
+    "pyarrow>=10.0.0",
+    "matplotlib>=3.10.0",
+    "scikit-learn>=1.3.0",
+]
+
+[tool.uv]
+package = false

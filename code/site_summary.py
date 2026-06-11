@@ -4,12 +4,12 @@ analysis/site_summary.py
 
 Federated-safe aggregate summary for a septic shock cohort.
 
-Reads:
-  Data/<DATASET>/cohort.parquet
-  Data/<DATASET>/features.parquet
-  Data/<DATASET>/cohort_filter_counts.csv
+Reads (PHI, local only):
+  output/patient_level_data_<SITE>/cohort.parquet
+  output/patient_level_data_<SITE>/features.parquet
+  output/patient_level_data_<SITE>/cohort_filter_counts.csv
 
-Writes only aggregate CSVs to outputs/<DATASET>/ — no patient-level data leaves the site.
+Writes only aggregate CSVs to output/upload_to_box_<SITE>/ — no patient-level data leaves the site.
 
 Privacy guarantees
   - No row-level values, identifiers, free text, or exact dates in any output.
@@ -24,8 +24,8 @@ Outcome for analyses 4 and 5
   Threshold selected by max Youden's J on TRAIN split; carried unchanged to val/test.
 
 Usage:
-    python analysis/site_summary.py --dataset ucmc
-    python code/site_summary.py
+    uv run python code/site_summary.py
+    (site is read from config/config.py — SITE_NAME)
 """
 
 import sys
@@ -57,9 +57,13 @@ _cfg = _load_site_config()
 if _cfg is None:
     raise SystemExit(
         "ERROR: config/config.py not found.\n"
-        "Copy config/config.example.py to config/config.py and set SITE_NAME, CLIF_DIR, OUTPUT_DIR."
+        "Copy config/config.example.py to config/config.py and set SITE_NAME, CLIF_DIR, OUTPUT_ROOT."
     )
-SITE_NAME = getattr(_cfg, "SITE_NAME", "UCMC")
+SITE_NAME   = getattr(_cfg, "SITE_NAME", "UCMC")
+OUTPUT_ROOT = getattr(_cfg, "OUTPUT_ROOT", None)
+if OUTPUT_ROOT is None:
+    raise SystemExit("ERROR: OUTPUT_ROOT is not set in config/config.py.")
+OUTPUT_ROOT = Path(OUTPUT_ROOT)
 
 RANDOM_SEED      = 42
 TRAIN_FRAC       = 0.70
@@ -592,8 +596,9 @@ def write_readme():
 def main():
     global INPUT_DIR, OUTPUT_DIR
 
-    INPUT_DIR  = BASE_DIR / "Data"   / SITE_NAME
-    OUTPUT_DIR = BASE_DIR / "output" / SITE_NAME
+    # Read patient-level intermediate (PHI, local); write shareable aggregates.
+    INPUT_DIR  = OUTPUT_ROOT / "output" / f"patient_level_data_{SITE_NAME}"
+    OUTPUT_DIR = OUTPUT_ROOT / "output" / f"upload_to_box_{SITE_NAME}"
 
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     print(f"Site:   {SITE_NAME}")

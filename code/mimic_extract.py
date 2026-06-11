@@ -2,9 +2,9 @@
 
 Reads from the existing DuckDB built in rl-clinical-concordance.
 Uses the same SQL templates as that project so the output schema
-matches Data/UCMC/ exactly.
+matches the CLIF patient_level_data extracts exactly.
 
-Outputs (in Data/MIMIC/):
+Outputs (in output/patient_level_data_MIMIC/):
   cohort.parquet          — cohort demographics and outcomes
   features.parquet        — hourly feature time series
   cohort_filter_counts.csv — patient counts at each filter step
@@ -35,8 +35,8 @@ SQL_DIR = Path(
     r"C:\Users\hhieromnimon\Box\Research\rl-clinical-concordance\0_MIMIC_RAW_ABLATION\sql"
 )
 
-# Default output location
-DEFAULT_OUT = Path(__file__).parent.parent / "Data" / "MIMIC"
+# Default output location — patient-level (PHI) intermediate, local only
+DEFAULT_OUT = Path(__file__).parent.parent / "output" / "patient_level_data_MIMIC"
 
 # Template variables (match OVISS defaults)
 TEMPLATE_VARS = {

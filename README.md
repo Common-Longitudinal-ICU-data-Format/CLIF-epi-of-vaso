@@ -39,7 +39,7 @@ The [clifpy](https://common-longitudinal-icu-data-format.github.io/clifpy/) pack
 
 ## Expected Results
 
-Final aggregate outputs (no patient-level data) are written to `output/<SITE>/`. The following files are produced per site:
+Final aggregate outputs (no patient-level data) are written to `output/upload_to_box_<SITE>/` — **this is the only folder you share**. Patient-level intermediate files stay in `output/patient_level_data_<SITE>/` and never leave the site. The following files are produced per site:
 
 | File | Contents | Source script |
 |------|----------|---------------|
@@ -58,48 +58,51 @@ Final aggregate outputs (no patient-level data) are written to `output/<SITE>/`.
 
 ## Detailed instructions for running the project
 
-### 1. Configure `config.py`
+### 1. Configure `config/config.py`
 
 ```bash
-cp config/config.example.py config.py
-# Edit config.py: set CLIF_DIR and OUTPUT_DIR for your site
+cp config/config.example.py config/config.py
+# Edit config/config.py: set CLIF_DIR and OUTPUT_ROOT for your site
 ```
 
-See [`config/README.md`](config/README.md) for details.
+The scripts create two per-site subfolders under `<OUTPUT_ROOT>/output/` automatically:
+`patient_level_data_<SITE>/` (PHI intermediate — never shared) and
+`upload_to_box_<SITE>/` (aggregates to share). See [`config/README.md`](config/README.md) for details.
 
 ### 2. Set up the Python environment
 
 ```bash
-pip install -r requirements.txt
-# or with uv:
 uv sync
 ```
+
+This creates `.venv/` from `pyproject.toml` and the pinned `uv.lock`. Prefix the
+commands below with `uv run` to use it.
 
 ### 3. Extract cohort data
 
 ```bash
-python code/clif_extract.py
+uv run python code/clif_extract.py
 ```
 
-Writes intermediate files to `Data/<SITE>/`: `cohort.parquet`, `features.parquet`, `cohort_filter_counts.csv`.
+Writes patient-level intermediate files to `output/patient_level_data_<SITE>/`: `cohort.parquet`, `features.parquet`, `cohort_filter_counts.csv`. **These never leave the site.**
 
 ### 4. Run federated summary (site_summary.py)
 
 ```bash
-python code/site_summary.py --dataset ucmc
+uv run python code/site_summary.py
 ```
 
-Writes aggregate CSVs to `output/<SITE>/`. **Share only these files** — not the raw parquet data.
+Writes aggregate CSVs to `output/upload_to_box_<SITE>/`. **Share only this folder** — not the patient-level parquet data. (The site is read from `SITE_NAME` in `config/config.py`.)
 
 ### 5. Run threshold analysis at your site (site_threshold_sweep.py)
 
 Each site runs this locally (it reads the intermediate parquet files, not the aggregate CSVs):
 
 ```bash
-python code/site_threshold_sweep.py --dataset ucmc
+uv run python code/site_threshold_sweep.py
 ```
 
-Writes `output/<SITE>/threshold_comparison_table.csv`, `output/<SITE>/patient_level_table.csv`, and plots to `output/<SITE>/plots/`. **Share these files** along with the outputs from step 4.
+Writes `threshold_comparison_table.csv`, `patient_level_table.csv`, and `plots/` to `output/upload_to_box_<SITE>/`. **Share this folder** along with the outputs from step 4.
 
 
 
@@ -115,15 +118,15 @@ See [`code/README.md`](code/README.md) for full script documentation.
 │   ├── site_threshold_sweep.py          # Per-feature threshold sweep (run at each site)
 │   ├── cross_site_vasopressin_analysis.py  # Cross-site combined analysis (coordinating site)
 │   └── README.md
-├── config/                      # Configuration templates
-│   ├── config.example.py        # Copy to config.py and fill in site paths
+├── config/                      # Configuration
+│   ├── config.example.py        # Copy to config/config.py and fill in site paths
+│   ├── config.py                # Site-specific config (gitignored, copy from example)
 │   └── README.md
 ├── docs/                        # Documentation
 │   └── clif_extract.md          # CLIF extraction script reference
-├── output/                      # Generated outputs (gitignored)
-│   └── <SITE>/                  # Aggregate results per site
-├── Data/                        # Local cohort data (gitignored, never share)
-│   └── <SITE>/
-├── config.py                    # Site-specific config (gitignored, copy from config/)
-└── requirements.txt
+├── output/                      # Generated outputs (gitignored), created under OUTPUT_ROOT
+│   ├── patient_level_data_<SITE>/   # PHI intermediate (cohort/features) — NEVER share
+│   └── upload_to_box_<SITE>/        # Aggregate results per site — share this folder
+├── pyproject.toml               # Dependencies and project metadata
+└── uv.lock                      # Pinned, reproducible dependency versions
 ```

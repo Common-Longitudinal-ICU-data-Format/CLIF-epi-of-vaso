@@ -1,9 +1,9 @@
 # config.example.py
 #
-# Copy this file to config.py (at the repo root) and fill in your site's paths.
-# code/clif_extract.py automatically loads config.py at startup.
+# Copy this file to config/config.py and fill in your site's paths.
+# The analysis scripts automatically load config/config.py at startup.
 #
-# Only CLIF_DIR and OUTPUT_DIR need to change per site.
+# Only CLIF_DIR and OUTPUT_ROOT need to change per site.
 # All other values reflect the OVISS inclusion criteria and
 # should remain at their defaults unless your protocol differs.
 
@@ -11,17 +11,20 @@ from pathlib import Path
 
 # --- Required: set these for your site ---
 
-# Short identifier for your site — used as the output folder name (e.g. output/UCMC/)
+# Short identifier for your site — used in the per-site output folder names
+# (e.g. output/patient_level_data_UCMC/, output/upload_to_box_UCMC/)
 SITE_NAME = "UCMC"
 
 # Root directory containing all CLIF 2.1.0 parquet files
 CLIF_DIR = Path("/path/to/your/clif/2.1.0")
 # e.g. Windows: Path(r"C:\data\clif\2.1.0")
 
-# Directory where intermediate cohort/features parquet files will be written
-# Convention: Data/<SITE_NAME>/ inside the project repo
-OUTPUT_DIR = Path("/path/to/your/project/Data/UCMC")
-# e.g. Windows: Path(r"C:\projects\epi-of-vaso\Data\UCMC")
+# Root directory for all generated outputs. The scripts create two subfolders
+# under <OUTPUT_ROOT>/output/ automatically:
+#   patient_level_data_<SITE_NAME>/  — PHI intermediate (cohort/features); NEVER shared
+#   upload_to_box_<SITE_NAME>/       — aggregate CSVs + plots; share these for federation
+OUTPUT_ROOT = Path("/path/to/your/project")
+# e.g. Windows: Path(r"C:\projects\epi-of-vaso")
 
 # --- Optional: adjust only if your protocol differs ---
 

@@ -4,30 +4,35 @@ Site-specific configuration for CLIF extraction.
 
 ## Setup
 
-Copy `config.example.py` to `config.py` at the **repo root** and fill in your paths:
+Copy `config.example.py` to `config.py` **in this directory** and fill in your paths:
 
 ```bash
-cp config/config.example.py config.py
+cp config/config.example.py config/config.py
 ```
 
-Then edit `config.py`:
+Then edit `config/config.py`:
 
 ```python
 # Root directory containing your CLIF 2.1.0 parquet files
 CLIF_DIR = Path(r"C:\path\to\your\clif\2.1.0")
 
-# Output directory for cohort and features parquet files
-OUTPUT_DIR = Path(r"C:\path\to\your\project\Data\UCMC")
+# Root for all generated outputs (the scripts create the subfolders below)
+OUTPUT_ROOT = Path(r"C:\path\to\your\project")
 ```
 
-`config.py` is gitignored — it stays local and is never committed.
+The scripts create two per-site subfolders under `<OUTPUT_ROOT>/output/`:
+
+- `patient_level_data_<SITE_NAME>/` — PHI intermediate (cohort/features parquet); **never shared**
+- `upload_to_box_<SITE_NAME>/` — aggregate CSVs + plots; **share this folder** for federation
+
+`config/config.py` is gitignored — it stays local and is never committed.
 
 ## Variables
 
 | Variable | Required | Default | Description |
 |----------|----------|---------|-------------|
 | `CLIF_DIR` | Yes | — | Root of CLIF 2.1.0 parquet tables |
-| `OUTPUT_DIR` | Yes | — | Where cohort/features parquet files are written |
+| `OUTPUT_ROOT` | Yes | — | Root for generated outputs; per-site subfolders are created under `output/` |
 | `TIMEZONE` | No | `"UTC"` | Timezone for datetime parsing |
 | `TRAJECTORY_HOURS` | No | `120` | Max trajectory length per patient |
 | `NE_WINDOW_HOURS` | No | `24` | Hours from ICU admit for NE start |

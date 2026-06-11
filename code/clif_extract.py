@@ -3,7 +3,7 @@
 """
 CLIF 2.1.0 external validation: cohort identification and hourly feature extraction.
 
-Outputs (in OUTPUT_DIR):
+Outputs (in OUTPUT_ROOT/output/patient_level_data_<SITE_NAME>/ — PHI, local only):
   cohort.parquet          — cohort demographics and outcomes
   features.parquet        — hourly feature time series
   cohort_filter_counts.csv — patient counts at each filter step
@@ -52,8 +52,9 @@ def _load_site_config():
 # ---------------------------------------------------------------------------
 # Configuration — defaults (override in config/config.py, copied from config.example.py)
 # ---------------------------------------------------------------------------
-CLIF_DIR   = None   # REQUIRED — set in config.py
-OUTPUT_DIR = None   # REQUIRED — set in config.py
+CLIF_DIR    = None   # REQUIRED — set in config/config.py
+OUTPUT_ROOT = None   # REQUIRED — set in config/config.py
+SITE_NAME   = "UCMC"
 TIMEZONE = "UTC"
 TRAJECTORY_HOURS = 120
 NE_WINDOW_HOURS = 24   # NE must start within 24h of ICU admit
@@ -75,7 +76,7 @@ VASOPRESSOR_CATEGORIES = [
 _cfg = _load_site_config()
 if _cfg is not None:
     for _k in (
-        "CLIF_DIR", "OUTPUT_DIR", "TIMEZONE", "TRAJECTORY_HOURS",
+        "CLIF_DIR", "OUTPUT_ROOT", "SITE_NAME", "TIMEZONE", "TRAJECTORY_HOURS",
         "NE_WINDOW_HOURS", "MIN_NE_RECORDS", "SOFA_THRESHOLD",
         "LACTATE_THRESHOLD", "MAP_THRESHOLD",
         "STEROID_CATEGORIES", "VASOPRESSOR_CATEGORIES",
@@ -85,11 +86,16 @@ if _cfg is not None:
     del _k
 del _cfg
 
-if CLIF_DIR is None or OUTPUT_DIR is None:
+if CLIF_DIR is None or OUTPUT_ROOT is None:
     sys.exit(
-        "ERROR: CLIF_DIR and OUTPUT_DIR are not configured.\n"
+        "ERROR: CLIF_DIR and OUTPUT_ROOT are not configured.\n"
         "Copy config/config.example.py to config/config.py and set your site-specific paths."
     )
+
+# Patient-level (PHI) intermediate outputs — stay local, NEVER shared.
+# site_summary.py / site_threshold_sweep.py read from here and write the
+# shareable aggregates to output/upload_to_box_<SITE_NAME>/.
+PATIENT_LEVEL_DIR = OUTPUT_ROOT / "output" / f"patient_level_data_{SITE_NAME}"
 
 
 # ---------------------------------------------------------------------------
@@ -1058,13 +1064,13 @@ def build_features(cohort: pd.DataFrame, co: ClifOrchestrator, clif_dir: Path) -
 # Main
 # ---------------------------------------------------------------------------
 def main():
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    PATIENT_LEVEL_DIR.mkdir(parents=True, exist_ok=True)
 
     co = ClifOrchestrator(
         data_directory=str(CLIF_DIR),
         filetype="parquet",
         timezone=TIMEZONE,
-        output_directory=str(OUTPUT_DIR),
+        output_directory=str(PATIENT_LEVEL_DIR),
     )
 
     print("=" * 60)
@@ -1083,11 +1089,11 @@ def main():
         "sepsis_onset_sofa", "initial_lactate",
         "vaso_before_traj",
     ]]
-    cohort_path = OUTPUT_DIR / "cohort.parquet"
+    cohort_path = PATIENT_LEVEL_DIR / "cohort.parquet"
     cohort_out.to_parquet(cohort_path, index=False)
     print(f"Saved {cohort_path}")
 
-    filter_csv = OUTPUT_DIR / "cohort_filter_counts.csv"
+    filter_csv = PATIENT_LEVEL_DIR / "cohort_filter_counts.csv"
     pd.DataFrame(filter_log).to_csv(filter_csv, index=False)
     print(f"Saved {filter_csv}")
 
@@ -1102,12 +1108,12 @@ def main():
     print(f"  MBP missing: {features['mbp'].isna().mean():.1%}")
     print(f"  SOFA mean: {features['sofa'].mean():.1f}")
 
-    features.to_parquet(OUTPUT_DIR / "features.parquet", index=False)
-    print(f"Saved {OUTPUT_DIR / 'features.parquet'}")
+    features.to_parquet(PATIENT_LEVEL_DIR / "features.parquet", index=False)
+    print(f"Saved {PATIENT_LEVEL_DIR / 'features.parquet'}")
 
-    print("\nDone. Outputs written to:")
-    print(f"  {OUTPUT_DIR / 'cohort.parquet'}")
-    print(f"  {OUTPUT_DIR / 'features.parquet'}")
+    print("\nDone. Patient-level outputs (local only) written to:")
+    print(f"  {PATIENT_LEVEL_DIR / 'cohort.parquet'}")
+    print(f"  {PATIENT_LEVEL_DIR / 'features.parquet'}")
 
 
 if __name__ == "__main__":

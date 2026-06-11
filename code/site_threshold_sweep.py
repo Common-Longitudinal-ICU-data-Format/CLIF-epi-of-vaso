@@ -2,8 +2,9 @@
 site_threshold_sweep.py
 
 Per-feature threshold sweep predicting clinician vasopressin action (action_vaso).
-Run at each site — reads the site's intermediate parquet files, writes aggregate
-CSV and plot outputs to output/<DATASET>/ for sharing with the coordinating site.
+Run at each site — reads the site's intermediate parquet files from
+output/patient_level_data_<SITE>/, writes aggregate CSV and plot outputs to
+output/upload_to_box_<SITE>/ for sharing with the coordinating site.
 
 Optionally compares against an RL policy if a trained FQI model is available.
 
@@ -19,15 +20,15 @@ Additional analyses:
   - Feature-action density (requires --model for RL curve)
   - Decision tree fidelity curve (depth 1-6 vs agreement with clinician)
 
-Outputs (in output/<DATASET>/):
+Outputs (in output/upload_to_box_<SITE>/):
   - threshold_sweep.png
   - decision_tree_fidelity.png
   - threshold_comparison_table.csv
   - patient_level_table.csv
 
 Usage:
-    python code/site_threshold_sweep.py
-    python code/site_threshold_sweep.py --model path/to/fqi_model.pkl
+    uv run python code/site_threshold_sweep.py
+    uv run python code/site_threshold_sweep.py --model path/to/fqi_model.pkl
 """
 import argparse
 import pickle
@@ -49,9 +50,8 @@ from sklearn.metrics import roc_auc_score, cohen_kappa_score, confusion_matrix
 # ---------------------------------------------------------------------------
 
 BASE     = Path(__file__).parent
-DATA_DIR = BASE.parent / "Data"
 
-# Load SITE_NAME from config/config.py (by file path, not import, so the
+# Load config from config/config.py (by file path, not import, so the
 # config/ directory is not mistaken for an empty namespace package)
 def _load_site_config():
     import importlib.util as _ilu
@@ -67,9 +67,17 @@ _cfg = _load_site_config()
 if _cfg is None:
     raise SystemExit(
         "ERROR: config/config.py not found.\n"
-        "Copy config/config.example.py to config/config.py and set SITE_NAME, CLIF_DIR, OUTPUT_DIR."
+        "Copy config/config.example.py to config/config.py and set SITE_NAME, CLIF_DIR, OUTPUT_ROOT."
     )
-SITE_NAME = getattr(_cfg, "SITE_NAME", "UCMC")
+SITE_NAME   = getattr(_cfg, "SITE_NAME", "UCMC")
+OUTPUT_ROOT = getattr(_cfg, "OUTPUT_ROOT", None)
+if OUTPUT_ROOT is None:
+    raise SystemExit("ERROR: OUTPUT_ROOT is not set in config/config.py.")
+OUTPUT_ROOT = Path(OUTPUT_ROOT)
+
+# Patient-level intermediate (PHI, local); shareable aggregates go to upload_to_box.
+PATIENT_LEVEL_DIR = OUTPUT_ROOT / "output" / f"patient_level_data_{SITE_NAME}"
+UPLOAD_DIR        = OUTPUT_ROOT / "output" / f"upload_to_box_{SITE_NAME}"
 
 # (column_name, display_label, is_binary)
 ANALYSIS_FEATURES = [
@@ -714,13 +722,13 @@ def main():
     ap.add_argument("--model", default=None,
                     help="Path to fqi_model.pkl for RL comparison (optional)")
     ap.add_argument("--out-dir", default=None,
-                    help="Output directory (default: output/<SITE_NAME>/)")
+                    help="Output directory (default: output/upload_to_box_<SITE_NAME>/)")
     args = ap.parse_args()
 
-    feat_path = DATA_DIR / SITE_NAME / "features.parquet"
-    coh_path  = DATA_DIR / SITE_NAME / "cohort.parquet"
+    feat_path = PATIENT_LEVEL_DIR / "features.parquet"
+    coh_path  = PATIENT_LEVEL_DIR / "cohort.parquet"
 
-    out_dir = Path(args.out_dir) if args.out_dir else BASE.parent / "output" / SITE_NAME
+    out_dir = Path(args.out_dir) if args.out_dir else UPLOAD_DIR
     out_dir.mkdir(parents=True, exist_ok=True)
     (out_dir / "plots").mkdir(exist_ok=True)
 

@@ -7,7 +7,7 @@ Data/
 output/
 logs/
 
-# Local config (copy config/config.example.py to config.py at repo root)
+# Local config (copy config/config.example.py to config/config.py)
 config.py
 
 # Python

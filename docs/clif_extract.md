@@ -2,7 +2,7 @@
 
 **Purpose:** CLIF 2.1.0 cohort extraction. Identifies septic shock patients from a CLIF site and builds hourly feature tables.
 
-Outputs drop into `Data/UCMC/` (configured via `OUTPUT_DIR` in `config.py`):
+Outputs drop into `<OUTPUT_ROOT>/output/patient_level_data_<SITE>/` (patient-level / PHI — never shared):
 - `cohort.parquet` — one row per patient, cohort-level columns
 - `features.parquet` — one row per patient-hour, hourly features
 - `cohort_filter_counts.csv` — patient counts at each inclusion filter step
@@ -33,28 +33,28 @@ Expected at `CLIF_DIR` (edit at top of script). Required tables:
 ### 2. Python environment
 
 ```bash
-pip install -r requirements.txt
+uv sync
 ```
 
 ---
 
 ## Configuration
 
-Copy `config/config.example.py` to `config.py` (repo root) and fill in your site's paths — this is the **only file you need to edit**:
+Copy `config/config.example.py` to `config/config.py` and fill in your site's paths — this is the **only file you need to edit**:
 
 ```bash
-cp config/config.example.py config.py
-# then open config.py and set CLIF_DIR and OUTPUT_DIR
+cp config/config.example.py config/config.py
+# then open config/config.py and set CLIF_DIR and OUTPUT_ROOT
 ```
 
-`clif_extract.py` automatically loads `config.py` at startup and will exit with a clear error if `CLIF_DIR` or `OUTPUT_DIR` are missing.
+`clif_extract.py` automatically loads `config/config.py` at startup and will exit with a clear error if `CLIF_DIR` or `OUTPUT_ROOT` are missing.
 
 All other parameters reflect the OVISS inclusion criteria and should not need adjustment.
 
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `CLIF_DIR` | *(set per site)* | Root directory of CLIF parquet files |
-| `OUTPUT_DIR` | *(set per site)* | Where outputs are written |
+| `OUTPUT_ROOT` | *(set per site)* | Root for outputs; scripts create `output/patient_level_data_<SITE>/` and `output/upload_to_box_<SITE>/` under it |
 | `TRAJECTORY_HOURS` | 120 | Maximum trajectory length (hours) |
 | `NE_WINDOW_HOURS` | 24 | NE must start within this many hours of ICU admit |
 | `MIN_NE_RECORDS` | 2 | Minimum NE administration records required |
@@ -66,12 +66,12 @@ All other parameters reflect the OVISS inclusion criteria and should not need ad
 ## Usage
 
 ```bash
-python code/clif_extract.py
+uv run python code/clif_extract.py
 ```
 
 No arguments. The script runs Phase A (cohort) then Phase B (features) sequentially.
 
-If `cohort.parquet` already exists in `OUTPUT_DIR` and has all required columns, Phase A is skipped and the cached cohort is used directly.
+If `cohort.parquet` already exists in `output/patient_level_data_<SITE>/` and has all required columns, Phase A is skipped and the cached cohort is used directly.
 
 
 ## Phase A: Cohort identification
@@ -175,8 +175,8 @@ A per-patient hourly grid is built from `time_hour = 0` (trajectory start / shoc
 
 ## Notes for federated sites
 
-- Update `CLIF_DIR` and `OUTPUT_DIR` at the top of the script.
+- Update `CLIF_DIR` and `OUTPUT_ROOT` in `config/config.py`.
 - All other parameters match OVISS inclusion criteria and should not need adjustment.
-- Phase A is cached: if `cohort.parquet` already exists in `OUTPUT_DIR` with all required columns, it will not be rebuilt. `cohort_filter_counts.csv` is only written on a fresh build.
+- Phase A is cached: if `cohort.parquet` already exists in `output/patient_level_data_<SITE>/` with all required columns, it will not be rebuilt. `cohort_filter_counts.csv` is only written on a fresh build.
 - `gcs` is gracefully skipped if `clif_patient_assessments.parquet` is absent.
 - `ne_mar_action` / `vaso_mar_action` are NaN-filled if no MAR action column is present in your continuous meds table.
