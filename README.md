@@ -50,14 +50,6 @@ Final aggregate outputs (no patient-level data) are written to `output/UCMC/` (C
 | `feature_thresholds_youden.csv` | Per-feature threshold performance (AUC, sens, spec) |
 | `feature_roc_curves.csv` | ROC curve points on fixed grid for coordinating-site replot |
 
-> [!WARNING]
-> **Never upload patient-level data to Box.** Only **aggregate** results may be placed in
-> `output/` and shared with the project PI / consortium:
-> - No `patient_id`, `stay_id`, or any row-level records.
-> - Minimum cell size **n ≥ 11** for every reported statistic (cells with n < 11 are suppressed).
-> - No raw `.parquet` / patient-level data files.
->
-> See `output/README.md` for details.
 
 ## Detailed instructions for running the project
 
