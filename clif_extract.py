@@ -948,12 +948,6 @@ def add_hourly_sofa(grid: pd.DataFrame, co: ClifOrchestrator) -> pd.DataFrame:
     )
     _add_missing_med_cols(co)
 
-    # Drop string columns that DuckDB can't aggregate numerically
-    str_cols = [c for c in co.wide_df.columns
-                if co.wide_df[c].dtype == object and c != "hospitalization_id"]
-    if str_cols:
-        co.wide_df = co.wide_df.drop(columns=str_cols)
-
     sofa_scores = co.compute_sofa_scores(
         wide_df=co.wide_df,
         id_name="hospitalization_id",
