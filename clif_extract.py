@@ -4,8 +4,9 @@
 CLIF 2.1.0 external validation: cohort identification and hourly feature extraction.
 
 Outputs (in OUTPUT_DIR):
-  cohort_clif.parquet   — matches MIMIC data/cohort.parquet schema
-  features_clif.parquet — matches MIMIC data/features.parquet schema
+  cohort.parquet          — cohort demographics and outcomes
+  features.parquet        — hourly feature time series
+  cohort_filter_counts.csv — patient counts at each filter step
 
 """
 
@@ -425,6 +426,14 @@ def build_cohort(clif_dir: Path, co: ClifOrchestrator) -> tuple:
         (cohort["trajectory_end"] - cohort["trajectory_start"])
         .dt.total_seconds() / 3600
     ).clip(lower=0).astype(int)
+
+    _dt = to_naive_utc(pd.to_datetime(cohort["deathtime"], utc=True))
+    _ts = to_naive_utc(pd.to_datetime(cohort["trajectory_start"], utc=True))
+    cohort["death_hour"] = (
+        ((_dt - _ts).dt.total_seconds() / 3600)
+        .where(cohort["hospital_death"] == 1)
+        .apply(lambda x: float(int(x)) if pd.notna(x) else float("nan"))
+    )
 
     # Rename sofa to sepsis_onset_sofa (already on cohort from step 4)
     if "sofa_total" in cohort.columns:
@@ -1019,21 +1028,9 @@ def build_features(cohort: pd.DataFrame, co: ClifOrchestrator, clif_dir: Path) -
     grid["action_vaso"] = (grid["vaso_dose"] > 0).astype(int)
 
     # death: 1 only at the epoch during which the patient died
-    death_info = cohort[["stay_id", "hospital_death", "deathtime", "trajectory_start"]].copy()
-    death_info["_dt"] = to_naive_utc(pd.to_datetime(death_info["deathtime"], utc=True))
-    death_info["_ts"] = to_naive_utc(pd.to_datetime(death_info["trajectory_start"], utc=True))
-    death_info["_death_hour"] = (
-        (death_info["_dt"] - death_info["_ts"]).dt.total_seconds() / 3600
-    ).where(death_info["hospital_death"] == 1).apply(
-        lambda x: float(int(x)) if pd.notna(x) else float("nan")
-    )
-    grid = grid.merge(
-        death_info[["stay_id", "_death_hour"]], on="stay_id", how="left"
-    )
-    grid["death"] = (
-        grid["time_hour"] == grid["_death_hour"]
-    ).astype(int)
-    grid = grid.drop(columns=["_death_hour"])
+    grid = grid.merge(cohort[["stay_id", "death_hour"]], on="stay_id", how="left")
+    grid["death"] = (grid["time_hour"] == grid["death_hour"]).astype(int)
+    grid = grid.drop(columns=["death_hour"])
 
     grid = grid.drop(columns=["start_time", "end_time"])
     grid = grid.sort_values(["stay_id", "time_hour"]).reset_index(drop=True)
@@ -1054,47 +1051,29 @@ def main():
         output_directory=str(OUTPUT_DIR),
     )
 
-    cohort_path = OUTPUT_DIR / "cohort_clif.parquet"
-    _REQUIRED_COLS = {"age", "gender", "race", "sepsis_onset_sofa", "initial_lactate"}
+    print("=" * 60)
+    print("PHASE A: COHORT IDENTIFICATION")
+    print("=" * 60)
+    cohort, co, filter_log = build_cohort(CLIF_DIR, co)
 
-    _rebuild = True
-    if cohort_path.exists():
-        print("PHASE A: loading cached cohort...")
-        cohort_out = pd.read_parquet(cohort_path)
-        if _REQUIRED_COLS.issubset(set(cohort_out.columns)):
-            cohort = cohort_out.copy()
-            print(f"  {len(cohort):,} patients loaded from cache")
-            _rebuild = False
-        else:
-            print("  Cached cohort missing demographic columns — rebuilding...")
-            cohort_path.unlink()
+    print(f"\nFinal cohort: {len(cohort):,} patients")
+    print(f"  Mortality:        {cohort['hospital_death'].mean():.1%}")
+    print(f"  Median traj_hours: {cohort['traj_hours'].median():.0f}h")
 
-    if _rebuild:
-        print("=" * 60)
-        print("PHASE A: COHORT IDENTIFICATION")
-        print("=" * 60)
-        cohort, co, filter_log = build_cohort(CLIF_DIR, co)
+    cohort_out = cohort[[
+        "stay_id", "hospital_death", "anchor_year_group",
+        "traj_hours", "death_hour", "first_norepi_time",
+        "age", "gender", "race", "weight",
+        "sepsis_onset_sofa", "initial_lactate",
+        "vaso_before_traj",
+    ]]
+    cohort_path = OUTPUT_DIR / "cohort.parquet"
+    cohort_out.to_parquet(cohort_path, index=False)
+    print(f"Saved {cohort_path}")
 
-        print(f"\nFinal cohort: {len(cohort):,} patients")
-        print(f"  Mortality:        {cohort['hospital_death'].mean():.1%}")
-        print(f"  Median traj_hours: {cohort['traj_hours'].median():.0f}h")
-
-        cohort_out = cohort[[
-            "stay_id", "hospital_death", "anchor_year_group",
-            "icu_intime", "icu_outtime", "deathtime",
-            "trajectory_start", "trajectory_end", "traj_hours",
-            "first_norepi_time",
-            "age", "gender", "race", "weight",
-            "sepsis_onset_sofa", "initial_lactate",
-            "vaso_before_traj",
-        ]]
-        OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-        cohort_out.to_parquet(cohort_path, index=False)
-        print(f"Saved {cohort_path}")
-
-        filter_csv = OUTPUT_DIR / "cohort_filter_counts.csv"
-        pd.DataFrame(filter_log).to_csv(filter_csv, index=False)
-        print(f"Saved {filter_csv}")
+    filter_csv = OUTPUT_DIR / "cohort_filter_counts.csv"
+    pd.DataFrame(filter_log).to_csv(filter_csv, index=False)
+    print(f"Saved {filter_csv}")
 
     print("\n" + "=" * 60)
     print("PHASE B: FEATURE EXTRACTION")
@@ -1107,12 +1086,12 @@ def main():
     print(f"  MBP missing: {features['mbp'].isna().mean():.1%}")
     print(f"  SOFA mean: {features['sofa'].mean():.1f}")
 
-    features.to_parquet(OUTPUT_DIR / "features_clif.parquet", index=False)
-    print(f"Saved {OUTPUT_DIR / 'features_clif.parquet'}")
+    features.to_parquet(OUTPUT_DIR / "features.parquet", index=False)
+    print(f"Saved {OUTPUT_DIR / 'features.parquet'}")
 
     print("\nDone. Outputs written to:")
-    print(f"  {OUTPUT_DIR / 'cohort_clif.parquet'}")
-    print(f"  {OUTPUT_DIR / 'features_clif.parquet'}")
+    print(f"  {OUTPUT_DIR / 'cohort.parquet'}")
+    print(f"  {OUTPUT_DIR / 'features.parquet'}")
 
 
 if __name__ == "__main__":
