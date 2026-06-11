@@ -249,6 +249,19 @@ def dm_value(q0: np.ndarray, q1: np.ndarray, actions: np.ndarray) -> float:
 # Figure 1: Threshold sweep curves
 # ---------------------------------------------------------------------------
 
+def _draw_sweep_panel(ax, t, r, lbl, fontsize_title=8, fontsize_ax=8, fontsize_tick=7, fontsize_legend=6):
+    ax.plot(t, r["kappa_ge"], color="#1f77b4", lw=1.5, alpha=0.9,  label="κ (≥ threshold)")
+    ax.plot(t, r["kappa_le"], color="#d62728", lw=1.5, alpha=0.9,  ls="--", label="κ (≤ threshold)")
+    ax.axvline(r["opt_thresh"], color="black", lw=1.2, ls=":", label=f"opt {r['opt_dir']} {r['opt_thresh']:.2g}")
+    ax.axhline(0, color="gray", lw=0.5, ls="--")
+    ax.set_xlabel(lbl, fontsize=fontsize_ax)
+    ax.set_ylabel("Cohen's Kappa", fontsize=fontsize_ax)
+    ax.set_title(f"{lbl}\nAUROC={r['auroc']:.3f}  κ*={r['opt_kappa']:.3f}  "
+                 f"Agr={r['agree_at_opt']:.2%}", fontsize=fontsize_title)
+    ax.tick_params(labelsize=fontsize_tick)
+    ax.legend(fontsize=fontsize_legend, loc="lower right")
+
+
 def plot_threshold_sweep(sweep_results: list, out_path: Path):
     cont_results = [(col, lbl, r) for col, lbl, r in sweep_results if r is not None and "thresholds" in r]
     n = len(cont_results)
@@ -258,20 +271,7 @@ def plot_threshold_sweep(sweep_results: list, out_path: Path):
     axes = axes.ravel()
 
     for i, (col, lbl, r) in enumerate(cont_results):
-        ax = axes[i]
-        t = r["thresholds"]
-
-        ax.plot(t, r["kappa_ge"], color="#1f77b4", lw=1.5, alpha=0.9,  label="κ (≥ threshold)")
-        ax.plot(t, r["kappa_le"], color="#d62728", lw=1.5, alpha=0.9,  ls="--", label="κ (≤ threshold)")
-        ax.axvline(r["opt_thresh"], color="black", lw=1.2, ls=":", label=f"opt {r['opt_dir']} {r['opt_thresh']:.2g}")
-        ax.axhline(0, color="gray", lw=0.5, ls="--")
-
-        ax.set_xlabel(lbl, fontsize=8)
-        ax.set_ylabel("Cohen's Kappa", fontsize=8)
-        ax.set_title(f"{lbl}\nAUROC={r['auroc']:.3f}  κ*={r['opt_kappa']:.3f}  "
-                     f"Agr={r['agree_at_opt']:.2%}", fontsize=8)
-        ax.tick_params(labelsize=7)
-        ax.legend(fontsize=6, loc="lower right")
+        _draw_sweep_panel(axes[i], r["thresholds"], r, lbl)
 
     for j in range(i + 1, len(axes)):
         axes[j].set_visible(False)
@@ -284,6 +284,23 @@ def plot_threshold_sweep(sweep_results: list, out_path: Path):
     fig.savefig(out_path, dpi=500, bbox_inches="tight")
     plt.close(fig)
     print(f"Saved: {out_path}")
+
+    # Individual per-feature plots
+    indiv_dir = out_path.parent / "threshold_sweep_individual"
+    indiv_dir.mkdir(parents=True, exist_ok=True)
+    for col, lbl, r in cont_results:
+        fig_i, ax_i = plt.subplots(figsize=(5.5, 3.8))
+        _draw_sweep_panel(ax_i, r["thresholds"], r, lbl,
+                          fontsize_title=10, fontsize_ax=10, fontsize_tick=9, fontsize_legend=8)
+        fig_i.suptitle("Threshold sweep: Kappa vs threshold\n"
+                        "(target = clinician vasopressin action; black line = optimal threshold)",
+                        fontsize=10)
+        fig_i.tight_layout()
+        feat_path = indiv_dir / f"threshold_sweep_{col}.png"
+        feat_path.parent.mkdir(parents=True, exist_ok=True)
+        fig_i.savefig(feat_path, dpi=500, bbox_inches="tight")
+        plt.close(fig_i)
+        print(f"Saved: {feat_path}")
 
 
 def write_threshold_sweep_data(sweep_results: list, out_path: Path):
@@ -808,7 +825,7 @@ def main():
     # Patient-level analysis: threshold on max(feature) → ever-vasopressin
     print("\nComputing patient-level metrics (threshold on max feature -> ever-vasopressin)...")
     pat_table = _patient_level_eval(step_data, sweep_results)
-    pat_table.write_csv(out_dir / "patient_level_table.csv")
+    pat_table.to_pandas().to_csv(out_dir / "patient_level_table.csv", index=False)
     print(f"Saved: {out_dir / 'patient_level_table.csv'}")
 
     print("Computing patient-level confounders by threshold group...")
