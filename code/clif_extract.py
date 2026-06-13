@@ -508,15 +508,13 @@ def build_hourly_grid(cohort: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-def add_ne_dose(grid: pd.DataFrame, clif_dir: Path) -> pd.DataFrame:
-    meds = pd.read_parquet(clif_dir / "clif_medication_admin_continuous.parquet")
+def add_ne_dose(grid: pd.DataFrame, meds: pd.DataFrame) -> pd.DataFrame:
     ne = meds[
         (meds["med_category"] == "norepinephrine") &
-        meds["med_dose"].notna() &
-        (meds["med_dose_unit"] == "mcg/kg/min")
-    ][["hospitalization_id", "admin_dttm", "med_dose"]].copy()
-    ne = ne.rename(columns={"hospitalization_id": "stay_id"})
-    ne["admin_dttm"] = to_naive_utc(ne["admin_dttm"])
+        (meds["_convert_status"] == "success") &
+        meds["med_dose_converted"].notna()
+    ][["stay_id", "admin_dttm", "med_dose_converted"]].copy()
+    ne = ne.rename(columns={"med_dose_converted": "med_dose"})
     ne = ne.sort_values(["stay_id", "admin_dttm"])
     ne["end_dttm"] = (ne.groupby("stay_id")["admin_dttm"]
                         .shift(-1)
@@ -535,14 +533,13 @@ def add_ne_dose(grid: pd.DataFrame, clif_dir: Path) -> pd.DataFrame:
     return grid
 
 
-def add_vaso_dose(grid: pd.DataFrame, clif_dir: Path) -> pd.DataFrame:
-    meds = pd.read_parquet(clif_dir / "clif_medication_admin_continuous.parquet")
+def add_vaso_dose(grid: pd.DataFrame, meds: pd.DataFrame) -> pd.DataFrame:
     vaso = meds[
         (meds["med_category"] == "vasopressin") &
-        meds["med_dose"].notna()
-    ][["hospitalization_id", "admin_dttm", "med_dose"]].copy()
-    vaso = vaso.rename(columns={"hospitalization_id": "stay_id"})
-    vaso["admin_dttm"] = to_naive_utc(vaso["admin_dttm"])
+        (meds["_convert_status"] == "success") &
+        meds["med_dose_converted"].notna()
+    ][["stay_id", "admin_dttm", "med_dose_converted"]].copy()
+    vaso = vaso.rename(columns={"med_dose_converted": "med_dose"})
     vaso = vaso.sort_values(["stay_id", "admin_dttm"])
     vaso["end_dttm"] = (vaso.groupby("stay_id")["admin_dttm"]
                             .shift(-1)
@@ -706,37 +703,63 @@ _VASO_FACTOR_U_MIN = 2.5
 _ASSUMED_WEIGHT_KG = 70.0
 
 
-def add_nee(grid: pd.DataFrame, clif_dir: Path) -> pd.DataFrame:
+_PREFERRED_UNITS_CONT = {
+    "norepinephrine": "mcg/kg/min",
+    "epinephrine":    "mcg/kg/min",
+    "phenylephrine":  "mcg/kg/min",
+    "dopamine":       "mcg/kg/min",
+    "vasopressin":    "u/min",
+    "vasopressine":   "u/min",
+    "metaraminol":    "mcg/kg/min",
+    "angiotensin ii": "mcg/kg/min",
+}
+
+
+def _load_and_convert_meds(co: ClifOrchestrator, stay_ids: list) -> pd.DataFrame:
+    """Load continuous meds via clifpy and convert to preferred clinical units.
+
+    Uses clifpy's unit converter so weight-based conversions (e.g. mcg/min →
+    mcg/kg/min) draw patient weight from the vitals table automatically.
+    Returns a df with admin_dttm as tz-naive UTC and stay_id replacing
+    hospitalization_id.  Only rows with _convert_status == 'success' have
+    a valid med_dose_converted; others should be filtered out by callers.
+    """
+    co.load_table("medication_admin_continuous", filters={"hospitalization_id": stay_ids})
+    co.load_table("vitals", filters={
+        "hospitalization_id": stay_ids,
+        "vital_category": ["weight_kg"],
+    })
+    co.convert_dose_units_for_continuous_meds(
+        preferred_units=_PREFERRED_UNITS_CONT,
+        save_to_table=True,
+        override=True,
+    )
+    df = co.medication_admin_continuous.df_converted.copy()
+    df = df.rename(columns={"hospitalization_id": "stay_id"})
+    df["admin_dttm"] = to_naive_utc(df["admin_dttm"])
+    return df
+
+
+def add_nee(grid: pd.DataFrame, meds: pd.DataFrame) -> pd.DataFrame:
     """Norepinephrine equivalent dose (mcg/kg/min):
     NE + Epi + Phe/10 + Dopa/100 + Metaraminol/8 + AngII×10 + Vaso×2.5(U/min).
     """
-    meds = pd.read_parquet(clif_dir / "clif_medication_admin_continuous.parquet")
+    converted = meds[meds["_convert_status"] == "success"].copy()
 
     # ── Catecholamines + metaraminol + angiotensin II ─────────────────────────
-    cath = meds[meds["med_category"].isin(_NEE_FACTORS_MCG) & meds["med_dose"].notna()][
-        ["hospitalization_id", "admin_dttm", "med_category", "med_dose", "med_dose_unit"]
-    ].copy()
-    cath = cath.rename(columns={"hospitalization_id": "stay_id"})
-    cath["admin_dttm"] = to_naive_utc(cath["admin_dttm"])
-    # mcg/min without /kg → divide by assumed weight to get mcg/kg/min
-    per_min = (cath["med_dose_unit"].str.lower().str.contains("mcg/min", na=False) &
-               ~cath["med_dose_unit"].str.lower().str.contains("kg", na=False))
-    cath.loc[per_min, "med_dose"] = cath.loc[per_min, "med_dose"] / _ASSUMED_WEIGHT_KG
-    cath["nee_contrib"] = cath["med_dose"] * cath["med_category"].map(_NEE_FACTORS_MCG)
+    cath = converted[
+        converted["med_category"].isin(_NEE_FACTORS_MCG) &
+        converted["med_dose_converted"].notna()
+    ][["stay_id", "admin_dttm", "med_category", "med_dose_converted"]].copy()
+    cath["nee_contrib"] = cath["med_dose_converted"] * cath["med_category"].map(_NEE_FACTORS_MCG)
 
-    # ── Vasopressin (U/min equivalent) ────────────────────────────────────────
+    # ── Vasopressin (U/min → NEE via _VASO_FACTOR_U_MIN) ─────────────────────
     vaso_cats = {"vasopressin", "vasopressine", "terlipressin"}
-    vaso = meds[meds["med_category"].str.lower().isin(vaso_cats) &
-                meds["med_dose"].notna()][
-        ["hospitalization_id", "admin_dttm", "med_dose", "med_dose_unit"]
-    ].copy()
-    vaso = vaso.rename(columns={"hospitalization_id": "stay_id"})
-    vaso["admin_dttm"] = to_naive_utc(vaso["admin_dttm"])
-    unit_lo = vaso["med_dose_unit"].str.lower().fillna("")
-    # Convert U/hr → U/min
-    is_per_hr = unit_lo.str.contains(r"u?nit[s]?/h|u/h", na=False)
-    vaso.loc[is_per_hr, "med_dose"] = vaso.loc[is_per_hr, "med_dose"] / 60.0
-    vaso["nee_contrib"] = vaso["med_dose"] * _VASO_FACTOR_U_MIN
+    vaso = converted[
+        converted["med_category"].str.lower().isin(vaso_cats) &
+        converted["med_dose_converted"].notna()
+    ][["stay_id", "admin_dttm", "med_dose_converted"]].copy()
+    vaso["nee_contrib"] = vaso["med_dose_converted"] * _VASO_FACTOR_U_MIN
     vaso["med_category"] = "vasopressin"
 
     # ── Combine, expand to intervals, and aggregate ───────────────────────────
@@ -1009,11 +1032,14 @@ def build_features(cohort: pd.DataFrame, co: ClifOrchestrator, clif_dir: Path) -
     grid = build_hourly_grid(cohort)
     print(f"  {len(grid):,} patient-hours across {cohort['stay_id'].nunique()} patients")
 
+    print("Converting medication units via clifpy...")
+    meds = _load_and_convert_meds(co, cohort["stay_id"].tolist())
+
     print("Adding NE dose...")
-    grid = add_ne_dose(grid, clif_dir)
+    grid = add_ne_dose(grid, meds)
 
     print("Adding vasopressin dose...")
-    grid = add_vaso_dose(grid, clif_dir)
+    grid = add_vaso_dose(grid, meds)
 
     print("Adding MBP...")
     grid = add_mbp(grid, clif_dir)
@@ -1031,7 +1057,7 @@ def build_features(cohort: pd.DataFrame, co: ClifOrchestrator, clif_dir: Path) -
     grid = add_vitals(grid, clif_dir)
 
     print("Adding NEE (norepinephrine equivalent dose)...")
-    grid = add_nee(grid, clif_dir)
+    grid = add_nee(grid, meds)
 
     print("Adding labs (BUN, creatinine, lactate)...")
     grid = add_labs(grid, clif_dir)
