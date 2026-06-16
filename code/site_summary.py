@@ -86,7 +86,7 @@ ANALYSIS_FEATURES      = ANALYSIS_FEATURES_CONT + ANALYSIS_FEATURES_BIN
 # Baseline table
 BL_CONTINUOUS  = ["age", "weight", "sepsis_onset_sofa", "initial_lactate", "traj_hours"]
 BL_BINARY      = ["hospital_death"]
-BL_CATEGORICAL = ["gender", "race"]
+BL_CATEGORICAL = ["gender", "race", "location_category", "location_type"]
 
 # ============================================================
 # HELPERS

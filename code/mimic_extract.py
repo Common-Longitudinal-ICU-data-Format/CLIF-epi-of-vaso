@@ -62,7 +62,7 @@ def render_sql(template_path: Path, **kwargs) -> str:
 # Filter counts (cohort inclusion flowchart)
 # ---------------------------------------------------------------------------
 
-def get_filter_counts(conn: duckdb.DuckDBPyConnection) -> list[dict]:
+def get_filter_counts(conn: duckdb.DuckDBPyConnection, n_excl_vaso: int, n_final: int) -> list[dict]:
     """Count patients at each inclusion step to match cohort_filter_counts.csv format."""
     rows = []
 
@@ -113,10 +113,15 @@ def get_filter_counts(conn: duckdb.DuckDBPyConnection) -> list[dict]:
     rows.append({"step": "Norepinephrine within 24h of ICU admit (>=2 records)",
                  "n_hospitalizations": n})
 
-    # Final count from the already-built cohort temp table
+    # Count from the already-built cohort temp table (before vaso exclusion)
     n = conn.execute("SELECT COUNT(*) FROM cohort_septic_shock").fetchone()[0]
-    rows.append({"step": "Lactate > 2.0 mmol/L (final septic shock cohort)",
+    rows.append({"step": "Lactate > 2.0 mmol/L (septic shock cohort before vaso exclusion)",
                  "n_hospitalizations": n})
+
+    rows.append({"step": "Patients on vasopressin in 24h before trajectory start (excluded)",
+                 "n_hospitalizations": n_excl_vaso})
+    rows.append({"step": "Final cohort after excluding pre-trajectory vasopressin",
+                 "n_hospitalizations": n_final})
 
     return rows
 
@@ -171,16 +176,22 @@ def main():
     conn.execute("DROP TABLE IF EXISTS cohort_septic_shock")
     conn.execute(f"CREATE TEMP TABLE cohort_septic_shock AS ({cohort_sql})")
 
-    cohort = pl.from_arrow(conn.execute("SELECT * FROM cohort_septic_shock").arrow())
-    cohort.write_parquet(out / "cohort.parquet")
-    print(f"  {len(cohort):,} patients | "
+    cohort_raw = pl.from_arrow(conn.execute("SELECT * FROM cohort_septic_shock").arrow())
+
+    # Exclude patients on vasopressin in 24h before trajectory start (matches clif_extract logic)
+    n_excl_vaso = int((cohort_raw["vaso_before_traj"] == 1).sum())
+    cohort = cohort_raw.filter(cohort_raw["vaso_before_traj"] == 0)
+    print(f"  {n_excl_vaso:,} patients excluded for vasopressin in 24h before trajectory start")
+    print(f"  {len(cohort):,} patients in final ICU cohort | "
           f"mortality {cohort['hospital_death'].mean():.1%} | "
           f"median age {cohort['age'].median():.0f}")
+
+    cohort.write_parquet(out / "cohort.parquet")
     print(f"  Saved {out / 'cohort.parquet'}")
 
     # --- Filter counts ---
     print("  Building filter counts...")
-    filter_rows = get_filter_counts(conn)
+    filter_rows = get_filter_counts(conn, n_excl_vaso=n_excl_vaso, n_final=len(cohort))
     import csv
     with open(out / "cohort_filter_counts.csv", "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=["step", "n_hospitalizations"])
@@ -191,6 +202,12 @@ def main():
         print(f"    {r['step']:<60} n={r['n_hospitalizations']:,}")
 
     # --- Features ---
+    # Rebuild cohort_septic_shock with only the post-exclusion patients so the
+    # features SQL produces the right row set.
+    conn.execute("DROP TABLE IF EXISTS cohort_septic_shock")
+    conn.register("_cohort_filtered", cohort.to_arrow())
+    conn.execute("CREATE TEMP TABLE cohort_septic_shock AS SELECT * FROM _cohort_filtered")
+
     print("\n[2/2] Extracting hourly features...")
     features_sql = render_sql(SQL_DIR / "02_features.sql.j2", **TEMPLATE_VARS)
     features = pl.from_arrow(conn.execute(features_sql).arrow())
