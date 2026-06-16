@@ -9,7 +9,7 @@ Reads (PHI, local only):
   output/patient_level_data_<SITE>/features.parquet
 
 Writes figures to:
-  output/epi_analysis_<SITE>/
+  output/upload_to_box_<SITE>/epi_analysis/
 
 Analyses:
   1    KM survival curves by max NEE dose bin (0, 0.1, 0.2, 0.3, 0.5, 0.7, 1.0 μg/kg/min)
@@ -68,7 +68,7 @@ SITE_NAME   = _args.site if _args.site else getattr(_cfg, "SITE_NAME", "UCMC")
 OUTPUT_ROOT = Path(getattr(_cfg, "OUTPUT_ROOT", "."))
 
 PATIENT_LEVEL_DIR = OUTPUT_ROOT / "output" / f"patient_level_data_{SITE_NAME}"
-OUT_DIR = OUTPUT_ROOT / "output" / f"epi_analysis_{SITE_NAME}"
+OUT_DIR = OUTPUT_ROOT / "output" / f"upload_to_box_{SITE_NAME}" / "epi_analysis"
 OUT_DIR.mkdir(parents=True, exist_ok=True)
 
 SITE_LOWER = SITE_NAME.lower()
@@ -1435,15 +1435,9 @@ print(f"\nAll figures written to: {OUT_DIR}")
 # Save aggregates — federated-safe CSVs + plot copies for upload_to_box_{SITE}
 # =============================================================================
 print("\nSaving aggregate CSVs...")
-import shutil
-
 AGG_DIR = OUTPUT_ROOT / "output" / f"upload_to_box_{SITE_NAME}" / "epi_analysis"
 AGG_DIR.mkdir(parents=True, exist_ok=True)
 
-# Copy plots into epi_analysis/ alongside CSVs
-for _png in OUT_DIR.glob("*.png"):
-    shutil.copy2(_png, AGG_DIR / _png.name)
-print(f"  Copied {len(list(OUT_DIR.glob('*.png')))} plots → {AGG_DIR}")
 
 # ── 1. km_cif_by_nee_bin.csv ─────────────────────────────────────────────────
 _rows = []
@@ -1633,6 +1627,126 @@ for _col, _label in INIT_FEATURES:
                           q1=_d.quantile(0.25), median=_d.median(),
                           q3=_d.quantile(0.75)))
 pd.DataFrame(_rows).to_csv(AGG_DIR / "init_features_by_nee_bin.csv", index=False)
-print("  12/12 init_features_by_nee_bin.csv")
+print("  12/14 init_features_by_nee_bin.csv")
+
+# ── 13. vasopressor_combinations.csv ─────────────────────────────────────────
+_DRUG_DEFS_13 = [
+    ("action_vaso",    "VASO"),
+    ("norepinephrine", "NE"),
+    ("phenylephrine",  "PHENYL"),
+    ("dopamine",       "DOPA"),
+    ("epinephrine",    "EPI"),
+]
+_avail_drugs_13 = [(col, name) for col, name in _DRUG_DEFS_13 if col in features.columns]
+if _avail_drugs_13:
+    _N13 = len(pat)
+    _combo13 = pat[["stay_id"]].copy()
+    for _col13, _name13 in _avail_drugs_13:
+        _any13 = features.groupby("stay_id")[_col13].max() > 0
+        _combo13[f"any_{_name13}"] = _combo13["stay_id"].map(_any13).fillna(False)
+    _ac13 = [f"any_{n}" for _, n in _avail_drugs_13]
+    _combo13["n_drug_types"] = _combo13[_ac13].sum(axis=1)
+    _fh13 = {}
+    for _col13, _name13 in _avail_drugs_13:
+        _pos13 = features.loc[features[_col13] > 0].groupby("stay_id")["time_hour"].min()
+        _fh13[_name13] = _combo13["stay_id"].map(_pos13)
+    _first13 = pd.DataFrame(_fh13, index=_combo13.index)
+    _combo13["first_drug"] = _first13.idxmin(axis=1)
+    _rows13 = []
+    for _col13, _name13 in _avail_drugs_13:
+        _ac_i = f"any_{_name13}"
+        _n_any13    = int(_combo13[_ac_i].sum())
+        _n_single13 = int((_combo13[_ac_i] & (_combo13["n_drug_types"] == 1)).sum())
+        _n_first13  = int((_combo13["first_drug"] == _name13).sum())
+        _row13 = dict(
+            drug=_name13,
+            n_any_use=_n_any13,         pct_any_use=round(_n_any13/_N13*100, 1) if _N13 else None,
+            n_single_agent=_n_single13, pct_single_agent=round(_n_single13/_N13*100, 1) if _N13 else None,
+            n_first_agent=_n_first13,   pct_first_agent=round(_n_first13/_N13*100, 1) if _N13 else None,
+            n_total_patients=_N13,
+        )
+        for _col2_13, _name2_13 in _avail_drugs_13:
+            _ac_j = f"any_{_name2_13}"
+            if _name2_13 == _name13:
+                _row13[f"n_combined_{_name2_13}"]   = None
+                _row13[f"pct_combined_{_name2_13}"] = None
+            else:
+                _nb13 = int((_combo13[_ac_i] & _combo13[_ac_j]).sum())
+                _row13[f"n_combined_{_name2_13}"]   = _nb13
+                _row13[f"pct_combined_{_name2_13}"] = round(_nb13/_N13*100, 1) if _N13 else None
+        _rows13.append(_row13)
+    pd.DataFrame(_rows13).to_csv(AGG_DIR / "vasopressor_combinations.csv", index=False)
+    print("  13/14 vasopressor_combinations.csv")
+else:
+    print("  13/14 skipped vasopressor_combinations (no drug columns in features)")
+
+# ── 14. vaso_receipt_logreg.csv ───────────────────────────────────────────────
+try:
+    import re as _re14
+    import statsmodels.formula.api as _smf14
+    _lr14 = pat[["stay_id", "ever_vaso", "age", "gender", "race"]].copy()
+    if "anchor_year_group" in cohort.columns:
+        _lr14 = _lr14.merge(cohort[["stay_id", "anchor_year_group"]], on="stay_id", how="left")
+    else:
+        _lr14["anchor_year_group"] = "unknown"
+    _lr14["age_cat"] = pd.cut(
+        _lr14["age"],
+        bins=[0, 50, 65, 75, 85, np.inf],
+        labels=["<50", "50-64", "65-74", "75-84", ">=85"],
+        right=False,
+    ).astype(str)
+    _lr14["female"] = (_lr14["gender"].astype(str).str.upper().str.startswith("F")).astype(int)
+    _RACE_MAP_14 = {
+        "White": "White",                                        "WHITE": "White",
+        "Black or African American": "Black or African American",
+        "BLACK/AFRICAN AMERICAN": "Black or African American",  "BLACK/AFRICAN": "Black or African American",
+        "Hispanic": "Hispanic",                                  "HISPANIC OR LATINO": "Hispanic",
+        "Asian": "Asian",                                        "ASIAN": "Asian",
+    }
+    _lr14["race_cat"] = _lr14["race"].map(_RACE_MAP_14).fillna("Other/Unknown")
+    _lr14 = _lr14.dropna(subset=["age", "ever_vaso"])
+    _lr14 = _lr14[_lr14["age_cat"] != "nan"].copy()
+    _yr_vals14 = sorted(_lr14["anchor_year_group"].dropna().unique().tolist())
+    _has_year14 = len(_yr_vals14) > 1 and "unknown" not in _yr_vals14
+    _formula14 = (
+        "ever_vaso ~ C(age_cat, Treatment('<50')) + female"
+        " + C(race_cat, Treatment('White'))"
+        + (" + C(anchor_year_group)" if _has_year14 else "")
+    )
+    _mod14 = _smf14.logit(_formula14, data=_lr14).fit(disp=0)
+    _ci14  = _mod14.conf_int()
+    _ci14.columns = ["ci_lo", "ci_hi"]
+
+    def _param_label_14(p):
+        m = _re14.search(r"age_cat.*\[T\.(.+?)\]", p)
+        if m: return f"Age: {m.group(1)} vs <50"
+        if p == "female": return "Female vs Male"
+        m = _re14.search(r"race_cat.*\[T\.(.+?)\]", p)
+        if m: return f"Race: {m.group(1)} vs White"
+        m = _re14.search(r"anchor_year_group.*\[T\.(.+?)\]", p)
+        if m: return f"Year: {m.group(1)}"
+        return p
+
+    _lr_rows14 = []
+    for _p, _coef, _cilo, _cihi, _pv in zip(
+        _mod14.params.index, _mod14.params.values,
+        _ci14["ci_lo"].values, _ci14["ci_hi"].values,
+        _mod14.pvalues.values,
+    ):
+        if _p == "Intercept":
+            continue
+        _lr_rows14.append(dict(
+            param=_p,
+            label=_param_label_14(_p),
+            or_est=round(float(np.exp(_coef)), 3),
+            or_lo=round(float(np.exp(_cilo)), 3),
+            or_hi=round(float(np.exp(_cihi)), 3),
+            pval=round(float(_pv), 4),
+            n_obs=int(_mod14.nobs),
+        ))
+    pd.DataFrame(_lr_rows14).to_csv(AGG_DIR / "vaso_receipt_logreg.csv", index=False)
+    print("  14/14 vaso_receipt_logreg.csv")
+except Exception as _e14:
+    print(f"  14/14 skipped vaso_receipt_logreg: {_e14}")
 
 print(f"\nAggregate CSVs written to: {AGG_DIR}")
