@@ -338,24 +338,25 @@ def dm_value(q0: np.ndarray, q1: np.ndarray, actions: np.ndarray) -> float:
 # ---------------------------------------------------------------------------
 
 def _draw_sweep_panel(ax, t, r, lbl, fontsize_title=8, fontsize_ax=8, fontsize_tick=7, fontsize_legend=6):
-    ax.plot(t, r["kappa_ge"], color="#1f77b4", lw=1.5, alpha=0.9,  label="κ (≥ threshold)")
-    ax.plot(t, r["kappa_le"], color="#d62728", lw=1.5, alpha=0.9,  ls="--", label="κ (≤ threshold)")
-    # Vertical line: training-at-risk kappa threshold (matches outcome analysis)
+    ax.plot(t, r["kappa_ge"], color="#1f77b4", lw=1.5, alpha=0.9,  label="κ-allsteps (≥ threshold)")
+    ax.plot(t, r["kappa_le"], color="#d62728", lw=1.5, alpha=0.9,  ls="--", label="κ-allsteps (≤ threshold)")
+    # Vertical line: κ-initiation threshold (vaso-naive training steps; used in outcome analysis)
     if "kappa_train_thresh" in r:
         vline_val = r["kappa_train_thresh"]
         vline_dir = r["kappa_train_dir"]
     else:
         vline_val = r["opt_thresh"]
         vline_dir = r["opt_dir"]
-    ax.axvline(vline_val, color="black", lw=1.2, ls=":", label=f"κ-train {vline_dir} {vline_val:.2g}")
+    ax.axvline(vline_val, color="black", lw=1.2, ls=":", label=f"κ-init {vline_dir} {vline_val:.2g}")
     ax.axhline(0, color="gray", lw=0.5, ls="--")
     ax.set_xlabel(lbl, fontsize=fontsize_ax)
     ax.set_ylabel("Cohen's Kappa", fontsize=fontsize_ax)
+    k_all_str = f"κ-allsteps={r['opt_kappa']:.3f}"
     if "kappa_train_kappa" in r:
-        kappa_str = (f"κ-train={r['kappa_train_kappa']:.3f}  "
+        kappa_str = (f"κ-init={r['kappa_train_kappa']:.3f}  {k_all_str}  "
                      f"Agr={r.get('kappa_train_agree', r['agree_at_opt']):.2%}")
     else:
-        kappa_str = f"κ*={r['opt_kappa']:.3f}  Agr={r['agree_at_opt']:.2%}"
+        kappa_str = f"{k_all_str}  Agr={r['agree_at_opt']:.2%}"
     ax.set_title(f"{lbl}\nAUROC={r['auroc']:.3f}  {kappa_str}", fontsize=fontsize_title)
     ax.tick_params(labelsize=fontsize_tick)
     ax.legend(fontsize=fontsize_legend, loc="lower right")
@@ -375,8 +376,8 @@ def plot_threshold_sweep(sweep_results: list, out_path: Path):
     for j in range(i + 1, len(axes)):
         axes[j].set_visible(False)
 
-    fig.suptitle("Threshold sweep: Kappa vs threshold for each feature\n"
-                 "(target = clinician vasopressin action; black line = optimal threshold)",
+    fig.suptitle("Threshold sweep: κ-allsteps (curves) vs threshold for each feature\n"
+                 "Black line = κ-initiation threshold (vaso-naive training steps; used in outcome analysis)",
                  fontsize=11)
     fig.tight_layout()
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -418,17 +419,18 @@ def write_threshold_sweep_data(sweep_results: list, out_path: Path):
             r["agree_ge"], r["agree_le"],
         ):
             rows.append({
-                "feature":           col,
-                "threshold":         round(float(t),   4),
-                "kappa_ge":          round(float(kge), 4) if np.isfinite(kge) else None,
-                "kappa_le":          round(float(kle), 4) if np.isfinite(kle) else None,
-                "agree_ge":          round(float(age), 4) if np.isfinite(age) else None,
-                "agree_le":          round(float(ale), 4) if np.isfinite(ale) else None,
-                "opt_thresh":         round(float(r["opt_thresh"]), 4),
-                "opt_dir":            r["opt_dir"],
-                "kappa_train_thresh": round(float(r["kappa_train_thresh"]), 4) if "kappa_train_thresh" in r else None,
-                "kappa_train_dir":    r.get("kappa_train_dir"),
-                "kappa_train_kappa":  round(float(r["kappa_train_kappa"]), 4) if "kappa_train_kappa" in r and np.isfinite(r["kappa_train_kappa"]) else None,
+                "feature":               col,
+                "threshold":             round(float(t),   4),
+                "kappa_ge":              round(float(kge), 4) if np.isfinite(kge) else None,
+                "kappa_le":              round(float(kle), 4) if np.isfinite(kle) else None,
+                "agree_ge":              round(float(age), 4) if np.isfinite(age) else None,
+                "agree_le":              round(float(ale), 4) if np.isfinite(ale) else None,
+                "kappa_allsteps_thresh": round(float(r["opt_thresh"]), 4),
+                "kappa_allsteps_dir":    r["opt_dir"],
+                "kappa_allsteps":        round(float(r["opt_kappa"]), 4) if np.isfinite(r["opt_kappa"]) else None,
+                "kappa_initiation_thresh": round(float(r["kappa_train_thresh"]), 4) if "kappa_train_thresh" in r else None,
+                "kappa_initiation_dir":    r.get("kappa_train_dir"),
+                "kappa_initiation":      round(float(r["kappa_train_kappa"]), 4) if "kappa_train_kappa" in r and np.isfinite(r["kappa_train_kappa"]) else None,
             })
     import pandas as _pd
     _pd.DataFrame(rows).to_csv(out_path, index=False)
@@ -515,7 +517,7 @@ def plot_feature_action_density(df: pl.DataFrame, sweep_results: list,
         ax.set_ylim(-0.05, 1.15)
         ax.set_ylabel("P(action=1)", fontsize=8)
         if r is not None:
-            ax.set_title(f"{lbl}\nκ*={r['opt_kappa']:.3f}  AUROC={r['auroc']:.3f}", fontsize=8)
+            ax.set_title(f"{lbl}\nκ-allsteps={r['opt_kappa']:.3f}  AUROC={r['auroc']:.3f}", fontsize=8)
         else:
             ax.set_title(lbl, fontsize=8)
         ax.tick_params(labelsize=7)
@@ -613,13 +615,20 @@ def plot_decision_tree_fidelity(X: np.ndarray, y: np.ndarray,
 # Summary table
 # ---------------------------------------------------------------------------
 
+_PAT_LEVEL_EXCLUDE = {"time_hour"}   # max(time_hour) = stay length, not a clinical threshold
+
+
 def _patient_level_eval(step_data: pl.DataFrame, sweep_results: list) -> pl.DataFrame:
-    """Patient-level: threshold on max(feature) → predicts ever-vasopressin."""
+    """Patient-level: threshold on max(feature) → predicts ever-vasopressin.
+
+    time_hour is excluded: max(time_hour) is ICU stay length, not a clinically
+    meaningful threshold for the ever-vasopressin question.
+    """
     from sklearn.metrics import roc_auc_score, cohen_kappa_score
 
     rows = []
     for col, lbl, r in sweep_results:
-        if r is None or col not in step_data.columns:
+        if r is None or col not in step_data.columns or col in _PAT_LEVEL_EXCLUDE:
             continue
         is_binary = col in {c for c, _, b in ANALYSIS_FEATURES if b}
 
@@ -637,13 +646,13 @@ def _patient_level_eval(step_data: pl.DataFrame, sweep_results: list) -> pl.Data
         feat_max  = np.where(np.isfinite(feat_max), feat_max,
                              float(np.nanmedian(feat_max)))
 
-        # Apply the same direction found in step-level sweep
+        # Use training-at-risk kappa threshold; fall back to all-steps optimal
         if is_binary:
             tau, direction = 0.5, "pos"
         else:
-            tau       = r["opt_thresh"]
-            direction = r["opt_dir"]  # ">=" maps to "pos", "<=" to "neg"
-            direction = "pos" if ">=" in direction else "neg"
+            tau       = r.get("kappa_train_thresh", r["opt_thresh"])
+            raw_dir   = r.get("kappa_train_dir", r["opt_dir"])
+            direction = "pos" if ">=" in raw_dir else "neg"
 
         pred = (feat_max > tau).astype(int) if direction == "pos" else (feat_max < tau).astype(int)
 
@@ -663,7 +672,7 @@ def _patient_level_eval(step_data: pl.DataFrame, sweep_results: list) -> pl.Data
             "label":           lbl,
             "n_vaso_patients": int(ever_vaso.sum()),
             "n_novaso_patients": int((ever_vaso == 0).sum()),
-            "patient_kappa":   round(kappa, 4) if np.isfinite(kappa) else None,
+            "patient_kappa_initiation": round(kappa, 4) if np.isfinite(kappa) else None,
             "patient_auroc":   round(auroc, 4) if np.isfinite(auroc) else None,
             "patient_agree":   round(agree, 4),
         })
@@ -696,7 +705,7 @@ def _patient_level_confounders(
 
     rows = []
     for col, lbl, r in sweep_results:
-        if r is None or col not in step_data.columns:
+        if r is None or col not in step_data.columns or col in _PAT_LEVEL_EXCLUDE:
             continue
         is_binary = col in {c for c, _, b in ANALYSIS_FEATURES if b}
 
@@ -717,8 +726,9 @@ def _patient_level_confounders(
         if is_binary:
             tau, direction = 0.5, "pos"
         else:
-            tau       = r["opt_thresh"]
-            direction = "pos" if ">=" in r["opt_dir"] else "neg"
+            tau     = r.get("kappa_train_thresh", r["opt_thresh"])
+            raw_dir = r.get("kappa_train_dir", r["opt_dir"])
+            direction = "pos" if ">=" in raw_dir else "neg"
 
         pred = (feat_max > tau).astype(int) if direction == "pos" else (feat_max < tau).astype(int)
         pat  = pat.with_columns(pl.Series("threshold_group", pred))
@@ -766,46 +776,52 @@ def build_summary_table(sweep_results: list, q0: np.ndarray, q1: np.ndarray,
         else:
             thresh_str = (f"{ktd} {ktt:.3g}" if ktt is not None
                           else f"{r['opt_dir']} {r['opt_thresh']:.3g}")
-        k_val = r.get("kappa_train_kappa", r["opt_kappa"])
-        agr   = r.get("kappa_train_agree", r["agree_at_opt"])
+        k_init = r.get("kappa_train_kappa")
+        k_all  = r["opt_kappa"]
+        agr    = r.get("kappa_train_agree", r["agree_at_opt"])
 
         thresh_dm  = dm_value(q0, q1, r["opt_pred"])
         dm_gap_pct = (thresh_dm - rl_dm) / abs(rl_dm) * 100 if rl_dm != 0 else np.nan
 
         rows.append({
-            "feature":      col,
-            "label":        lbl,
-            "threshold":    thresh_str,
-            "agreement":    round(agr, 4),
-            "kappa":        round(k_val, 4) if np.isfinite(k_val) else None,
-            "auroc":        round(r["auroc"], 4)   if not np.isnan(r["auroc"])   else None,
-            "sensitivity":  round(r["sens"], 4)    if not np.isnan(r["sens"])    else None,
-            "specificity":  round(r["spec"], 4)    if not np.isnan(r["spec"])    else None,
-            "dm_value":     round(float(thresh_dm), 4),
-            "dm_gap_pct":   round(float(dm_gap_pct), 2),
+            "feature":           col,
+            "label":             lbl,
+            "threshold":         thresh_str,
+            "agreement":         round(agr, 4),
+            "kappa_initiation":  round(k_init, 4) if k_init is not None and np.isfinite(k_init) else None,
+            "kappa_allsteps":    round(k_all,  4) if not np.isnan(k_all) else None,
+            "auroc":             round(r["auroc"], 4)   if not np.isnan(r["auroc"])   else None,
+            "sensitivity":       round(r["sens"], 4)    if not np.isnan(r["sens"])    else None,
+            "specificity":       round(r["spec"], 4)    if not np.isnan(r["spec"])    else None,
+            "dm_value":          round(float(thresh_dm), 4),
+            "dm_gap_pct":        round(float(dm_gap_pct), 2),
         })
 
-    df = pl.DataFrame(rows).sort("kappa", descending=True, nulls_last=True)
+    df = pl.DataFrame(rows).sort("kappa_initiation", descending=True, nulls_last=True)
     return df, rl_dm
 
 
 def print_summary(df: pl.DataFrame, rl_dm: float):
-    print(f"\n{'='*95}")
-    print(f"  RL baseline DM value: {rl_dm:.4f}  (kappa/auroc/sens/spec are vs clinician action)")
-    print(f"{'='*95}")
-    header = f"{'Feature':<20} {'Threshold':>14} {'Agree':>7} {'Kappa':>7} "
-    header += f"{'AUROC':>7} {'Sens':>7} {'Spec':>7} {'DM val':>10} {'DM gap%':>9}"
+    print(f"\n{'='*110}")
+    print(f"  RL baseline DM value: {rl_dm:.4f}")
+    print(f"  κ-init  = kappa on vaso-naive training steps (threshold used in outcome analysis)")
+    print(f"  κ-all   = kappa on all timesteps (all-steps sweep optimal)")
+    print(f"{'='*110}")
+    header = (f"{'Feature':<20} {'Threshold':>14} {'Agree':>7} {'κ-init':>8} "
+              f"{'κ-all':>7} {'AUROC':>7} {'Sens':>7} {'Spec':>7} {'DM val':>10} {'DM gap%':>9}")
     print(header)
-    print("-" * 95)
+    print("-" * 110)
     for row in df.iter_rows(named=True):
+        k_init = row.get("kappa_initiation") or 0
+        k_all  = row.get("kappa_allsteps")  or 0
         print(
             f"{row['feature']:<20} {row['threshold']:>14} "
-            f"{row['agreement']:>7.3f} {(row['kappa'] or 0):>7.3f} "
+            f"{row['agreement']:>7.3f} {k_init:>8.3f} {k_all:>7.3f} "
             f"{(row['auroc'] or 0):>7.3f} {(row['sensitivity'] or 0):>7.3f} "
             f"{(row['specificity'] or 0):>7.3f} {row['dm_value']:>10.4f} "
             f"{row['dm_gap_pct']:>+9.2f}%"
         )
-    print("=" * 95)
+    print("=" * 110)
 
 
 # ---------------------------------------------------------------------------
@@ -818,13 +834,13 @@ def main():
     ap.add_argument("--model", default=None,
                     help="Path to fqi_model.pkl for RL comparison (optional)")
     ap.add_argument("--out-dir", default=None,
-                    help="Output directory (default: output/upload_to_box_<SITE_NAME>/)")
+                    help="Output directory (default: output/upload_to_box_<SITE_NAME>/threshold/)")
     args = ap.parse_args()
 
     feat_path = PATIENT_LEVEL_DIR / "features.parquet"
     coh_path  = PATIENT_LEVEL_DIR / "cohort.parquet"
 
-    out_dir = Path(args.out_dir) if args.out_dir else UPLOAD_DIR
+    out_dir = Path(args.out_dir) if args.out_dir else UPLOAD_DIR / "threshold"
     out_dir.mkdir(parents=True, exist_ok=True)
     (out_dir / "plots").mkdir(exist_ok=True)
 
@@ -879,7 +895,7 @@ def main():
         _res = kappa_threshold_train_sweep(step_train, _col, _is_bin)
         if _res is not None:
             kappa_train_map[_col] = _res
-            print(f"  {_col:<18}: {_res[1]} {_res[0]:.4g}  κ-train={_res[2]:.3f}")
+            print(f"  {_col:<18}: {_res[1]} {_res[0]:.4g}  κ-init={_res[2]:.3f}")
         else:
             print(f"  {_col:<18}: [skip] insufficient data")
 
@@ -937,9 +953,9 @@ def main():
             r["kappa_train_agree"] = float((pred_all == clin_actions).mean())
         sweep_results.append((col, lbl, r))
         if r is not None:
-            kts = (f"  κ-train={r['kappa_train_kappa']:.3f}"
+            kts = (f"  κ-init={r['kappa_train_kappa']:.3f}"
                    if "kappa_train_kappa" in r else "")
-            print(f"  {col:<18}: AUROC={r['auroc']:.3f}  k*={r['opt_kappa']:.3f}{kts}")
+            print(f"  {col:<18}: AUROC={r['auroc']:.3f}  κ-allsteps={r['opt_kappa']:.3f}{kts}")
 
     # Decision tree predicting clinician action (depth 1-7)
     print("\nFitting decision trees targeting clinician vasopressin action (depth 1-7)...")
@@ -966,19 +982,21 @@ def main():
             thresh_str = (f"{ktd} {ktt:.3g}" if ktt is not None and not is_binary
                           else r.get("kappa_train_dir", r["opt_dir"]) if is_binary
                           else f"{r['opt_dir']} {r['opt_thresh']:.3g}")
-            k_val = r.get("kappa_train_kappa", r["opt_kappa"])
-            agr   = r.get("kappa_train_agree", r["agree_at_opt"])
+            k_init = r.get("kappa_train_kappa")
+            k_all  = r["opt_kappa"]
+            agr    = r.get("kappa_train_agree", r["agree_at_opt"])
             rows.append({
-                "feature":     col,
-                "label":       lbl,
-                "threshold":   thresh_str,
-                "agreement":   round(agr, 4),
-                "kappa":       round(k_val, 4) if np.isfinite(k_val) else None,
-                "auroc":       round(r["auroc"], 4)   if not np.isnan(r["auroc"])   else None,
-                "sensitivity": round(r["sens"], 4)    if not np.isnan(r["sens"])    else None,
-                "specificity": round(r["spec"], 4)    if not np.isnan(r["spec"])    else None,
+                "feature":          col,
+                "label":            lbl,
+                "threshold":        thresh_str,
+                "agreement":        round(agr, 4),
+                "kappa_initiation": round(k_init, 4) if k_init is not None and np.isfinite(k_init) else None,
+                "kappa_allsteps":   round(k_all,  4) if not np.isnan(k_all) else None,
+                "auroc":            round(r["auroc"], 4)   if not np.isnan(r["auroc"])   else None,
+                "sensitivity":      round(r["sens"], 4)    if not np.isnan(r["sens"])    else None,
+                "specificity":      round(r["spec"], 4)    if not np.isnan(r["spec"])    else None,
             })
-        table = pl.DataFrame(rows).sort("kappa", descending=True, nulls_last=True)
+        table = pl.DataFrame(rows).sort("kappa_initiation", descending=True, nulls_last=True)
         rl_dm = None
 
     table.write_csv(out_dir / "threshold_comparison_table.csv")
@@ -994,10 +1012,10 @@ def main():
     conf_table = _patient_level_confounders(step_data, sweep_results, cohort)
     conf_table.to_pandas().to_csv(out_dir / "patient_level_confounders.csv", index=False)
     print(f"Saved: {out_dir / 'patient_level_confounders.csv'}")
-    print(f"\n{'Feature':<20} {'Pat κ':>8} {'Pat AUROC':>10} {'Pat Agree':>10} {'n_vaso':>8}")
-    print("-" * 60)
+    print(f"\n{'Feature':<20} {'Pat κ-init':>10} {'Pat AUROC':>10} {'Pat Agree':>10} {'n_vaso':>8}")
+    print("-" * 62)
     for row in pat_table.iter_rows(named=True):
-        print(f"  {row['feature']:<18} {(row['patient_kappa'] or 0):>8.3f} "
+        print(f"  {row['feature']:<18} {(row['patient_kappa_initiation'] or 0):>10.3f} "
               f"{(row['patient_auroc'] or 0):>10.3f} {row['patient_agree']:>10.3f} "
               f"{row['n_vaso_patients']:>8}")
 

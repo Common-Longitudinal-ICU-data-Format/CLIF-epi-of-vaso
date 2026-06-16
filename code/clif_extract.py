@@ -158,12 +158,44 @@ def identify_suspected_infection(clif_dir: Path, time_window_hours: int = 24) ->
 # ---------------------------------------------------------------------------
 def get_icu_times(clif_dir: Path) -> pd.DataFrame:
     adt = pd.read_parquet(clif_dir / "clif_adt.parquet")
-    icu = (adt[adt["location_category"] == "icu"]
-           .sort_values("in_dttm")
-           .groupby("hospitalization_id")
+    icu_rows = adt[adt["location_category"] == "icu"].sort_values("in_dttm")
+    # First ICU entry per patient (for intime) and last exit (for outtime)
+    agg = (icu_rows.groupby("hospitalization_id")
            .agg(icu_intime=("in_dttm", "first"), icu_outtime=("out_dttm", "last"))
            .reset_index())
+    # location_type of first ICU stay
+    first_loc_type = (icu_rows.groupby("hospitalization_id")
+                      .first()
+                      .reset_index()
+                      [["hospitalization_id"] +
+                       (["location_type"] if "location_type" in icu_rows.columns else [])])
+    icu = agg.merge(first_loc_type, on="hospitalization_id", how="left")
+    if "location_type" not in icu.columns:
+        icu["location_type"] = np.nan
     return icu
+
+
+def get_any_location_times(clif_dir: Path) -> pd.DataFrame:
+    """First ADT entry (any location_category) per hospitalization.
+
+    Used to build the non-ICU parallel cohort — returns the first location
+    a patient appears at during the hospitalization, plus its category/type.
+    """
+    adt = pd.read_parquet(clif_dir / "clif_adt.parquet")
+    first = (adt.sort_values("in_dttm")
+             .groupby("hospitalization_id")
+             .first()
+             .reset_index())
+    cols = ["hospitalization_id", "in_dttm", "out_dttm"]
+    for c in ["location_category", "location_type"]:
+        if c in first.columns:
+            cols.append(c)
+    first = first[cols].rename(columns={"in_dttm": "first_loc_intime",
+                                        "out_dttm": "first_loc_outtime"})
+    for c in ["location_category", "location_type"]:
+        if c not in first.columns:
+            first[c] = np.nan
+    return first
 
 
 # ---------------------------------------------------------------------------
@@ -343,6 +375,27 @@ def build_cohort(clif_dir: Path, co: ClifOrchestrator) -> tuple:
     })
     print(f"  {len(suspected):,} with infection within 24h of ICU admit")
 
+    # Also build non-ICU any-location cohort in parallel (for secondary output)
+    any_loc = get_any_location_times(clif_dir)
+    suspected_all = identify_suspected_infection(clif_dir)
+    suspected_all = suspected_all.merge(any_loc, on="hospitalization_id", how="inner")
+    suspected_all["presumed_infection_dttm"] = tz_coerce(suspected_all["presumed_infection_dttm"], TIMEZONE)
+    suspected_all["first_loc_intime"] = tz_coerce(suspected_all["first_loc_intime"], TIMEZONE)
+    diff_all = (suspected_all["presumed_infection_dttm"] - suspected_all["first_loc_intime"]).dt.total_seconds() / 3600
+    suspected_all = suspected_all[diff_all.abs() <= 24].copy()
+    # Non-ICU = patients not in the primary ICU cohort after step 2
+    nonicu_ids_step2 = set(suspected_all["hospitalization_id"]) - set(suspected["hospitalization_id"])
+    suspected_nonicu = suspected_all[suspected_all["hospitalization_id"].isin(nonicu_ids_step2)].copy()
+
+    # Log non-ICU location breakdown for the CONSORT flowchart
+    if len(suspected_nonicu) > 0 and "location_category" in suspected_nonicu.columns:
+        loc_counts = suspected_nonicu["location_category"].fillna("unknown").value_counts()
+        for loc_cat, loc_n in loc_counts.items():
+            filter_log.append({
+                "step": f"Non-ICU: {loc_cat}",
+                "n_hospitalizations": int(loc_n),
+            })
+
     print("Step 3: NE criteria (first NE ≤24h of ICU admit, ≥2 records)...")
     ne = get_ne_criteria(clif_dir, icu)
     suspected = suspected.merge(ne, on="hospitalization_id", how="inner")
@@ -478,15 +531,21 @@ def build_cohort(clif_dir: Path, co: ClifOrchestrator) -> tuple:
     cohort = cohort.merge(vaso_pretraj, on="stay_id", how="left")
     cohort["vaso_before_traj"] = cohort["vaso_before_traj"].fillna(0).astype(int)
 
+    n_excl_vaso = int((cohort["vaso_before_traj"] == 1).sum())
+    print(f"  {n_excl_vaso:,} patients excluded for vasopressin in 24h before trajectory start")
+    filter_log.append({
+        "step": "Patients on vasopressin in 24h before trajectory start (excluded)",
+        "n_hospitalizations": n_excl_vaso,
+    })
     print("  Excluding patients on vasopressin in 24h before trajectory start...")
     cohort = cohort[cohort["vaso_before_traj"] == 0].copy()
     filter_log.append({
-        "step": "Exclude vasopressin in 24h before trajectory start",
+        "step": "Final cohort after excluding pre-trajectory vasopressin",
         "n_hospitalizations": len(cohort),
     })
     print(f"  {len(cohort):,} remaining after exclusion")
 
-    return cohort, co, filter_log
+    return cohort, co, filter_log, suspected_nonicu
 
 
 # ---------------------------------------------------------------------------
@@ -785,6 +844,49 @@ def add_nee(grid: pd.DataFrame, meds: pd.DataFrame) -> pd.DataFrame:
     return grid
 
 
+# NEE component drugs pulled as individual dose columns (mcg/kg/min each)
+_NEE_COMPONENT_CATS = ["epinephrine", "phenylephrine", "dopamine"]
+
+
+def add_nee_components(grid: pd.DataFrame, meds: pd.DataFrame) -> pd.DataFrame:
+    """Add per-hour mean dose columns for each NEE component drug (mcg/kg/min).
+
+    Columns added: epinephrine, phenylephrine, dopamine.
+    Norepinephrine and vasopressin are already extracted by add_ne_dose/add_vaso_dose.
+    """
+    converted = meds[meds["_convert_status"] == "success"].copy()
+    g = grid[["stay_id", "time_hour", "start_time", "end_time"]]
+
+    for med_cat in _NEE_COMPONENT_CATS:
+        sub = converted[
+            (converted["med_category"] == med_cat) &
+            converted["med_dose_converted"].notna()
+        ][["stay_id", "admin_dttm", "med_dose_converted"]].copy()
+
+        if sub.empty:
+            grid[med_cat] = 0.0
+            continue
+
+        sub = sub.sort_values(["stay_id", "admin_dttm"])
+        sub["end_dttm"] = (sub.groupby("stay_id")["admin_dttm"]
+                           .shift(-1)
+                           .fillna(pd.Timestamp("2100-01-01")))
+        sub.loc[sub["med_dose_converted"] == 0.0, "end_dttm"] = (
+            sub.loc[sub["med_dose_converted"] == 0.0, "admin_dttm"]
+        )
+
+        sub_g = sub.merge(g, on="stay_id")
+        sub_hr = sub_g[(sub_g["admin_dttm"] < sub_g["end_time"]) &
+                       (sub_g["end_dttm"]   > sub_g["start_time"])]
+        agg = (sub_hr.groupby(["stay_id", "time_hour"])["med_dose_converted"]
+               .mean().reset_index()
+               .rename(columns={"med_dose_converted": med_cat}))
+        grid = grid.merge(agg, on=["stay_id", "time_hour"], how="left")
+        grid[med_cat] = grid[med_cat].fillna(0.0)
+
+    return grid
+
+
 def add_labs(grid: pd.DataFrame, clif_dir: Path) -> pd.DataFrame:
     labs = pd.read_parquet(clif_dir / "clif_labs.parquet")
     target = labs[labs["lab_category"].isin(["bun", "creatinine", "lactate", "wbc", "platelet_count"])][
@@ -1059,6 +1161,9 @@ def build_features(cohort: pd.DataFrame, co: ClifOrchestrator, clif_dir: Path) -
     print("Adding NEE (norepinephrine equivalent dose)...")
     grid = add_nee(grid, meds)
 
+    print("Adding NEE component doses (epinephrine, phenylephrine, dopamine)...")
+    grid = add_nee_components(grid, meds)
+
     print("Adding labs (BUN, creatinine, lactate)...")
     grid = add_labs(grid, clif_dir)
 
@@ -1110,19 +1215,21 @@ def main():
     print("=" * 60)
     print("PHASE A: COHORT IDENTIFICATION")
     print("=" * 60)
-    cohort, co, filter_log = build_cohort(CLIF_DIR, co)
+    cohort, co, filter_log, suspected_nonicu = build_cohort(CLIF_DIR, co)
 
-    print(f"\nFinal cohort: {len(cohort):,} patients")
+    print(f"\nFinal ICU cohort: {len(cohort):,} patients")
     print(f"  Mortality:        {cohort['hospital_death'].mean():.1%}")
     print(f"  Median traj_hours: {cohort['traj_hours'].median():.0f}h")
 
+    # location_category is always "icu" for this cohort; location_type varies
     cohort_out = cohort[[
         "stay_id", "hospital_death", "anchor_year_group",
-        "traj_hours", "death_hour", "first_norepi_time",
+        "traj_hours", "death_hour", "first_norepi_time", "trajectory_start",
         "age", "gender", "race", "weight",
         "sepsis_onset_sofa", "initial_lactate",
-        "vaso_before_traj",
-    ]]
+        "vaso_before_traj", "location_type",
+    ]].copy()
+    cohort_out["location_category"] = "icu"
     cohort_path = PATIENT_LEVEL_DIR / "cohort.parquet"
     cohort_out.to_parquet(cohort_path, index=False)
     print(f"Saved {cohort_path}")
@@ -1130,6 +1237,20 @@ def main():
     filter_csv = PATIENT_LEVEL_DIR / "cohort_filter_counts.csv"
     pd.DataFrame(filter_log).to_csv(filter_csv, index=False)
     print(f"Saved {filter_csv}")
+
+    # Non-ICU cohort: save minimal info for exploratory use
+    if suspected_nonicu is not None and len(suspected_nonicu) > 0:
+        print(f"\nNon-ICU patients meeting infection + location within 24h: "
+              f"{len(suspected_nonicu):,}")
+        nonicu_out = suspected_nonicu[[
+            "hospitalization_id",
+            "location_category", "location_type",
+            "presumed_infection_dttm", "first_loc_intime",
+        ]].rename(columns={"hospitalization_id": "stay_id"})
+        nonicu_path = PATIENT_LEVEL_DIR / "cohort_nonicu_step2.parquet"
+        nonicu_out.to_parquet(nonicu_path, index=False)
+        print(f"Saved non-ICU step-2 candidates → {nonicu_path}")
+        print("  (NE/SOFA/lactate filters not yet applied to non-ICU cohort)")
 
     print("\n" + "=" * 60)
     print("PHASE B: FEATURE EXTRACTION")
