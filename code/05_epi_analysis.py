@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-epi_analysis.py
+05_epi_analysis.py
 
 Epidemiological characterization of vasopressin use in septic shock.
 
@@ -23,7 +23,7 @@ Analyses:
   4d   Waiting time: hours above NEE/lactate/MAP thresholds before vasopressin
 
 Usage:
-    uv run python code/epi_analysis.py
+    uv run python code/05_epi_analysis.py
 """
 
 import sys
@@ -164,6 +164,12 @@ pre_vaso_nee = pre_vaso_nee[
 pre_vaso_max = pre_vaso_nee.groupby("stay_id")["nee"].max().rename("pre_vaso_max_nee")
 pat = pat.merge(pre_vaso_max, on="stay_id", how="left")
 
+# death_in_window: patient died within the 120h trajectory (vs. hospital_death which
+# includes deaths after the window, incorrectly placed at t=120 in KM)
+death_in_window = features.groupby("stay_id")["death"].max().rename("death_in_window")
+pat = pat.merge(death_in_window, on="stay_id", how="left")
+pat["death_in_window"] = pat["death_in_window"].fillna(0).astype(int)
+
 # Approximate clock hour of vasopressin initiation.
 # trajectory_start (exact) used if available; else first_norepi_time is a proxy
 # (trajectory_start = max(icu_intime, first_norepi_time, presumed_infection_dttm))
@@ -293,7 +299,7 @@ for i, grp in enumerate(NEE_BIN_LABELS):
     if len(sub) < 5:
         continue
     kmf = KaplanMeierFitter()
-    kmf.fit(sub["traj_hours"], event_observed=sub["hospital_death"],
+    kmf.fit(sub["traj_hours"], event_observed=sub["death_in_window"],
             label=f"{grp} μg/kg/min (n={len(sub)})")
     kmf.plot_survival_function(ax=ax, ci_show=True, color=PALETTE[i], linewidth=2)
 
@@ -320,7 +326,7 @@ for label, mask, color in [
 ]:
     sub = pat[mask]
     kmf = KaplanMeierFitter()
-    kmf.fit(sub["traj_hours"], event_observed=sub["hospital_death"],
+    kmf.fit(sub["traj_hours"], event_observed=sub["death_in_window"],
             label=f"{label} (n={len(sub)})")
     kmf.plot_survival_function(ax=ax, ci_show=True, color=color, linewidth=2.5)
 
@@ -342,41 +348,6 @@ print("Analysis 2: NEE dose vs vaso use...")
 
 scat = features[["nee", "action_vaso"]].copy()
 scat["nee_clipped"] = scat["nee"].clip(upper=NEE_PLOT_CAP)
-
-# ── Raw ───────────────────────────────────────────────────────────────────────
-fig, ax = plt.subplots(figsize=(10, 5))
-rng    = np.random.default_rng(42)
-jitter = rng.uniform(-0.05, 0.05, size=len(scat))
-ax.scatter(
-    scat["nee_clipped"], scat["action_vaso"] + jitter,
-    alpha=0.015, s=1.5, color="#2c6fad", rasterized=True,
-)
-ax.set_xlabel("NEE dose (μg/kg/min, capped at 5)", fontsize=11)
-ax.set_ylabel("Vasopressin on (0=no, 1=yes, jittered ±0.05)", fontsize=11)
-ax.set_title(f"{SITE_NAME}: NEE dose vs vasopressin — all patient-hours (n={len(scat):,})", fontsize=12)
-ax.set_ylim(-0.2, 1.2)
-ax.set_yticks([0, 1])
-ax.set_yticklabels(["Off (0)", "On (1)"])
-fig.tight_layout()
-fig.savefig(OUT_DIR / f"{SITE_LOWER}_analysis2_raw.png", dpi=150)
-plt.close(fig)
-
-# ── A: hexbin density ─────────────────────────────────────────────────────────
-fig, ax = plt.subplots(figsize=(10, 5))
-hb = ax.hexbin(
-    scat["nee_clipped"], scat["action_vaso"],
-    gridsize=60, cmap="YlOrRd", mincnt=1, linewidths=0.2,
-)
-plt.colorbar(hb, ax=ax, label="Patient-hours per hex")
-ax.set_xlabel("NEE dose (μg/kg/min, capped at 5)", fontsize=11)
-ax.set_ylabel("Vasopressin on (0=no, 1=yes)", fontsize=11)
-ax.set_title(f"{SITE_NAME}: NEE dose vs vasopressin — density (hexbin)", fontsize=12)
-ax.set_ylim(-0.1, 1.1)
-ax.set_yticks([0, 1])
-ax.set_yticklabels(["Off (0)", "On (1)"])
-fig.tight_layout()
-fig.savefig(OUT_DIR / f"{SITE_LOWER}_analysis2_A.png", dpi=150)
-plt.close(fig)
 
 # ── B: binned proportion with Wilson 95% CI ───────────────────────────────────
 bin_edges = np.arange(0, NEE_PLOT_CAP + 0.05, 0.1)
@@ -411,7 +382,7 @@ ax.set_ylim(bottom=0)
 fig.tight_layout()
 fig.savefig(OUT_DIR / f"{SITE_LOWER}_analysis2_B.png", dpi=150)
 plt.close(fig)
-print("  Saved analysis2_raw / analysis2_A / analysis2_B")
+print("  Saved analysis2_B")
 
 # ── 2B_stratified: proportion on vaso by NEE bin, coloured by location ───────
 print("Analysis 2B_stratified: proportion on vaso by NEE, stratified by location...")
@@ -807,73 +778,6 @@ plt.close(fig)
 print("  Saved analysis3_TOD")
 
 # =============================================================================
-# Analysis 3.5: Step-wise feature trajectories centered on vaso initiation
-# =============================================================================
-print("Analysis 3.5: Feature trajectories around initiation...")
-
-WINDOW = 24  # hours before/after event
-
-# Vaso patients: align to first_vaso_hour
-feat_vaso = features[features["stay_id"].isin(ever_vaso_ids)].merge(
-    first_vaso[["stay_id", "first_vaso_hour"]], on="stay_id"
-)
-feat_vaso["rel_hour"] = feat_vaso["time_hour"] - feat_vaso["first_vaso_hour"]
-feat_vaso_win = feat_vaso[
-    (feat_vaso["rel_hour"] >= -WINDOW) & (feat_vaso["rel_hour"] <= WINDOW)
-]
-
-# Never-vaso patients: anchor at hour of max NEE as pseudo-event
-feat_never = features[features["stay_id"].isin(never_vaso_ids)].copy()
-nee_peak_idx = feat_never.groupby("stay_id")["nee"].idxmax()
-anchor = (feat_never.loc[nee_peak_idx, ["stay_id", "time_hour"]]
-          .rename(columns={"time_hour": "anchor_hour"}))
-feat_never = feat_never.merge(anchor, on="stay_id")
-feat_never["rel_hour"] = feat_never["time_hour"] - feat_never["anchor_hour"]
-feat_never_win = feat_never[
-    (feat_never["rel_hour"] >= -WINDOW) & (feat_never["rel_hour"] <= WINDOW)
-]
-
-TRAJ_FEATS = [
-    ("nee",     "NEE (μg/kg/min)"),
-    ("mbp",     "MAP (mmHg)"),
-    ("sofa",    "SOFA score"),
-    ("lactate", "Lactate (mmol/L)"),
-]
-
-fig, axes = plt.subplots(2, 2, figsize=(13, 9), sharex=True)
-axes = axes.flatten()
-
-for ax, (col, label) in zip(axes, TRAJ_FEATS):
-    gv = mean_ci(feat_vaso_win,  col)
-    gn = mean_ci(feat_never_win, col)
-
-    ax.fill_between(gv["rel_hour"], gv["ci_lo"], gv["ci_hi"],
-                    alpha=0.2, color=PALETTE[2])
-    ax.plot(gv["rel_hour"], gv["mean"], color=PALETTE[2], linewidth=2,
-            label=f"Ever vasopressin (n={len(ever_vaso_ids)})")
-
-    ax.fill_between(gn["rel_hour"], gn["ci_lo"], gn["ci_hi"],
-                    alpha=0.2, color=PALETTE[0])
-    ax.plot(gn["rel_hour"], gn["mean"], color=PALETTE[0], linewidth=2,
-            label=f"Never vasopressin (n={len(never_vaso_ids)})\nanchored at max-NEE hour")
-
-    ax.axvline(0, color="black", linestyle="--", linewidth=1.2)
-    ax.set_ylabel(label, fontsize=11)
-    ax.set_xlabel("Hours relative to vaso start / peak-NEE anchor", fontsize=9)
-    ax.legend(fontsize=8)
-    ax.set_title(label, fontsize=11)
-
-fig.suptitle(
-    f"{SITE_NAME}: Feature trajectories ±{WINDOW}h around vasopressin initiation\n"
-    f"(mean ± 95% CI; never-vaso patients anchored at their hour of peak NEE)",
-    fontsize=12,
-)
-fig.tight_layout()
-fig.savefig(OUT_DIR / f"{SITE_LOWER}_analysis3_5_trajectories.png", dpi=150, bbox_inches="tight")
-plt.close(fig)
-print("  Saved analysis3_5")
-
-# =============================================================================
 # Analysis 4a: Distribution of time-to-vasopressin initiation
 # =============================================================================
 print("Analysis 4a: Time-to-vaso histogram...")
@@ -897,78 +801,6 @@ fig.tight_layout()
 fig.savefig(OUT_DIR / f"{SITE_LOWER}_analysis4a_time_to_vaso.png", dpi=150)
 plt.close(fig)
 print("  Saved analysis4a")
-
-# =============================================================================
-# Analysis 4b: NEE dose at vasopressin initiation (violin)
-# =============================================================================
-print("Analysis 4b: NEE at vaso initiation violin...")
-
-nee_init = pat[pat["ever_vaso"] == 1]["nee_at_init"].dropna().clip(upper=NEE_PLOT_CAP)
-q1, med, q3 = nee_init.quantile([0.25, 0.5, 0.75])
-
-fig, ax = plt.subplots(figsize=(5, 7))
-parts = ax.violinplot(nee_init, positions=[1], showmedians=True, showextrema=True)
-for pc in parts["bodies"]:
-    pc.set_facecolor(PALETTE[0])
-    pc.set_alpha(0.75)
-parts["cmedians"].set_color(PALETTE[2])
-parts["cmedians"].set_linewidth(2.5)
-# IQR box
-ax.bar(1, q3 - q1, bottom=q1, width=0.12,
-       color=PALETTE[2], alpha=0.85, label=f"IQR: {q1:.2f}–{q3:.2f} μg/kg/min")
-ax.set_xticks([1])
-ax.set_xticklabels(["Vaso initiators"], fontsize=11)
-ax.set_ylabel("NEE dose at vasopressin initiation (μg/kg/min)", fontsize=11)
-ax.set_title(f"{SITE_NAME}: NEE dose at moment of vasopressin start\n"
-             f"Median = {med:.2f} μg/kg/min  (n={len(nee_init):,})", fontsize=12)
-ax.set_ylim(0)
-ax.legend(fontsize=10)
-fig.tight_layout()
-fig.savefig(OUT_DIR / f"{SITE_LOWER}_analysis4b_nee_at_init.png", dpi=150)
-plt.close(fig)
-print("  Saved analysis4b")
-
-# =============================================================================
-# Analysis 4c: Heatmap — NEE over time, rows sorted by initiation hour
-# =============================================================================
-print("Analysis 4c: NEE heatmap (this may take a moment)...")
-
-vaso_stays = (pat[pat["ever_vaso"] == 1]
-              .sort_values("first_vaso_hour")["stay_id"].values)
-feat_heat  = (features[features["stay_id"].isin(vaso_stays)]
-              [["stay_id", "time_hour", "nee"]].copy())
-feat_heat["nee"] = feat_heat["nee"].clip(upper=3.0)
-
-MAX_HOUR = 120
-pivot = (feat_heat
-         .pivot_table(index="stay_id", columns="time_hour", values="nee", aggfunc="first")
-         .reindex(columns=range(MAX_HOUR + 1))
-         .reindex(vaso_stays))
-
-fig_h = max(6, len(vaso_stays) // 25)
-fig, ax = plt.subplots(figsize=(14, fig_h))
-img = ax.imshow(
-    pivot.values, aspect="auto", cmap="YlOrRd",
-    vmin=0, vmax=3, interpolation="none",
-    extent=[0, MAX_HOUR, len(vaso_stays), 0],
-)
-plt.colorbar(img, ax=ax, label="NEE (μg/kg/min, capped at 3)", shrink=0.7)
-
-# Overlay white line at first_vaso_hour
-fv_sorted = (pat[pat["ever_vaso"] == 1]
-             .set_index("stay_id").reindex(vaso_stays)["first_vaso_hour"].values)
-ax.plot(fv_sorted, np.arange(len(vaso_stays)) + 0.5,
-        color="white", linewidth=1.0, alpha=0.85, label="Vaso start")
-ax.legend(loc="upper right", fontsize=9, facecolor="#333", labelcolor="white")
-
-ax.set_xlabel("Hours from trajectory start", fontsize=11)
-ax.set_ylabel(f"Patients (n={len(vaso_stays)}, sorted by vaso start time ↓)", fontsize=10)
-ax.set_title(f"{SITE_NAME}: NEE dose over time — vasopressin patients only, "
-             f"sorted by initiation hour", fontsize=12)
-fig.tight_layout()
-fig.savefig(OUT_DIR / f"{SITE_LOWER}_analysis4c_heatmap.png", dpi=100, bbox_inches="tight")
-plt.close(fig)
-print("  Saved analysis4c")
 
 # =============================================================================
 # Analysis 4d: Waiting time — hours above thresholds before vasopressin
@@ -1255,66 +1087,6 @@ fig.tight_layout()
 fig.savefig(OUT_DIR / f"{SITE_LOWER}_analysis5_B.png", dpi=150, bbox_inches="tight")
 plt.close(fig)
 print("  Saved analysis5_B")
-
-# ─────────────────────────────────────────────────────────────────────────────
-# 5_C: Heatmap — row-z-scored medians, annotated with actual medians
-# ─────────────────────────────────────────────────────────────────────────────
-hm_vals, hm_ann = [], []
-for col, label in INIT_FEATURES:
-    row, ann = [], []
-    for q in Q_LABELS:
-        sub = initiators[initiators["nee_init_q"] == q][col].dropna()
-        if len(sub) >= 5:
-            m = sub.median()
-            row.append(m)
-            ann.append(f"{m:.1f}")
-        else:
-            row.append(np.nan)
-            ann.append("")
-    hm_vals.append(row)
-    hm_ann.append(ann)
-
-hm = np.array(hm_vals, dtype=float)
-hm_z = np.full_like(hm, np.nan)
-for i in range(hm.shape[0]):
-    row  = hm[i]
-    mask = ~np.isnan(row)
-    if mask.sum() >= 2:
-        mu, sd = np.nanmean(row), np.nanstd(row)
-        hm_z[i, mask] = (row[mask] - mu) / sd if sd > 0 else 0.0
-
-feat_labels_short = [label for _, label in INIT_FEATURES]
-col_labels_short  = [f"Q{i+1}\n{q.split('  ')[1]} μg/kg/min" for i, q in enumerate(Q_LABELS)]
-
-fig, ax = plt.subplots(figsize=(8, 0.72 * len(feat_labels_short) + 2.5))
-im = ax.imshow(hm_z, cmap="RdBu_r", vmin=-2, vmax=2, aspect="auto")
-plt.colorbar(im, ax=ax, label="Row z-score of median\n(blue = lower in this quartile)",
-             fraction=0.04, pad=0.02)
-
-ax.set_xticks(range(4))
-ax.set_xticklabels(col_labels_short, fontsize=10)
-ax.set_yticks(range(len(feat_labels_short)))
-ax.set_yticklabels(feat_labels_short, fontsize=10)
-
-for i in range(len(feat_labels_short)):
-    for j in range(4):
-        txt = hm_ann[i][j]
-        if txt:
-            txt_color = "white" if abs(hm_z[i, j]) > 1.2 else "black"
-            ax.text(j, i, txt, ha="center", va="center",
-                    fontsize=9, color=txt_color, fontweight="bold")
-
-ax.set_xlabel("NEE dose at vasopressin initiation (quartile)", fontsize=11)
-ax.set_title(
-    f"{SITE_NAME}  —  5_C: Patient profile by NEE dose at vasopressin initiation\n"
-    f"Color = row-normalized z-score  |  text = actual median  "
-    f"(n={len(initiators):,} initiators)",
-    fontsize=12,
-)
-fig.tight_layout()
-fig.savefig(OUT_DIR / f"{SITE_LOWER}_analysis5_C.png", dpi=150, bbox_inches="tight")
-plt.close(fig)
-print("  Saved analysis5_C")
 
 # =============================================================================
 # Analysis 5_D: Rate of change in key features vs NEE-at-initiation quartile
