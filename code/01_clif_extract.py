@@ -93,7 +93,7 @@ if CLIF_DIR is None or OUTPUT_ROOT is None:
     )
 
 # Patient-level (PHI) intermediate outputs — stay local, NEVER shared.
-# site_summary.py / site_threshold_sweep.py read from here and write the
+# 02_site_summary.py / 03_site_threshold_sweep.py read from here and write the
 # shareable aggregates to output/upload_to_box_<SITE_NAME>/.
 PATIENT_LEVEL_DIR = OUTPUT_ROOT / "output" / f"patient_level_data_{SITE_NAME}"
 

@@ -1,5 +1,5 @@
 """
-site_threshold_sweep.py
+03_site_threshold_sweep.py
 
 Per-feature threshold sweep predicting clinician vasopressin action (action_vaso).
 Run at each site — reads the site's intermediate parquet files from
@@ -27,8 +27,8 @@ Outputs (in output/upload_to_box_<SITE>/):
   - patient_level_table.csv
 
 Usage:
-    uv run python code/site_threshold_sweep.py
-    uv run python code/site_threshold_sweep.py --model path/to/fqi_model.pkl
+    uv run python code/03_site_threshold_sweep.py
+    uv run python code/03_site_threshold_sweep.py --model path/to/fqi_model.pkl
 """
 import argparse
 import pickle
@@ -846,7 +846,7 @@ def main():
 
     if not feat_path.exists():
         raise FileNotFoundError(
-            f"{feat_path} not found.\nRun code/clif_extract.py first."
+            f"{feat_path} not found.\nRun code/01_clif_extract.py first."
         )
 
     # Load features and cohort
@@ -879,7 +879,7 @@ def main():
     print(f"Patients:   {step_data['stay_id'].n_unique():,}")
     print(f"Steps:      {len(step_data):,}")
 
-    # Training split for kappa threshold computation (matches site_threshold_outcome.py)
+    # Training split for kappa threshold computation (matches 04_site_threshold_outcome.py)
     _all_ids = cohort["stay_id"].unique().to_numpy()
     _rng     = np.random.default_rng(RANDOM_SEED)
     _perm    = _rng.permutation(len(_all_ids))
