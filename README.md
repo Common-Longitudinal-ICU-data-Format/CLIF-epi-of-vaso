@@ -92,7 +92,6 @@ Writes `threshold_outcome_table.csv` and `threshold_concordance_summary.csv` to 
 
 ```bash
 uv run python code/05_epi_analysis.py
-uv run python code/05_epi_analysis.py --site MIMIC   # override site name
 ```
 
 Writes figures and 12 federated-safe CSVs to `output/upload_to_box_<SITE>/epi_analysis/`.
