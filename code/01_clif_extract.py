@@ -484,7 +484,7 @@ def build_cohort(clif_dir: Path, co: ClifOrchestrator) -> tuple:
     def to_utc(s):
         s = pd.to_datetime(s, utc=False)
         if s.dt.tz is None:
-            s = s.dt.tz_localize(TIMEZONE)
+            s = s.dt.tz_localize(TIMEZONE, ambiguous="NaT", nonexistent="NaT")
         else:
             s = s.dt.tz_convert(TIMEZONE)
         return s
