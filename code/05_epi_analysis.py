@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-epi_analysis.py
+05_epi_analysis.py
 
 Epidemiological characterization of vasopressin use in septic shock.
 
@@ -23,7 +23,7 @@ Analyses:
   4d   Waiting time: hours above NEE/lactate/MAP thresholds before vasopressin
 
 Usage:
-    uv run python code/epi_analysis.py
+    uv run python code/05_epi_analysis.py
 """
 
 import sys

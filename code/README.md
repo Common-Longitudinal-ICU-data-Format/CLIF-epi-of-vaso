@@ -6,54 +6,56 @@ All analysis scripts for the vasopressin epidemiology project.
 
 | Script | Purpose | Run at |
 |--------|---------|--------|
-| `clif_extract.py` | Extract septic shock cohort and hourly features from CLIF 2.1.0 parquet tables | Each CLIF site |
-| `site_summary.py` | Compute federated-safe aggregate statistics; write shareable CSVs to `upload_to_box_<SITE>/` | Each site |
-| `site_threshold_sweep.py` | Per-feature threshold sweep vs clinician vasopressin action | Each site |
-| `site_threshold_outcome.py` | Discrete-time survival analysis of threshold-based rules (optional) | Each site |
-| `epi_analysis.py` | Epidemiological characterization; write figures + CSVs to `upload_to_box_<SITE>/epi_analysis/` | Each site |
-| `cross_site_vasopressin_analysis.py` | Combine aggregate outputs from multiple `upload_to_box_*` folders; produce cross-site figures | Coordinating site only |
-| `make_summary_report.py` | Generate self-contained HTML summary from `upload_to_box_*/epi_analysis/` figures | Coordinating site only |
+| `01_clif_extract.py` | Extract septic shock cohort and hourly features from CLIF 2.1.0 parquet tables | Each CLIF site |
+| `02_site_summary.py` | Compute federated-safe aggregate statistics; write shareable CSVs to `upload_to_box_<SITE>/` | Each site |
+| `03_site_threshold_sweep.py` | Per-feature threshold sweep vs clinician vasopressin action | Each site |
+| `04_site_threshold_outcome.py` | Discrete-time survival analysis of threshold-based rules (optional) | Each site |
+| `05_epi_analysis.py` | Epidemiological characterization; write figures + CSVs to `upload_to_box_<SITE>/epi_analysis/` | Each site |
+| `06_cross_site_vasopressin_analysis.py` | Combine aggregate outputs from multiple `upload_to_box_*` folders; produce cross-site figures | Coordinating site only |
+| `07_make_summary_report.py` | Generate self-contained HTML summary from `upload_to_box_*/epi_analysis/` figures | Coordinating site only |
 
-The site is read from `SITE_NAME` in `config/config.py`. Pass `--site <NAME>` to `epi_analysis.py` to override (e.g. for MIMIC-IV).
+Unnumbered scripts (`mimic_extract.py`, `multisite_epi_plots.py`, `make_threshold_summary_report.py`) are supplementary and not part of the primary analysis pipeline.
+
+The site is read from `SITE_NAME` in `config/config.py`. Pass `--site <NAME>` to `05_epi_analysis.py` to override (e.g. for MIMIC-IV).
 
 ## Usage
 
 ```bash
 # Extraction — writes PHI intermediate to output/patient_level_data_<SITE>/
-uv run python code/clif_extract.py
+uv run python code/01_clif_extract.py
 
 # Federated summary — writes shareable CSVs to output/upload_to_box_<SITE>/
-uv run python code/site_summary.py
+uv run python code/02_site_summary.py
 
 # Threshold sweep — writes to output/upload_to_box_<SITE>/threshold/
-uv run python code/site_threshold_sweep.py
+uv run python code/03_site_threshold_sweep.py
 
 # Threshold outcome (optional) — writes to output/upload_to_box_<SITE>/threshold/
-uv run python code/site_threshold_outcome.py
+uv run python code/04_site_threshold_outcome.py
 
 # Epidemiological analysis — writes figures + 12 aggregate CSVs to upload_to_box_<SITE>/epi_analysis/
-uv run python code/epi_analysis.py
-uv run python code/epi_analysis.py --site MIMIC   # override site name
+uv run python code/05_epi_analysis.py
+uv run python code/05_epi_analysis.py --site MIMIC   # override site name
 
 # Cross-site (coordinating site) — reads all upload_to_box_* dirs in output/
-uv run python code/cross_site_vasopressin_analysis.py
-uv run python code/make_summary_report.py
-uv run python code/make_summary_report.py --embed   # portable single-file HTML
+uv run python code/06_cross_site_vasopressin_analysis.py
+uv run python code/07_make_summary_report.py
+uv run python code/07_make_summary_report.py --embed   # portable single-file HTML
 ```
 
 ## Outputs
 
 | Script | Output location | Notes |
 |--------|----------------|-------|
-| `clif_extract.py` | `output/patient_level_data_<SITE>/` | PHI — never shared |
-| `site_summary.py` | `output/upload_to_box_<SITE>/` (root CSVs) | Share |
-| `site_threshold_sweep.py` | `output/upload_to_box_<SITE>/threshold/` | Share |
-| `site_threshold_outcome.py` | `output/upload_to_box_<SITE>/threshold/` | Share |
-| `epi_analysis.py` | `output/epi_analysis_<SITE>/` (PHI copy) + `output/upload_to_box_<SITE>/epi_analysis/` (CSVs + plots) | Share the `epi_analysis/` folder inside `upload_to_box_<SITE>/` |
-| `cross_site_vasopressin_analysis.py` | `cross-site output/plots/` | Coordinating site |
-| `make_summary_report.py` | `output/cross_site_summary.html` | Coordinating site |
+| `01_clif_extract.py` | `output/patient_level_data_<SITE>/` | PHI — never shared |
+| `02_site_summary.py` | `output/upload_to_box_<SITE>/` (root CSVs) | Share |
+| `03_site_threshold_sweep.py` | `output/upload_to_box_<SITE>/threshold/` | Share |
+| `04_site_threshold_outcome.py` | `output/upload_to_box_<SITE>/threshold/` | Share |
+| `05_epi_analysis.py` | `output/epi_analysis_<SITE>/` (PHI copy) + `output/upload_to_box_<SITE>/epi_analysis/` (CSVs + plots) | Share the `epi_analysis/` folder inside `upload_to_box_<SITE>/` |
+| `06_cross_site_vasopressin_analysis.py` | `cross-site output/plots/` | Coordinating site |
+| `07_make_summary_report.py` | `output/cross_site_summary.html` | Coordinating site |
 
-## epi_analysis.py analyses
+## 05_epi_analysis.py analyses
 
 | ID | Name | Description |
 |----|------|-------------|

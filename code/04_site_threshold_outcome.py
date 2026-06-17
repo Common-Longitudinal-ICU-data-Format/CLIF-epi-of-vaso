@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-site_threshold_outcome.py
+04_site_threshold_outcome.py
 
 Per-site discrete-time survival analysis of threshold-based vasopressin rules.
 
@@ -40,7 +40,7 @@ Outputs to output/upload_to_box_<SITE>/ (aggregate only, no patient rows):
   threshold_concordance_summary.csv — concordance prevalence + crude hazard (QC)
 
 Usage:
-    uv run python code/site_threshold_outcome.py
+    uv run python code/04_site_threshold_outcome.py
 """
 
 import sys
@@ -120,7 +120,7 @@ def _r(x):
 
 
 def get_train_ids(cohort: pd.DataFrame) -> set:
-    """Deterministic 70% training split — identical to site_summary.py."""
+    """Deterministic 70% training split — identical to 02_site_summary.py."""
     ids = cohort["stay_id"].values.copy()
     rng = np.random.default_rng(RANDOM_SEED)
     ids = ids[rng.permutation(len(ids))]
@@ -534,7 +534,7 @@ def main():
     cohort = pd.read_parquet(coh_path)
     feat   = pd.read_parquet(feat_path)
 
-    # Same t≤0 vaso exclusion as site_summary.py
+    # Same t≤0 vaso exclusion as 02_site_summary.py
     feat = feat.sort_values(["stay_id", "time_hour"])
     vaso_t0 = feat[feat["time_hour"] <= 0].groupby("stay_id")["action_vaso"].max()
     excl = set(vaso_t0[vaso_t0 == 1].index)

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-analysis/site_summary.py
+02_site_summary.py
 
 Federated-safe aggregate summary for a septic shock cohort.
 
@@ -24,7 +24,7 @@ Outcome for analyses 4 and 5
   Threshold selected by max Youden's J on TRAIN split; carried unchanged to val/test.
 
 Usage:
-    uv run python code/site_summary.py
+    uv run python code/02_site_summary.py
     (site is read from config/config.py — SITE_NAME)
 """
 
