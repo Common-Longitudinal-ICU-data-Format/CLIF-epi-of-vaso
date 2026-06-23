@@ -224,6 +224,26 @@ print(f"  {len(ever_vaso_ids):,} ever-vaso ({len(ever_vaso_ids)/len(cohort):.1%}
 
 # ── helpers ───────────────────────────────────────────────────────────────────
 from lifelines import KaplanMeierFitter
+from lifelines.statistics import logrank_test, multivariate_logrank_test
+
+
+def fmt_p(p):
+    """Format p-value for annotation."""
+    if p < 0.001:
+        return "p<0.001"
+    if p < 0.01:
+        return f"p={p:.3f}"
+    if p < 0.05:
+        return f"p={p:.3f}"
+    return f"p={p:.2f}"
+
+
+def bracket(ax, x1, x2, y_top, h_rel, text, fontsize=8.5):
+    """Draw a significance bracket spanning x1→x2 at y_top; h_rel is tick height."""
+    ax.plot([x1, x1, x2, x2], [y_top, y_top + h_rel, y_top + h_rel, y_top],
+            lw=1.1, color="black", clip_on=False)
+    ax.text((x1 + x2) / 2, y_top + h_rel * 1.3, text,
+            ha="center", va="bottom", fontsize=fontsize)
 def smd_continuous(a, b):
     a, b = a.dropna(), b.dropna()
     if len(a) < 2 or len(b) < 2:
@@ -296,7 +316,7 @@ ax.legend(title="Pre-vaso max NEE", bbox_to_anchor=(1.02, 1),
           loc="upper left", fontsize=9)
 fig.tight_layout()
 fig.savefig(OUT_DIR / f"{SITE_LOWER}_analysis0_time_to_vaso_by_nee.png",
-            dpi=150, bbox_inches="tight")
+            dpi=500, bbox_inches="tight")
 plt.close(fig)
 print("  Saved analysis0")
 
@@ -315,6 +335,11 @@ for i, grp in enumerate(NEE_BIN_LABELS):
             label=f"{grp} μg/kg/min (n={len(sub)})")
     kmf.plot_survival_function(ax=ax, ci_show=True, color=PALETTE[i], linewidth=2)
 
+_lr1_dat = pat[["pre_vaso_nee_group", "traj_hours", "death_in_window"]].dropna(subset=["pre_vaso_nee_group"])
+_lr1_res = multivariate_logrank_test(_lr1_dat["traj_hours"], _lr1_dat["pre_vaso_nee_group"], _lr1_dat["death_in_window"])
+ax.text(0.98, 0.02, f"Log-rank {fmt_p(_lr1_res.p_value)}",
+        transform=ax.transAxes, ha="right", va="bottom", fontsize=10,
+        bbox=dict(boxstyle="round,pad=0.3", facecolor="white", edgecolor="gray", alpha=0.8))
 ax.set_xlabel("Hours from trajectory start", fontsize=12)
 ax.set_ylabel("Survival probability", fontsize=12)
 ax.set_title(f"{SITE_NAME}: Kaplan–Meier survival by pre-vaso max NEE dose", fontsize=13)
@@ -322,7 +347,7 @@ ax.set_xlim(0)
 ax.set_ylim(0, 1.02)
 ax.legend(title="Pre-vaso max NEE bin", bbox_to_anchor=(1.02, 1), loc="upper left", fontsize=9)
 fig.tight_layout()
-fig.savefig(OUT_DIR / f"{SITE_LOWER}_analysis1_km_nee_dose.png", dpi=150, bbox_inches="tight")
+fig.savefig(OUT_DIR / f"{SITE_LOWER}_analysis1_km_nee_dose.png", dpi=500, bbox_inches="tight")
 plt.close(fig)
 print("  Saved analysis1")
 
@@ -342,6 +367,14 @@ for label, mask, color in [
             label=f"{label} (n={len(sub)})")
     kmf.plot_survival_function(ax=ax, ci_show=True, color=color, linewidth=2.5)
 
+_ev15 = pat[pat["ever_vaso"] == 1]
+_nv15 = pat[pat["ever_vaso"] == 0]
+_lr15 = logrank_test(_ev15["traj_hours"], _nv15["traj_hours"],
+                     event_observed_A=_ev15["death_in_window"],
+                     event_observed_B=_nv15["death_in_window"])
+ax.text(0.98, 0.02, f"Log-rank {fmt_p(_lr15.p_value)}",
+        transform=ax.transAxes, ha="right", va="bottom", fontsize=11,
+        bbox=dict(boxstyle="round,pad=0.3", facecolor="white", edgecolor="gray", alpha=0.8))
 ax.set_xlabel("Hours from trajectory start", fontsize=12)
 ax.set_ylabel("Survival probability", fontsize=12)
 ax.set_title(f"{SITE_NAME}: Kaplan–Meier — ever vs never vasopressin", fontsize=13)
@@ -349,7 +382,7 @@ ax.set_xlim(0)
 ax.set_ylim(0, 1.02)
 ax.legend(fontsize=11)
 fig.tight_layout()
-fig.savefig(OUT_DIR / f"{SITE_LOWER}_analysis1_5_km_evervaso.png", dpi=150)
+fig.savefig(OUT_DIR / f"{SITE_LOWER}_analysis1_5_km_evervaso.png", dpi=500)
 plt.close(fig)
 print("  Saved analysis1_5")
 
@@ -392,7 +425,7 @@ ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda y, _: f"{y:.0%}"))
 ax.set_xlim(left=0)
 ax.set_ylim(bottom=0)
 fig.tight_layout()
-fig.savefig(OUT_DIR / f"{SITE_LOWER}_analysis2_B.png", dpi=150)
+fig.savefig(OUT_DIR / f"{SITE_LOWER}_analysis2_B.png", dpi=500)
 plt.close(fig)
 print("  Saved analysis2_B")
 
@@ -440,7 +473,7 @@ ax.set_title(
     fontsize=12,
 )
 fig.tight_layout()
-fig.savefig(OUT_DIR / f"{SITE_LOWER}_analysis2_A.png", dpi=150)
+fig.savefig(OUT_DIR / f"{SITE_LOWER}_analysis2_A.png", dpi=500)
 plt.close(fig)
 print("  Saved analysis2_A")
 
@@ -469,7 +502,7 @@ ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda y, _: f"{y:.0%}"))
 ax.set_xlim(left=0)
 ax.set_ylim(bottom=0)
 fig.tight_layout()
-fig.savefig(OUT_DIR / f"{SITE_LOWER}_analysis2_B_annotated.png", dpi=150)
+fig.savefig(OUT_DIR / f"{SITE_LOWER}_analysis2_B_annotated.png", dpi=500)
 plt.close(fig)
 print("  Saved analysis2_B_annotated")
 
@@ -527,7 +560,7 @@ if _loc_col is not None:
     )
     fig.tight_layout()
     fig.savefig(OUT_DIR / f"{SITE_LOWER}_analysis2B_stratified.png",
-                dpi=150, bbox_inches="tight")
+                dpi=500, bbox_inches="tight")
     plt.close(fig)
     print("  Saved analysis2B_stratified")
 else:
@@ -596,7 +629,7 @@ ax.set_title(
     fontsize=12,
 )
 fig.tight_layout()
-fig.savefig(OUT_DIR / f"{SITE_LOWER}_analysis2_C.png", dpi=150)
+fig.savefig(OUT_DIR / f"{SITE_LOWER}_analysis2_C.png", dpi=500)
 plt.close(fig)
 print("  Saved analysis2_C")
 
@@ -664,7 +697,7 @@ if _comp_avail and len(ever_vaso_ids) > 0:
         )
         fig.tight_layout()
         fig.savefig(OUT_DIR / f"{SITE_LOWER}_analysis2D_nee_components_prevaso.png",
-                    dpi=150, bbox_inches="tight")
+                    dpi=500, bbox_inches="tight")
         plt.close(fig)
         print("  Saved analysis2D_nee_components_prevaso")
 
@@ -702,7 +735,7 @@ if _comp_avail and len(ever_vaso_ids) > 0:
             )
             fig.tight_layout()
             fig.savefig(OUT_DIR / f"{SITE_LOWER}_analysis2D_dose_prevaso.png",
-                        dpi=150, bbox_inches="tight")
+                        dpi=500, bbox_inches="tight")
             plt.close(fig)
             print("  Saved analysis2D_dose_prevaso")
     else:
@@ -755,7 +788,7 @@ if _comp_avail:
         )
         fig.tight_layout()
         fig.savefig(OUT_DIR / f"{SITE_LOWER}_analysis2D_dose_by_nee.png",
-                    dpi=150, bbox_inches="tight")
+                    dpi=500, bbox_inches="tight")
         plt.close(fig)
         print("  Saved analysis2D_dose_by_nee")
 
@@ -780,7 +813,7 @@ if _comp_avail:
         )
         fig.tight_layout()
         fig.savefig(OUT_DIR / f"{SITE_LOWER}_analysis2D_prop_by_nee.png",
-                    dpi=150, bbox_inches="tight")
+                    dpi=500, bbox_inches="tight")
         plt.close(fig)
         print("  Saved analysis2D_prop_by_nee")
 else:
@@ -814,6 +847,7 @@ BIN_STEP = 3.2   # distance from the start of one bin-pair to the next
 for ax_idx, (col, label) in enumerate(BOX3_FEATURES):
     ax = axes[ax_idx]
     tick_positions, tick_labels = [], []
+    _max_ann_y = -np.inf
 
     for bin_idx, grp in enumerate(NEE_BIN_LABELS):
         sub   = pat[pat["pre_vaso_nee_group"] == grp]
@@ -838,12 +872,26 @@ for ax_idx, (col, label) in enumerate(BOX3_FEATURES):
         _draw_box(n_dat, x_never, PALETTE[0])   # blue = never vaso
         _draw_box(v_dat, x_ever,  PALETTE[2])   # red  = ever vaso
 
+        if len(n_dat) >= 5 and len(v_dat) >= 5:
+            _, _mw_p = scipy_stats.mannwhitneyu(n_dat, v_dat, alternative="two-sided")
+            _stars = ("***" if _mw_p < 0.001 else "**" if _mw_p < 0.01
+                      else "*" if _mw_p < 0.05 else "")
+            if _stars:
+                _y95 = max(np.percentile(n_dat, 95), np.percentile(v_dat, 95))
+                _max_ann_y = max(_max_ann_y, _y95)
+                ax.text((x_never + x_ever) / 2, _y95, _stars,
+                        ha="center", va="bottom", fontsize=10, color="black")
+
         tick_positions.append(bin_idx * BIN_STEP + 0.55)
         tick_labels.append(grp)
 
         if bin_idx < len(NEE_BIN_LABELS) - 1:
             ax.axvline(bin_idx * BIN_STEP + 2.1, color="lightgray",
                        linewidth=0.8, linestyle="-")
+
+    if _max_ann_y > -np.inf:
+        _lo, _hi = ax.get_ylim()
+        ax.set_ylim(_lo, max(_hi, _max_ann_y + (_hi - _lo) * 0.2))
 
     ax.set_xticks(tick_positions)
     ax.set_xticklabels(tick_labels, rotation=30, ha="right", fontsize=9)
@@ -864,7 +912,7 @@ fig.suptitle(
     fontsize=13,
 )
 fig.tight_layout()
-fig.savefig(OUT_DIR / f"{SITE_LOWER}_analysis3.png", dpi=150, bbox_inches="tight")
+fig.savefig(OUT_DIR / f"{SITE_LOWER}_analysis3.png", dpi=500, bbox_inches="tight")
 plt.close(fig)
 print("  Saved analysis3")
 
@@ -976,7 +1024,7 @@ fig.suptitle(
     fontsize=12,
 )
 fig.tight_layout()
-fig.savefig(OUT_DIR / f"{SITE_LOWER}_analysis3_TOD.png", dpi=150, bbox_inches="tight")
+fig.savefig(OUT_DIR / f"{SITE_LOWER}_analysis3_TOD.png", dpi=500, bbox_inches="tight")
 plt.close(fig)
 print("  Saved analysis3_TOD")
 
@@ -1001,7 +1049,7 @@ ax.set_ylabel("Number of patients", fontsize=11)
 ax.set_title(f"{SITE_NAME}: When is vasopressin started? (n={len(vaso_timing):,} patients)", fontsize=12)
 ax.legend(fontsize=11)
 fig.tight_layout()
-fig.savefig(OUT_DIR / f"{SITE_LOWER}_analysis4a_time_to_vaso.png", dpi=150)
+fig.savefig(OUT_DIR / f"{SITE_LOWER}_analysis4a_time_to_vaso.png", dpi=500)
 plt.close(fig)
 print("  Saved analysis4a")
 
@@ -1113,7 +1161,7 @@ fig.suptitle(
 )
 fig.tight_layout()
 fig.savefig(OUT_DIR / f"{SITE_LOWER}_analysis4d_nee_thresholds.png",
-            dpi=150, bbox_inches="tight")
+            dpi=500, bbox_inches="tight")
 plt.close(fig)
 print("  Saved analysis4d_nee_thresholds")
 
@@ -1157,7 +1205,7 @@ fig.suptitle(
     fontsize=13,
 )
 fig.tight_layout()
-fig.savefig(OUT_DIR / f"{SITE_LOWER}_analysis4d_wait_time.png", dpi=150, bbox_inches="tight")
+fig.savefig(OUT_DIR / f"{SITE_LOWER}_analysis4d_wait_time.png", dpi=500, bbox_inches="tight")
 plt.close(fig)
 print("  Saved analysis4d")
 
@@ -1205,7 +1253,7 @@ ax.set_xlim(0)
 ax.set_ylim(0, 1.02)
 ax.legend(title="TOD of vaso start", bbox_to_anchor=(1.02, 1), loc="upper left", fontsize=9)
 fig.tight_layout()
-fig.savefig(OUT_DIR / f"{SITE_LOWER}_analysis4d_tod_km.png", dpi=150, bbox_inches="tight")
+fig.savefig(OUT_DIR / f"{SITE_LOWER}_analysis4d_tod_km.png", dpi=500, bbox_inches="tight")
 plt.close(fig)
 print("  Saved analysis4d_tod_km")
 
@@ -1274,25 +1322,6 @@ INIT_FEATURES = [
 ]
 
 Q_COLORS = [PALETTE[0], PALETTE[1], PALETTE[3], PALETTE[2]]
-
-
-def fmt_p(p):
-    """Format p-value for annotation."""
-    if p < 0.001:
-        return "p<0.001"
-    if p < 0.01:
-        return f"p={p:.3f}"
-    if p < 0.05:
-        return f"p={p:.3f}"
-    return f"p={p:.2f}"
-
-
-def bracket(ax, x1, x2, y_top, h_rel, text, fontsize=8.5):
-    """Draw a significance bracket spanning x1→x2 at y_top; h_rel is tick height."""
-    ax.plot([x1, x1, x2, x2], [y_top, y_top + h_rel, y_top + h_rel, y_top],
-            lw=1.1, color="black", clip_on=False)
-    ax.text((x1 + x2) / 2, y_top + h_rel * 1.3, text,
-            ha="center", va="bottom", fontsize=fontsize)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1379,7 +1408,7 @@ fig.suptitle(
     fontsize=12,
 )
 fig.tight_layout()
-fig.savefig(OUT_DIR / f"{SITE_LOWER}_analysis5_A.png", dpi=150, bbox_inches="tight")
+fig.savefig(OUT_DIR / f"{SITE_LOWER}_analysis5_A.png", dpi=500, bbox_inches="tight")
 plt.close(fig)
 print("  Saved analysis5_A")
 
@@ -1424,7 +1453,7 @@ fig.suptitle(
     fontsize=13,
 )
 fig.tight_layout()
-fig.savefig(OUT_DIR / f"{SITE_LOWER}_analysis5_B.png", dpi=150, bbox_inches="tight")
+fig.savefig(OUT_DIR / f"{SITE_LOWER}_analysis5_B.png", dpi=500, bbox_inches="tight")
 plt.close(fig)
 print("  Saved analysis5_B")
 
@@ -1482,6 +1511,31 @@ if len(_slope_df) > 0:
                 positions=[i + 1 for i in _valid],
                 showmedians=True, showextrema=False, widths=0.7,
             )
+
+        # Kruskal-Wallis across all valid quartile groups
+        _kw5d_grps = [_grp_data[i] for i in _valid]
+        _kw5d_label = _lbl
+        _kw5d_sig = False
+        if len(_kw5d_grps) >= 2:
+            _, _kw5d_p = scipy_stats.kruskal(*_kw5d_grps)
+            if _kw5d_p < 0.05:
+                _kw5d_sig = True
+                _kw5d_label = f"{_lbl}\nKruskal-Wallis {fmt_p(_kw5d_p)}"
+
+        # Q1 vs Q4 Mann-Whitney (Bonferroni × n features)
+        _d5d_q1, _d5d_q4 = _grp_data[0], _grp_data[3]
+        if _kw5d_sig and len(_d5d_q1) >= 5 and len(_d5d_q4) >= 5:
+            _all5d = np.concatenate([_grp_data[i] for i in _valid])
+            _y5d_max = np.nanpercentile(_all5d, 95)
+            _y5d_rng = np.nanpercentile(_all5d, 95) - np.nanpercentile(_all5d, 5)
+            _h5d = _y5d_rng * 0.05
+            _, _mw5d_p = scipy_stats.mannwhitneyu(_d5d_q1, _d5d_q4, alternative="two-sided")
+            _mw5d_adj = min(_mw5d_p * len(_RC_FEATURES), 1.0)
+            if _mw5d_adj < 0.05:
+                bracket(_ax, 1, 4, _y5d_max + _h5d * 0.5, _h5d,
+                        f"Q1 vs Q4: {fmt_p(_mw5d_adj)} (Bonf.)")
+                _ax.set_ylim(top=_y5d_max + _h5d * 5)
+
         _ax.axhline(0, color="black", linestyle="--", linewidth=1, alpha=0.5)
         _ax.set_xticks([1, 2, 3, 4])
         _ax.set_xticklabels(
@@ -1490,7 +1544,7 @@ if len(_slope_df) > 0:
         )
         _ax.set_xlabel("NEE at vaso initiation (μg/kg/min)", fontsize=9)
         _ax.set_ylabel(f"Δ{_lbl} per hour\n(slope in {_RC_WINDOW}h pre-vaso)", fontsize=9)
-        _ax.set_title(_lbl, fontsize=10)
+        _ax.set_title(_kw5d_label, fontsize=9)
 
     fig.suptitle(
         f"{SITE_NAME}  —  5_D: Rate of change in features before vasopressin initiation\n"
@@ -1500,7 +1554,7 @@ if len(_slope_df) > 0:
     )
     fig.tight_layout()
     fig.savefig(OUT_DIR / f"{SITE_LOWER}_analysis5_D_rate_of_change.png",
-                dpi=150, bbox_inches="tight")
+                dpi=500, bbox_inches="tight")
     plt.close(fig)
     print("  Saved analysis5_D")
 
@@ -1535,7 +1589,7 @@ if len(_tod_sofa) >= 10:
     ax.legend(fontsize=10)
     fig.tight_layout()
     fig.savefig(OUT_DIR / f"{SITE_LOWER}_analysis5_E_tod_vs_sofa.png",
-                dpi=150, bbox_inches="tight")
+                dpi=500, bbox_inches="tight")
     plt.close(fig)
     print("  Saved analysis5_E")
 else:
@@ -1630,7 +1684,7 @@ if _DWELL_DOSE_COL is not None:
         )
         fig.tight_layout()
         fig.savefig(OUT_DIR / f"{SITE_LOWER}_analysis_dwell_time_by_dose.png",
-                    dpi=150, bbox_inches="tight")
+                    dpi=500, bbox_inches="tight")
         plt.close(fig)
         print("  Saved analysis_dwell_time_by_dose")
 
@@ -1690,7 +1744,7 @@ if _DWELL_DOSE_COL is not None:
             )
             fig.tight_layout()
             fig.savefig(OUT_DIR / f"{SITE_LOWER}_analysis_dwell_vs_map.png",
-                        dpi=150, bbox_inches="tight")
+                        dpi=500, bbox_inches="tight")
             plt.close(fig)
             print("  Saved analysis_dwell_vs_map")
         else:
