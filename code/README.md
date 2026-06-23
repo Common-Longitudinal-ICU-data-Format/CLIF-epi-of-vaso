@@ -109,4 +109,4 @@ uv run python code/multisite_epi_plots.py
 2. `first_vaso_hour` (continuous, initiators only) — how quickly is it started? Aggregated via exact OLS sufficient statistics.
 3. `nee_at_init` (continuous, initiators only) — at what NE burden is it started? Aggregated via exact OLS sufficient statistics.
 
-UCMC is the anchor site and must run `05_epi_analysis.py` first. Other sites automatically find and load UCMC's `theta0_m*.json` files from the sibling `upload_to_box_UCMC/epi_analysis/` directory.
+UCMC is the anchor site and must run `05_epi_analysis.py` first. It prints a `FEDERATED_ICC_ANCHOR` dict that the coordinating site distributes; other sites paste it into their `config/config.py` before running. See `config/README.md` for the full setup procedure.

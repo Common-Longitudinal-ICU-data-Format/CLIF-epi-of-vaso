@@ -2226,49 +2226,38 @@ try:
     _local_sd[_local_sd == 0] = 1.0
     _y_m1    = _m1_df["ever_vaso"].values.astype(float)
 
-    # ── Anchor site: fit theta0 and save for other sites ─────────────────────
-    _IS_ANCHOR = SITE_NAME.upper() == "UCMC"
+    # ── Anchor parameters: config → local fit ────────────────────────────────
+    _anchor_cfg = getattr(_cfg, "FEDERATED_ICC_ANCHOR", None)
     _theta0_m0, _theta0_m1, _anchor_mu, _anchor_sd = None, None, _local_mu, _local_sd
+    _IS_ANCHOR = _anchor_cfg is None
 
-    if _IS_ANCHOR:
+    if _anchor_cfg is not None:
+        _theta0_m0 = np.array(_anchor_cfg["theta0_m0"])
+        _theta0_m1 = np.array(_anchor_cfg["theta0_m1"])
+        _anchor_mu = np.array(_anchor_cfg["mu"])
+        _anchor_sd = np.array(_anchor_cfg["sd"])
+        _anchor_sd[_anchor_sd == 0] = 1.0
+        print("  Loaded anchor theta0 from config.FEDERATED_ICC_ANCHOR")
+    else:
         print("  Anchor site: fitting local logistic theta0 for M0 and M1...")
         _theta0_m0 = _icc_fit_logistic(_X_m0, _y_m0)
         _X_m1_fit  = np.column_stack([np.ones(len(_m1_df)),
                                       (_m1_Xraw - _local_mu) / _local_sd])
         _theta0_m1 = _icc_fit_logistic(_X_m1_fit, _y_m1)
-        _json_icc.dump(
-            {"theta0": _theta0_m0.tolist(), "model": "M0", "site": SITE_NAME},
-            open(AGG_DIR / "theta0_m0.json", "w"),
-        )
-        _json_icc.dump(
-            {"theta0": _theta0_m1.tolist(), "model": "M1", "site": SITE_NAME,
-             "covariates": _COVARIATES_M1,
-             "mu": _local_mu.tolist(), "sd": _local_sd.tolist()},
-            open(AGG_DIR / "theta0_m1.json", "w"),
-        )
-        print(f"  Saved theta0_m0.json + theta0_m1.json → {AGG_DIR}")
-    else:
-        # Search sibling upload_to_box dirs for anchor theta0
-        for _cand in sorted((OUTPUT_ROOT / "output").glob(
-                "upload_to_box_*/epi_analysis/theta0_m0.json")):
-            _theta0_m0 = np.array(_json_icc.load(open(_cand))["theta0"])
-            print(f"  Loaded theta0_m0 from {_cand.parent.parent.name}")
-            break
-        for _cand in sorted((OUTPUT_ROOT / "output").glob(
-                "upload_to_box_*/epi_analysis/theta0_m1.json")):
-            _t0d = _json_icc.load(open(_cand))
-            _theta0_m1 = np.array(_t0d["theta0"])
-            _anchor_mu = np.array(_t0d["mu"])
-            _anchor_sd = np.array(_t0d["sd"])
-            _anchor_sd[_anchor_sd == 0] = 1.0
-            print(f"  Loaded theta0_m1 from {_cand.parent.parent.name}")
-            break
-        if _theta0_m0 is None:
-            print("  No anchor theta0 found — fitting locally (non-anchor estimate)")
-            _theta0_m0 = _icc_fit_logistic(_X_m0, _y_m0)
-            _X_m1_fit  = np.column_stack([np.ones(len(_m1_df)),
-                                          (_m1_Xraw - _local_mu) / _local_sd])
-            _theta0_m1 = _icc_fit_logistic(_X_m1_fit, _y_m1)
+        _anchor_mu, _anchor_sd = _local_mu, _local_sd
+        _anchor_sd[_anchor_sd == 0] = 1.0
+
+        def _fmt(arr):
+            return "[" + ", ".join(f"{v:.6g}" for v in arr) + "]"
+
+        print("\n  ── Anchor fitted. Add to config.py for all other sites: ──")
+        print("  FEDERATED_ICC_ANCHOR = {")
+        print(f'      "theta0_m0": {_fmt(_theta0_m0)},')
+        print(f'      "theta0_m1": {_fmt(_theta0_m1)},')
+        print(f'      "mu":        {_fmt(_anchor_mu)},')
+        print(f'      "sd":        {_fmt(_anchor_sd)},')
+        print("  }")
+        print("  ─" * 28)
 
     # ── Score/Hessian for M0 at theta0 ───────────────────────────────────────
     _s_m0, _h_m0 = _icc_score_hess(_X_m0, _y_m0, _theta0_m0)

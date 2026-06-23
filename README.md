@@ -94,7 +94,9 @@ Writes `threshold_outcome_table.csv` and `threshold_concordance_summary.csv` to 
 uv run python code/05_epi_analysis.py
 ```
 
-Writes figures and aggregate CSVs to `output/upload_to_box_<SITE>/epi_analysis/`, including a federated ICC return packet (`site_packet_<SITE>.json`). UCMC must run first — it fits the anchor logistic model and writes `theta0_m0.json` and `theta0_m1.json` that other sites load automatically.
+Writes figures and aggregate CSVs to `output/upload_to_box_<SITE>/epi_analysis/`, including a federated ICC return packet (`site_packet_<SITE>.json`).
+
+**UCMC runs first** (with `FEDERATED_ICC_ANCHOR = None` in config). **All other sites** uncomment the pre-filled `FEDERATED_ICC_ANCHOR` block in `config.example.py` before running. See [`config/README.md`](config/README.md) for details.
 
 ### 8. Share your upload folder
 
@@ -143,8 +145,6 @@ output/
       vasopressor_combinations.csv
       vaso_receipt_logreg.csv
       site_packet_<SITE>.json        ← federated ICC return packet
-      theta0_m0.json                 ← anchor site (UCMC) only
-      theta0_m1.json                 ← anchor site (UCMC) only
       <site>_analysis*.png           ← figures alongside CSVs
 ```
 
