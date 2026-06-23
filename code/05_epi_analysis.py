@@ -2132,6 +2132,101 @@ except Exception as _e14:
 
 print(f"\nAggregate CSVs written to: {AGG_DIR}")
 
+# ── 15. log_nee_at_init_lm.csv + log_nee_at_init_lm_std.csv ─────────────────
+# OLS of log(NEE at vasopressin initiation) on demographics + clinical covariates.
+# Population: vasopressin initiators with nee_at_init > 0.
+# Continuous predictors standardized per 1-SD so β is comparable across sites.
+try:
+    import re as _re15
+    import statsmodels.formula.api as _smf15
+
+    _lm15 = initiators[
+        ["stay_id", "nee_at_init", "age", "gender", "race",
+         "sofa_at_init", "lac_at_init", "mbp_at_init",
+         "ventil_at_init", "rrt_at_init", "steroid_at_init"]
+    ].copy()
+    _lm15 = _lm15[_lm15["nee_at_init"] > 0].copy()
+    _lm15["log_nee"] = np.log(_lm15["nee_at_init"])
+
+    _lm15["female"] = (
+        _lm15["gender"].astype(str).str.upper().str.startswith("F")
+    ).astype(float)
+
+    _RACE_MAP_15 = {
+        "White": "White",                                    "WHITE": "White",
+        "Black or African American": "Black",
+        "BLACK/AFRICAN AMERICAN": "Black",                  "BLACK/AFRICAN": "Black",
+        "Hispanic": "Hispanic",                             "HISPANIC OR LATINO": "Hispanic",
+        "Asian": "Asian",                                   "ASIAN": "Asian",
+    }
+    _lm15["race_cat"] = _lm15["race"].map(_RACE_MAP_15).fillna("Other/Unknown")
+
+    _lm15_mu_sd = {}
+    for _c15 in ["age", "sofa_at_init", "lac_at_init", "mbp_at_init"]:
+        _mu15 = _lm15[_c15].mean()
+        _sd15 = _lm15[_c15].std()
+        _lm15[f"{_c15}_z"] = (_lm15[_c15] - _mu15) / _sd15 if _sd15 > 0 else 0.0
+        _lm15_mu_sd[_c15] = {"mean": round(float(_mu15), 4), "sd": round(float(_sd15), 4)}
+
+    _lm15 = _lm15.dropna(subset=[
+        "log_nee", "age_z", "female", "sofa_at_init_z",
+        "lac_at_init_z", "mbp_at_init_z",
+        "ventil_at_init", "rrt_at_init", "steroid_at_init",
+    ])
+
+    _formula15 = (
+        "log_nee ~ age_z + female"
+        " + C(race_cat, Treatment('Black'))"
+        " + sofa_at_init_z + lac_at_init_z + mbp_at_init_z"
+        " + ventil_at_init + rrt_at_init + steroid_at_init"
+    )
+    _mod15 = _smf15.ols(_formula15, data=_lm15).fit()
+    _ci15  = _mod15.conf_int()
+    _ci15.columns = ["ci_lo", "ci_hi"]
+
+    _LABEL_MAP_15 = {
+        "age_z":           "Age per 1-SD",
+        "female":          "Female vs Male",
+        "sofa_at_init_z":  "SOFA at initiation per 1-SD",
+        "lac_at_init_z":   "Lactate at initiation per 1-SD",
+        "mbp_at_init_z":   "MAP at initiation per 1-SD",
+        "ventil_at_init":  "Ventilated at initiation",
+        "rrt_at_init":     "RRT at initiation",
+        "steroid_at_init": "Steroid at initiation",
+    }
+
+    def _param_label_15(p):
+        if p == "Intercept":
+            return "Intercept"
+        m = _re15.search(r"race_cat.*\[T\.(.+?)\]", p)
+        if m:
+            return f"Race: {m.group(1)} vs Black"
+        return _LABEL_MAP_15.get(p, p)
+
+    _lm_rows15 = []
+    for _p, _coef, _cilo, _cihi, _pv in zip(
+        _mod15.params.index, _mod15.params.values,
+        _ci15["ci_lo"].values, _ci15["ci_hi"].values,
+        _mod15.pvalues.values,
+    ):
+        _lm_rows15.append(dict(
+            param=_p,
+            label=_param_label_15(_p),
+            beta=round(float(_coef), 4),
+            ci_lo=round(float(_cilo), 4),
+            ci_hi=round(float(_cihi), 4),
+            pval=round(float(_pv), 4),
+            n_obs=int(_mod15.nobs),
+            r2=round(float(_mod15.rsquared), 4),
+        ))
+    pd.DataFrame(_lm_rows15).to_csv(AGG_DIR / "log_nee_at_init_lm.csv", index=False)
+    pd.DataFrame([
+        {"covariate": k, **v} for k, v in _lm15_mu_sd.items()
+    ]).to_csv(AGG_DIR / "log_nee_at_init_lm_std.csv", index=False)
+    print(f"  15/15 log_nee_at_init_lm.csv  (n={int(_mod15.nobs):,}; R²={_mod15.rsquared:.3f})")
+except Exception as _e15:
+    print(f"  15/15 skipped log_nee_at_init_lm: {_e15}")
+
 # =============================================================================
 # Section 16: Federated ICC — Site Return Packet
 #
