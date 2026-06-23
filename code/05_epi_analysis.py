@@ -81,6 +81,18 @@ NEE_BIN_EDGES  = [0.0, 0.1, 0.2, 0.3, 0.5, 0.7, 1.0, np.inf]
 NEE_BIN_LABELS = ["<0.1", "0.1–0.2", "0.2–0.3", "0.3–0.5",
                   "0.5–0.7", "0.7–1.0", ">1.0"]
 
+NE_NEE_THRESHOLDS = [0.05, 0.1, 0.15, 0.2, 0.25, 0.3, 0.5]
+
+# NEE conversion factors: NEE = NE + EPI + PE/10 + DA/100 + VASO×2.5 + ANG×10
+NEE_WEIGHTS = {
+    "norepinephrine": 1.0,
+    "epinephrine":    1.0,
+    "phenylephrine":  0.1,
+    "dopamine":       0.01,
+    "vasopressin":    2.5,
+    "angiotensin ii": 10.0,
+}
+
 PALETTE = ["#4e79a7", "#f28e2b", "#e15759", "#76b7b2",
            "#59a14f", "#edc948", "#b07aa1"]
 
@@ -384,6 +396,83 @@ fig.savefig(OUT_DIR / f"{SITE_LOWER}_analysis2_B.png", dpi=150)
 plt.close(fig)
 print("  Saved analysis2_B")
 
+# ── 2A: proportion of patients ever on vasopressin by pre-vaso max NEE bin ───
+print("Analysis 2A: proportion of patients ever on vasopressin by NEE bin...")
+_pat_2a = (
+    pat.groupby("pre_vaso_nee_group", observed=True, sort=True)
+    .agg(n_total=("stay_id", "count"), n_vaso=("ever_vaso", "sum"))
+    .reset_index()
+)
+_pat_2a = _pat_2a[_pat_2a["n_total"] >= 5].copy()
+_pat_2a["prop"] = _pat_2a["n_vaso"] / _pat_2a["n_total"]
+_z2a = 1.96
+_n2a, _p2a = _pat_2a["n_total"].values.astype(float), _pat_2a["prop"].values
+_den2a = 1 + _z2a**2 / _n2a
+_cen2a = _p2a + _z2a**2 / (2 * _n2a)
+_spr2a = _z2a * np.sqrt(_p2a * (1 - _p2a) / _n2a + _z2a**2 / (4 * _n2a**2))
+_pat_2a["ci_lo"] = np.maximum((_cen2a - _spr2a) / _den2a, 0.0)
+_pat_2a["ci_hi"] = np.minimum((_cen2a + _spr2a) / _den2a, 1.0)
+
+_x2a = np.arange(len(_pat_2a))
+fig, ax = plt.subplots(figsize=(10, 5))
+ax.bar(_x2a, _pat_2a["prop"], color=PALETTE[0], alpha=0.8, width=0.6)
+ax.errorbar(
+    _x2a, _pat_2a["prop"],
+    yerr=[np.maximum(_pat_2a["prop"] - _pat_2a["ci_lo"], 0),
+          np.maximum(_pat_2a["ci_hi"] - _pat_2a["prop"], 0)],
+    fmt="none", ecolor="black", capsize=4,
+)
+for _xi, _r in zip(_x2a, _pat_2a.itertuples()):
+    ax.text(_xi, float(_r.prop) + 0.02, f"n={int(_r.n_total):,}",
+            ha="center", va="bottom", fontsize=8)
+ax.set_xticks(_x2a)
+ax.set_xticklabels(
+    [str(g) for g in _pat_2a["pre_vaso_nee_group"]],
+    rotation=30, ha="right",
+)
+ax.set_xlabel("Pre-vaso max NEE bin (μg/kg/min)", fontsize=11)
+ax.set_ylabel("Proportion of patients ever on vasopressin", fontsize=11)
+ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda y, _: f"{y:.0%}"))
+ax.set_ylim(0)
+ax.set_title(
+    f"{SITE_NAME}: Proportion of patients ever on vasopressin by pre-vaso max NEE bin\n"
+    f"(patient-level; Wilson 95% CI; annotated with n per bin)",
+    fontsize=12,
+)
+fig.tight_layout()
+fig.savefig(OUT_DIR / f"{SITE_LOWER}_analysis2_A.png", dpi=150)
+plt.close(fig)
+print("  Saved analysis2_A")
+
+# ── 2B_annotated: same as 2B with obs count annotated on each point ──────────
+print("Analysis 2B_annotated: annotating n obs on 2B plot...")
+fig, ax = plt.subplots(figsize=(11, 5))
+ax.errorbar(
+    binned["x"], binned["prop"],
+    yerr=[np.maximum(binned["prop"] - binned["ci_lo"], 0),
+          np.maximum(binned["ci_hi"] - binned["prop"], 0)],
+    fmt="o", color=PALETTE[0], ecolor="#aaaaaa", capsize=3, markersize=5,
+)
+for _, _row in binned.iterrows():
+    ax.annotate(
+        f"n={int(_row['count']):,}", (_row["x"], _row["prop"]),
+        textcoords="offset points", xytext=(0, 8),
+        ha="center", fontsize=6, color="#555555",
+    )
+ax.set_xlabel("NEE dose bin midpoint (μg/kg/min, bin width = 0.1)", fontsize=11)
+ax.set_ylabel("Proportion of patient-hours on vasopressin", fontsize=11)
+ax.set_title(
+    f"{SITE_NAME}: Proportion on vasopressin by NEE dose (n patient-hours per bin)",
+    fontsize=12,
+)
+ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda y, _: f"{y:.0%}"))
+ax.set_xlim(left=0)
+ax.set_ylim(bottom=0)
+fig.tight_layout()
+fig.savefig(OUT_DIR / f"{SITE_LOWER}_analysis2_B_annotated.png", dpi=150)
+plt.close(fig)
+print("  Saved analysis2_B_annotated")
+
 # ── 2B_stratified: proportion on vaso by NEE bin, coloured by location ───────
 print("Analysis 2B_stratified: proportion on vaso by NEE, stratified by location...")
 
@@ -518,9 +607,9 @@ print("  Saved analysis2_C")
 # =============================================================================
 print("Analysis 2_D: NEE component drugs pre-vaso stacked bar...")
 
-_COMP_COLS = ["norepinephrine", "epinephrine", "phenylephrine", "dopamine"]
-_COMP_LABELS = ["Norepinephrine", "Epinephrine", "Phenylephrine", "Dopamine"]
-_COMP_COLORS = [PALETTE[0], PALETTE[2], PALETTE[1], PALETTE[3]]
+_COMP_COLS = ["norepinephrine", "epinephrine", "phenylephrine", "dopamine", "angiotensin ii"]
+_COMP_LABELS = ["Norepinephrine", "Epinephrine", "Phenylephrine", "Dopamine", "Angiotensin II"]
+_COMP_COLORS = [PALETTE[0], PALETTE[2], PALETTE[1], PALETTE[3], PALETTE[4]]
 
 # Check which component columns exist in features
 _comp_avail = [c for c in _COMP_COLS if c in features.columns]
@@ -578,10 +667,124 @@ if _comp_avail and len(ever_vaso_ids) > 0:
                     dpi=150, bbox_inches="tight")
         plt.close(fig)
         print("  Saved analysis2D_nee_components_prevaso")
+
+        # ── 2D_dose: mean NEE-equivalent contribution by rel_hour (same x-axis) ─
+        print("Analysis 2D_dose: mean NEE-equivalent contribution vs rel_hour...")
+        _dose_time_rows = []
+        for _rh in range(-_WINDOW_PRE, 0):
+            _s = _pre[_pre["rel_hour"] == _rh]
+            if len(_s) == 0:
+                continue
+            _rd = {"rel_hour": _rh, "n": len(_s)}
+            for _c in _comp_avail:
+                _rd[f"nee_{_c}"] = _s[_c].mean() * NEE_WEIGHTS.get(_c, 1.0)
+            _dose_time_rows.append(_rd)
+        _dose_time_df = pd.DataFrame(_dose_time_rows)
+
+        if len(_dose_time_df) > 0:
+            fig, ax = plt.subplots(figsize=(12, 5))
+            _bot_d = np.zeros(len(_dose_time_df))
+            for _c, _lbl, _clr in zip(_comp_avail, _comp_labels_avail, _comp_colors_avail):
+                _vals_d = _dose_time_df[f"nee_{_c}"].values
+                ax.bar(_dose_time_df["rel_hour"], _vals_d, bottom=_bot_d,
+                       width=0.85, color=_clr, label=_lbl)
+                _bot_d = _bot_d + _vals_d
+            ax.set_xlabel("Hours before vasopressin initiation (0 = vaso start)", fontsize=11)
+            ax.set_ylabel("Mean NEE-equivalent contribution (μg/kg/min)", fontsize=11)
+            ax.set_xlim(-_WINDOW_PRE - 0.5, -0.5)
+            ax.set_ylim(bottom=0)
+            ax.axvline(-1, color="black", linestyle="--", linewidth=1, alpha=0.5)
+            ax.legend(title="Drug", bbox_to_anchor=(1.02, 1), loc="upper left", fontsize=9)
+            ax.set_title(
+                f"{SITE_NAME}: Mean NEE-equivalent contribution per drug in 24h before vasopressin initiation\n"
+                f"(ever-vaso patients, n={len(ever_vaso_ids):,}; stacked; weights: NE×1, EPI×1, PE×0.1, DA×0.01)",
+                fontsize=12,
+            )
+            fig.tight_layout()
+            fig.savefig(OUT_DIR / f"{SITE_LOWER}_analysis2D_dose_prevaso.png",
+                        dpi=150, bbox_inches="tight")
+            plt.close(fig)
+            print("  Saved analysis2D_dose_prevaso")
     else:
         print("  Skipped analysis2D (no pre-vaso hours found)")
 else:
     print("  Skipped analysis2D (NEE component columns not in features)")
+
+# ── 2D_dose_by_nee / 2D_prop_by_nee: drug mix by NEE dose bin (all hours) ────
+print("Analysis 2D by NEE dose bin: dose contribution and proportion per bin...")
+if _comp_avail:
+    _feat_all_d = features[["nee"] + _comp_avail].copy()
+    _feat_all_d["nee_clipped"] = _feat_all_d["nee"].clip(upper=NEE_PLOT_CAP)
+    _feat_all_d["nee_bin"] = pd.cut(
+        _feat_all_d["nee_clipped"], bins=bin_edges, right=False, include_lowest=True,
+    )
+
+    _dose_nee_rows, _prop_nee_rows = [], []
+    for _nee_b, _grp in _feat_all_d.groupby("nee_bin", observed=True):
+        if len(_grp) < 20 or not hasattr(_nee_b, "left"):
+            continue
+        _xmid = (_nee_b.left + _nee_b.right) / 2
+        _rd = {"nee_bin": _nee_b, "x": _xmid}
+        _rp = {"nee_bin": _nee_b, "x": _xmid}
+        for _c in _comp_avail:
+            _rd[_c] = _grp[_c].mean() * NEE_WEIGHTS.get(_c, 1.0)  # NEE-equivalent
+            _rp[_c] = (_grp[_c] > 0).mean()
+        _dose_nee_rows.append(_rd)
+        _prop_nee_rows.append(_rp)
+    _dose_nee_df = pd.DataFrame(_dose_nee_rows)
+    _prop_nee_df = pd.DataFrame(_prop_nee_rows)
+
+    if len(_dose_nee_df) > 0:
+        fig, ax = plt.subplots(figsize=(12, 5))
+        _w_nee = 0.09
+        _bot_n = np.zeros(len(_dose_nee_df))
+        for _c, _lbl, _clr in zip(_comp_avail, _comp_labels_avail, _comp_colors_avail):
+            _vals = _dose_nee_df[_c].values
+            ax.bar(_dose_nee_df["x"], _vals, bottom=_bot_n,
+                   width=_w_nee, color=_clr, label=_lbl, align="center")
+            _bot_n = _bot_n + _vals
+        ax.set_xlabel("NEE dose bin midpoint (μg/kg/min, bin width = 0.1)", fontsize=11)
+        ax.set_ylabel("Mean NEE-equivalent contribution (μg/kg/min)", fontsize=11)
+        ax.set_xlim(left=0)
+        ax.set_ylim(bottom=0)
+        ax.legend(title="Drug", bbox_to_anchor=(1.02, 1), loc="upper left", fontsize=9)
+        ax.set_title(
+            f"{SITE_NAME}: Mean NEE-equivalent contribution per drug by NEE dose bin\n"
+            f"(all patient-hours; stacked; weights: NE×1, EPI×1, PE×0.1, DA×0.01)",
+            fontsize=12,
+        )
+        fig.tight_layout()
+        fig.savefig(OUT_DIR / f"{SITE_LOWER}_analysis2D_dose_by_nee.png",
+                    dpi=150, bbox_inches="tight")
+        plt.close(fig)
+        print("  Saved analysis2D_dose_by_nee")
+
+    if len(_prop_nee_df) > 0:
+        fig, ax = plt.subplots(figsize=(12, 5))
+        _bot_p = np.zeros(len(_prop_nee_df))
+        for _c, _lbl, _clr in zip(_comp_avail, _comp_labels_avail, _comp_colors_avail):
+            _vals = _prop_nee_df[_c].values
+            ax.bar(_prop_nee_df["x"], _vals, bottom=_bot_p,
+                   width=0.09, color=_clr, label=_lbl, align="center")
+            _bot_p = _bot_p + _vals
+        ax.set_xlabel("NEE dose bin midpoint (μg/kg/min, bin width = 0.1)", fontsize=11)
+        ax.set_ylabel("Proportion of patient-hours", fontsize=11)
+        ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda y, _: f"{y:.0%}"))
+        ax.set_xlim(left=0)
+        ax.set_ylim(0, 1)
+        ax.legend(title="Drug", bbox_to_anchor=(1.02, 1), loc="upper left", fontsize=9)
+        ax.set_title(
+            f"{SITE_NAME}: Proportion of patient-hours on each vasopressor drug by NEE dose bin\n"
+            f"(all patient-hours; stacked proportions)",
+            fontsize=12,
+        )
+        fig.tight_layout()
+        fig.savefig(OUT_DIR / f"{SITE_LOWER}_analysis2D_prop_by_nee.png",
+                    dpi=150, bbox_inches="tight")
+        plt.close(fig)
+        print("  Saved analysis2D_prop_by_nee")
+else:
+    print("  Skipped analysis2D by NEE dose (no drug component columns)")
 
 # =============================================================================
 # Analysis 3: Boxplots — feature distributions by NEE bin × vaso status
@@ -804,12 +1007,14 @@ print("  Saved analysis4a")
 
 # =============================================================================
 # Analysis 4d: Waiting time — hours above thresholds before vasopressin
+#   Multiple NE/NEE thresholds; SOFA delta (6h before → at start); SOFA >5 hours
 # =============================================================================
 print("Analysis 4d: Waiting time before vaso (per-patient loop)...")
 
 vaso_pat_df = pat[pat["ever_vaso"] == 1].set_index("stay_id")
-# Pre-filter features to vaso patients only for speed
 feat_vaso_only = features[features["stay_id"].isin(ever_vaso_ids)].copy()
+
+_HAS_NE_COL = "norepinephrine" in features.columns
 
 wait_rows = []
 for stay_id, row in vaso_pat_df.iterrows():
@@ -820,27 +1025,104 @@ for stay_id, row in vaso_pat_df.iterrows():
         (feat_vaso_only["stay_id"] == stay_id) &
         (feat_vaso_only["time_hour"] < fvh)
     ]
-    hrs_nee_high  = int((pre["nee"]     > 0.25).sum())
-    hrs_lac_high  = int((pre["lactate"] > 2.0).sum())
-    hrs_map_low   = int((pre["mbp"]     < 65.0).sum())
-    # Rising SOFA in last 6h before initiation
-    last6 = pre.sort_values("time_hour").tail(6)
-    sofa_rise = int((last6["sofa"].diff() > 0).sum()) if len(last6) >= 2 else 0
-    wait_rows.append({
-        "stay_id":        stay_id,
-        "first_vaso_hour": fvh,
-        "hrs_nee_gt025":  hrs_nee_high,
-        "hrs_lac_gt2":    hrs_lac_high,
-        "hrs_map_lt65":   hrs_map_low,
-        "sofa_rising_6h": sofa_rise,
-    })
+    _row = {"stay_id": stay_id, "first_vaso_hour": fvh}
+
+    for _t in NE_NEE_THRESHOLDS:
+        _tkey = f"{round(_t * 100):03d}"
+        if _HAS_NE_COL:
+            _row[f"hrs_ne_gt{_tkey}"]  = int((pre["norepinephrine"] > _t).sum())
+        _row[f"hrs_nee_gt{_tkey}"] = int((pre["nee"] > _t).sum())
+
+    _row["hrs_map_lt65"] = int((pre["mbp"]     < 65.0).sum())
+    _row["hrs_lac_gt2"]  = int((pre["lactate"] > 2.0).sum())
+    _row["hrs_sofa_gt5"] = int((pre["sofa"]    > 5.0).sum())
+
+    # Delta SOFA: sofa at vaso start − sofa at earliest hour in final 6h window
+    _sofa_init_vals = feat_vaso_only[
+        (feat_vaso_only["stay_id"] == stay_id) &
+        (feat_vaso_only["time_hour"] == fvh)
+    ]["sofa"].dropna().values
+    _sofa_at_init = float(_sofa_init_vals[0]) if len(_sofa_init_vals) > 0 else np.nan
+
+    _pre_6h = pre[pre["time_hour"] >= fvh - 6].sort_values("time_hour")
+    _sofa_6h_vals = _pre_6h["sofa"].dropna().values
+    _sofa_6h_before = float(_sofa_6h_vals[0]) if len(_sofa_6h_vals) > 0 else np.nan
+
+    _row["delta_sofa_6h"] = (
+        _sofa_at_init - _sofa_6h_before
+        if not (np.isnan(_sofa_at_init) or np.isnan(_sofa_6h_before))
+        else np.nan
+    )
+
+    wait_rows.append(_row)
+
 wait_df = pd.DataFrame(wait_rows)
 
+# ── Figure A: NE/NEE thresholds — boxplots across threshold levels ────────────
+_nee_threshold_data = [
+    wait_df[f"hrs_nee_gt{round(t*100):03d}"].dropna().values
+    for t in NE_NEE_THRESHOLDS
+]
+_n_thresh_panels = 2 if _HAS_NE_COL else 1
+fig, axes_th = plt.subplots(1, _n_thresh_panels,
+                             figsize=(6 * _n_thresh_panels, 5), sharey=False)
+if _n_thresh_panels == 1:
+    axes_th = [axes_th]
+
+# NEE panel
+_ax_nee = axes_th[-1]
+_bp_nee = _ax_nee.boxplot(
+    _nee_threshold_data,
+    positions=range(len(NE_NEE_THRESHOLDS)),
+    patch_artist=True, showfliers=False, widths=0.55,
+)
+for _patch in _bp_nee["boxes"]:
+    _patch.set_facecolor(PALETTE[0])
+    _patch.set_alpha(0.7)
+_ax_nee.set_xticks(range(len(NE_NEE_THRESHOLDS)))
+_ax_nee.set_xticklabels([f">{t}" for t in NE_NEE_THRESHOLDS], rotation=30, ha="right")
+_ax_nee.set_xlabel("NEE threshold (μg/kg/min)", fontsize=10)
+_ax_nee.set_ylabel("Hours above threshold before vasopressin", fontsize=10)
+_ax_nee.set_title("Hours with NEE above threshold\nbefore vasopressin initiation", fontsize=10)
+
+# NE panel (if available)
+if _HAS_NE_COL:
+    _ne_threshold_data = [
+        wait_df[f"hrs_ne_gt{round(t*100):03d}"].dropna().values
+        for t in NE_NEE_THRESHOLDS
+    ]
+    _ax_ne = axes_th[0]
+    _bp_ne = _ax_ne.boxplot(
+        _ne_threshold_data,
+        positions=range(len(NE_NEE_THRESHOLDS)),
+        patch_artist=True, showfliers=False, widths=0.55,
+    )
+    for _patch in _bp_ne["boxes"]:
+        _patch.set_facecolor(PALETTE[1])
+        _patch.set_alpha(0.7)
+    _ax_ne.set_xticks(range(len(NE_NEE_THRESHOLDS)))
+    _ax_ne.set_xticklabels([f">{t}" for t in NE_NEE_THRESHOLDS], rotation=30, ha="right")
+    _ax_ne.set_xlabel("NE threshold (μg/kg/min)", fontsize=10)
+    _ax_ne.set_ylabel("Hours above threshold before vasopressin", fontsize=10)
+    _ax_ne.set_title("Hours with NE above threshold\nbefore vasopressin initiation", fontsize=10)
+
+fig.suptitle(
+    f"{SITE_NAME}: Hours above NE/NEE threshold before vasopressin\n"
+    f"(n={len(wait_df):,} vasopressin patients; median + IQR + whiskers)",
+    fontsize=12,
+)
+fig.tight_layout()
+fig.savefig(OUT_DIR / f"{SITE_LOWER}_analysis4d_nee_thresholds.png",
+            dpi=150, bbox_inches="tight")
+plt.close(fig)
+print("  Saved analysis4d_nee_thresholds")
+
+# ── Figure B: MAP, lactate, SOFA>5, delta SOFA ───────────────────────────────
 panels = [
-    ("hrs_nee_gt025",  "Hours with NEE > 0.25 μg/kg/min\nbefore vasopressin"),
-    ("hrs_lac_gt2",    "Hours with lactate > 2 mmol/L\nbefore vasopressin"),
-    ("hrs_map_lt65",   "Hours with MAP < 65 mmHg\nbefore vasopressin"),
-    ("sofa_rising_6h", "Hours of rising SOFA in final 6h\nbefore vasopressin"),
+    ("hrs_map_lt65",  "Hours with MAP < 65 mmHg\nbefore vasopressin"),
+    ("hrs_lac_gt2",   "Hours with lactate > 2 mmol/L\nbefore vasopressin"),
+    ("hrs_sofa_gt5",  "Hours with SOFA > 5\nbefore vasopressin"),
+    ("delta_sofa_6h", "ΔSOFA (at start − 6h before)\nat vasopressin initiation"),
 ]
 
 fig, axes = plt.subplots(2, 2, figsize=(13, 9))
@@ -848,12 +1130,22 @@ axes = axes.flatten()
 
 for ax, (col, label) in zip(axes, panels):
     data = wait_df[col].dropna()
-    max_bin = min(int(data.max()) + 2, 60)
-    ax.hist(data, bins=range(0, max_bin + 1),
-            color=PALETTE[0], edgecolor="white", linewidth=0.3)
+    if len(data) == 0:
+        ax.set_visible(False)
+        continue
+    if col == "delta_sofa_6h":
+        _lo = max(data.min() - 1, -15)
+        _hi = min(data.max() + 1, 15)
+        ax.hist(data, bins=np.arange(_lo - 0.5, _hi + 1.5, 1),
+                color=PALETTE[3], edgecolor="white", linewidth=0.3)
+        ax.axvline(0, color="black", linewidth=1.2, linestyle="--", alpha=0.6)
+    else:
+        max_bin = min(int(data.max()) + 2, 60)
+        ax.hist(data, bins=range(0, max_bin + 1),
+                color=PALETTE[0], edgecolor="white", linewidth=0.3)
     med_val = data.median()
     ax.axvline(med_val, color=PALETTE[2], linewidth=2, linestyle="--",
-               label=f"Median: {med_val:.0f} h")
+               label=f"Median: {med_val:.1f}")
     ax.set_xlabel(label, fontsize=10)
     ax.set_ylabel("Patients", fontsize=10)
     ax.set_title(label, fontsize=10)
@@ -868,6 +1160,54 @@ fig.tight_layout()
 fig.savefig(OUT_DIR / f"{SITE_LOWER}_analysis4d_wait_time.png", dpi=150, bbox_inches="tight")
 plt.close(fig)
 print("  Saved analysis4d")
+
+# =============================================================================
+# Analysis 4d_tod: KM survival curves by time-of-day of vasopressin initiation
+#   TOD bins: 4-hour chunks (midnight–4am, 4–8am, ..., 8pm–midnight)
+#   Population: vasopressin initiators only
+# =============================================================================
+print("Analysis 4d_tod: KM survival by TOD of vasopressin initiation...")
+
+TOD_BIN_EDGES  = [0, 4, 8, 12, 16, 20, 24]
+TOD_BIN_LABELS_KM = [
+    "midnight–4am", "4–8am", "8am–noon",
+    "noon–4pm", "4–8pm", "8pm–midnight",
+]
+
+tod_km = pat[pat["ever_vaso"] == 1].dropna(subset=["vaso_clock_hour"]).copy()
+tod_km["tod_bin"] = pd.cut(
+    tod_km["vaso_clock_hour"],
+    bins=TOD_BIN_EDGES,
+    labels=TOD_BIN_LABELS_KM,
+    include_lowest=True,
+    right=False,
+)
+
+fig, ax = plt.subplots(figsize=(11, 6))
+_tod_pal = PALETTE[:len(TOD_BIN_LABELS_KM)]
+for _lbl, _clr in zip(TOD_BIN_LABELS_KM, _tod_pal):
+    _sub = tod_km[tod_km["tod_bin"] == _lbl]
+    if len(_sub) < 5:
+        continue
+    _kmf_tod = KaplanMeierFitter()
+    _kmf_tod.fit(_sub["traj_hours"], event_observed=_sub["death_in_window"],
+                 label=f"{_lbl} (n={len(_sub)})")
+    _kmf_tod.plot_survival_function(ax=ax, ci_show=True, color=_clr, linewidth=2)
+
+ax.set_xlabel("Hours from trajectory start", fontsize=12)
+ax.set_ylabel("Survival probability", fontsize=12)
+ax.set_title(
+    f"{SITE_NAME}: KM survival by time-of-day of vasopressin initiation\n"
+    f"(ever-vaso patients, n={len(tod_km):,}; 4-hour bins)",
+    fontsize=12,
+)
+ax.set_xlim(0)
+ax.set_ylim(0, 1.02)
+ax.legend(title="TOD of vaso start", bbox_to_anchor=(1.02, 1), loc="upper left", fontsize=9)
+fig.tight_layout()
+fig.savefig(OUT_DIR / f"{SITE_LOWER}_analysis4d_tod_km.png", dpi=150, bbox_inches="tight")
+plt.close(fig)
+print("  Saved analysis4d_tod_km")
 
 # =============================================================================
 # Analysis 5_A/B/C: Why do some patients start vasopressin at low NEE?
@@ -1201,6 +1541,165 @@ if len(_tod_sofa) >= 10:
 else:
     print("  Skipped analysis5_E (insufficient data)")
 
+# =============================================================================
+# Analysis: Dwell time at NE dose before changing — and MAP correlation
+#   For each ever-vaso patient, identify consecutive "plateaus" at the same
+#   NE dose.  Measure dwell duration and MAP change over each plateau.
+# =============================================================================
+print("\nAnalysis dwell_time: how long do clinicians wait at each NE dose?")
+
+_DWELL_DOSE_COL = "norepinephrine" if "norepinephrine" in features.columns else None
+
+if _DWELL_DOSE_COL is not None:
+    _fd = (
+        features[features["stay_id"].isin(ever_vaso_ids)]
+        [["stay_id", "time_hour", _DWELL_DOSE_COL, "mbp"]]
+        .sort_values(["stay_id", "time_hour"])
+        .reset_index(drop=True)
+        .copy()
+    )
+    _fd["dose_r"] = _fd[_DWELL_DOSE_COL].round(2)
+    # Mark start of each new plateau (dose change OR new patient)
+    _fd["_changed"] = (
+        (_fd["dose_r"] != _fd["dose_r"].shift(1)) |
+        (_fd["stay_id"] != _fd["stay_id"].shift(1))
+    )
+    _fd["plateau_id"] = _fd["_changed"].cumsum()
+
+    # Aggregate plateau-level stats (excluding dose == 0)
+    _plat_base = (
+        _fd.groupby("plateau_id")
+        .agg(
+            stay_id      =("stay_id",   "first"),
+            dose         =("dose_r",    "first"),
+            duration_hrs =("time_hour", "count"),
+        )
+        .reset_index()   # plateau_id becomes a regular column
+    )
+    # MAP start / end from non-null values
+    _map_agg = (
+        _fd.dropna(subset=["mbp"])
+        .groupby("plateau_id")["mbp"]
+        .agg(map_start="first", map_end="last")
+        .reset_index()
+    )
+    _plat = _plat_base.merge(
+        _map_agg[["plateau_id", "map_start", "map_end"]],
+        on="plateau_id", how="left",
+    ).reset_index(drop=True)
+    _plat["delta_map"] = _plat["map_end"] - _plat["map_start"]
+    _plat = _plat[_plat["dose"] > 0].copy()
+
+    if len(_plat) > 0:
+        _plat["dose_bin"] = pd.cut(
+            _plat["dose"],
+            bins=NEE_BIN_EDGES,
+            labels=NEE_BIN_LABELS,
+            right=False, include_lowest=True,
+        )
+        _valid_dbins = [g for g in NEE_BIN_LABELS
+                        if (_plat["dose_bin"] == g).sum() >= 5]
+
+        # ── Plot A: dwell time distribution by NE dose bin ───────────────────
+        _ncols_dw = min(len(_valid_dbins), 4)
+        _nrows_dw = (len(_valid_dbins) + _ncols_dw - 1) // _ncols_dw
+        fig, axes_dw = plt.subplots(_nrows_dw, _ncols_dw,
+                                     figsize=(4.5 * _ncols_dw, 4 * _nrows_dw),
+                                     sharey=False)
+        axes_dw = np.array(axes_dw).flatten()
+
+        for _ax_dw, _bl in zip(axes_dw, _valid_dbins):
+            _d = _plat[_plat["dose_bin"] == _bl]["duration_hrs"].dropna()
+            _max_b = min(int(_d.max()) + 2, 48)
+            _ax_dw.hist(_d, bins=range(1, _max_b + 1),
+                       color=PALETTE[0], edgecolor="white", linewidth=0.3)
+            _ax_dw.axvline(_d.median(), color=PALETTE[2], linewidth=1.8,
+                          linestyle="--", label=f"Median: {_d.median():.0f} h")
+            _ax_dw.set_title(f"NE {_bl} μg/kg/min\n(n={len(_d):,} episodes)", fontsize=9)
+            _ax_dw.set_xlabel("Dwell time (h)", fontsize=8)
+            _ax_dw.set_ylabel("Episodes", fontsize=8)
+            _ax_dw.legend(fontsize=7)
+
+        for _idx_dw in range(len(_valid_dbins), len(axes_dw)):
+            axes_dw[_idx_dw].set_visible(False)
+
+        fig.suptitle(
+            f"{SITE_NAME}: How long do clinicians wait at each NE dose before changing?\n"
+            f"(consecutive same-dose plateaus; ever-vaso patients, n={len(pat[pat['ever_vaso']==1]):,})",
+            fontsize=11,
+        )
+        fig.tight_layout()
+        fig.savefig(OUT_DIR / f"{SITE_LOWER}_analysis_dwell_time_by_dose.png",
+                    dpi=150, bbox_inches="tight")
+        plt.close(fig)
+        print("  Saved analysis_dwell_time_by_dose")
+
+        # ── Plot B: dwell time vs MAP change ─────────────────────────────────
+        _sc_df = _plat[
+            (_plat["duration_hrs"] >= 2) &
+            _plat["delta_map"].notna()
+        ].copy()
+
+        if len(_sc_df) >= 50:
+            fig, axes_sc = plt.subplots(1, 2, figsize=(14, 5))
+
+            # Panel A: scatter dwell time vs delta MAP, colored by NE dose
+            _sc = axes_sc[0].scatter(
+                _sc_df["duration_hrs"].clip(upper=48),
+                _sc_df["delta_map"].clip(-50, 50),
+                c=_sc_df["dose"].clip(upper=NEE_PLOT_CAP),
+                cmap="viridis", alpha=0.3, s=5, rasterized=True,
+            )
+            plt.colorbar(_sc, ax=axes_sc[0], label="NE dose (μg/kg/min)")
+            axes_sc[0].axhline(0, color="black", linewidth=0.8, linestyle="--")
+            axes_sc[0].set_xlabel("Dwell time (h, capped at 48)", fontsize=10)
+            axes_sc[0].set_ylabel("ΔMAP over dwell period (mmHg)", fontsize=10)
+            axes_sc[0].set_title("Dwell time vs MAP change\n(colored by NE dose)", fontsize=10)
+
+            # Panel B: median delta MAP by dose bin
+            _dmap_grp = _sc_df.groupby("dose_bin", observed=True)["delta_map"]
+            _med_dmap = pd.concat([
+                _dmap_grp.median().rename("median"),
+                _dmap_grp.quantile(0.25).rename("q25"),
+                _dmap_grp.quantile(0.75).rename("q75"),
+                _dmap_grp.count().rename("n"),
+            ], axis=1).reset_index()
+            _med_dmap = _med_dmap[_med_dmap["dose_bin"].isin(_valid_dbins)]
+            _x_idx = np.arange(len(_med_dmap))
+            axes_sc[1].bar(_x_idx, _med_dmap["median"], color=PALETTE[0], alpha=0.8,
+                           width=0.6)
+            axes_sc[1].errorbar(
+                _x_idx, _med_dmap["median"],
+                yerr=[np.maximum(_med_dmap["median"] - _med_dmap["q25"], 0),
+                      np.maximum(_med_dmap["q75"] - _med_dmap["median"], 0)],
+                fmt="none", ecolor="black", capsize=4,
+            )
+            axes_sc[1].axhline(0, color="black", linewidth=0.8, linestyle="--")
+            axes_sc[1].set_xticks(_x_idx)
+            axes_sc[1].set_xticklabels(
+                [str(b) for b in _med_dmap["dose_bin"]], rotation=30, ha="right", fontsize=8,
+            )
+            axes_sc[1].set_xlabel("NE dose bin (μg/kg/min)", fontsize=10)
+            axes_sc[1].set_ylabel("Median ΔMAP (mmHg, IQR bars)", fontsize=10)
+            axes_sc[1].set_title("Median MAP change by NE dose bin\n(IQR bars)", fontsize=10)
+
+            fig.suptitle(
+                f"{SITE_NAME}: NE dose dwell time and MAP change\n"
+                f"(plateau episodes with ≥2h at same dose, n={len(_sc_df):,})",
+                fontsize=12,
+            )
+            fig.tight_layout()
+            fig.savefig(OUT_DIR / f"{SITE_LOWER}_analysis_dwell_vs_map.png",
+                        dpi=150, bbox_inches="tight")
+            plt.close(fig)
+            print("  Saved analysis_dwell_vs_map")
+        else:
+            print("  Skipped dwell vs MAP scatter (insufficient plateaus)")
+    else:
+        print("  Skipped dwell-time analysis (no valid plateau data)")
+else:
+    print("  Skipped dwell-time analysis (norepinephrine column not in features)")
+
 print(f"\nAll figures written to: {OUT_DIR}")
 
 # =============================================================================
@@ -1345,15 +1844,31 @@ pd.DataFrame(dict(
 print("  9/12 time_to_vaso_hist.csv")
 
 # ── 10. wait_time_histograms.csv ─────────────────────────────────────────────
+_wait_metric_cols = (
+    [f"hrs_nee_gt{round(t*100):03d}" for t in NE_NEE_THRESHOLDS] +
+    ([f"hrs_ne_gt{round(t*100):03d}" for t in NE_NEE_THRESHOLDS] if _HAS_NE_COL else []) +
+    ["hrs_map_lt65", "hrs_lac_gt2", "hrs_sofa_gt5", "delta_sofa_6h"]
+)
 _rows = []
-for _col in ["hrs_nee_gt025", "hrs_lac_gt2", "hrs_map_lt65", "sofa_rising_6h"]:
+for _col in _wait_metric_cols:
+    if _col not in wait_df.columns:
+        continue
     _d = wait_df[_col].dropna()
-    _max_bin = min(int(_d.max()) + 2, 60)
-    _counts, _edges = np.histogram(_d, bins=range(0, _max_bin + 1))
+    if len(_d) == 0:
+        continue
+    _is_delta = _col == "delta_sofa_6h"
+    if _is_delta:
+        _lo_b = max(int(_d.min()) - 1, -15)
+        _hi_b = min(int(_d.max()) + 2, 15)
+        _bins = list(range(_lo_b, _hi_b + 1))
+    else:
+        _max_bin = min(int(_d.max()) + 2, 60)
+        _bins = list(range(0, _max_bin + 1))
+    _counts, _edges = np.histogram(_d, bins=_bins)
     _med = _d.median()
     for _edge, _cnt in zip(_edges[:-1], _counts):
-        _rows.append(dict(metric=_col, hours=int(_edge), count=int(_cnt),
-                          median_hours=_med))
+        _rows.append(dict(metric=_col, hours=float(_edge), count=int(_cnt),
+                          median=_med, mean=_d.mean()))
 pd.DataFrame(_rows).to_csv(AGG_DIR / "wait_time_histograms.csv", index=False)
 print("  10/12 wait_time_histograms.csv")
 
@@ -1375,11 +1890,16 @@ for _col, _label in INIT_FEATURES:
         if len(_d) < 5:
             continue
         _lo = Q_EDGES[_i];   _hi = Q_EDGES[_i + 1]
+        _sem_q = np.std(_d, ddof=1) / np.sqrt(len(_d)) if len(_d) > 1 else np.nan
         _rows.append(dict(
             feature=_col, quartile_label=_q,
             nee_lo=None if not np.isfinite(_lo) else _lo,
             nee_hi=None if not np.isfinite(_hi) else _hi,
             n=len(_d),
+            mean=float(np.mean(_d)),
+            ci_lo_mean=float(np.mean(_d) - 1.96 * _sem_q) if not np.isnan(_sem_q) else np.nan,
+            ci_hi_mean=float(np.mean(_d) + 1.96 * _sem_q) if not np.isnan(_sem_q) else np.nan,
+            min_val=float(np.min(_d)), max_val=float(np.max(_d)),
             p5=np.percentile(_d, 5), q1=np.percentile(_d, 25),
             median=np.median(_d),    q3=np.percentile(_d, 75),
             p95=np.percentile(_d, 95),
@@ -1395,9 +1915,17 @@ for _col, _label in INIT_FEATURES:
         _d = initiators[initiators["nee_init_bin"] == _grp][_col].dropna()
         if len(_d) < 5:
             continue
-        _rows.append(dict(feature=_col, nee_bin=_grp, n=len(_d),
-                          q1=_d.quantile(0.25), median=_d.median(),
-                          q3=_d.quantile(0.75)))
+        _sem_b = _d.std(ddof=1) / np.sqrt(len(_d)) if len(_d) > 1 else np.nan
+        _rows.append(dict(
+            feature=_col, nee_bin=_grp, n=len(_d),
+            mean=_d.mean(),
+            ci_lo_mean=_d.mean() - 1.96 * _sem_b if not np.isnan(_sem_b) else np.nan,
+            ci_hi_mean=_d.mean() + 1.96 * _sem_b if not np.isnan(_sem_b) else np.nan,
+            min_val=_d.min(), max_val=_d.max(),
+            p5=_d.quantile(0.05), q1=_d.quantile(0.25),
+            median=_d.median(), q3=_d.quantile(0.75),
+            p95=_d.quantile(0.95),
+        ))
 pd.DataFrame(_rows).to_csv(AGG_DIR / "init_features_by_nee_bin.csv", index=False)
 print("  12/14 init_features_by_nee_bin.csv")
 
@@ -1408,6 +1936,7 @@ _DRUG_DEFS_13 = [
     ("phenylephrine",  "PHENYL"),
     ("dopamine",       "DOPA"),
     ("epinephrine",    "EPI"),
+    ("angiotensin",    "ANGII"),
 ]
 _avail_drugs_13 = [(col, name) for col, name in _DRUG_DEFS_13 if col in features.columns]
 if _avail_drugs_13:
@@ -1449,6 +1978,32 @@ if _avail_drugs_13:
         _rows13.append(_row13)
     pd.DataFrame(_rows13).to_csv(AGG_DIR / "vasopressor_combinations.csv", index=False)
     print("  13/14 vasopressor_combinations.csv")
+
+    # ── 13b. vaso_timing_individual.csv ──────────────────────────────────────
+    # For vasopressin recipients: hours from each co-drug's first dose to vaso
+    # (negative = co-drug started before vasopressin)
+    if "VASO" in _first13.columns:
+        _vaso_mask13 = _combo13["any_VASO"]
+        _timing_ind_rows = []
+        for _, _name13 in _avail_drugs_13:
+            if _name13 == "VASO":
+                continue
+            _ac_j13 = f"any_{_name13}"
+            if _ac_j13 not in _combo13.columns:
+                continue
+            _both_mask13 = _vaso_mask13 & _combo13[_ac_j13]
+            _diff13 = (
+                _first13.loc[_both_mask13, _name13] - _first13.loc[_both_mask13, "VASO"]
+            ).dropna()
+            for _dh in _diff13.values:
+                _timing_ind_rows.append({"drug": _name13, "diff_hours": round(float(_dh), 3)})
+        if _timing_ind_rows:
+            pd.DataFrame(_timing_ind_rows).to_csv(AGG_DIR / "vaso_timing_individual.csv", index=False)
+            print("  13b vaso_timing_individual.csv")
+        else:
+            print("  13b vaso_timing_individual empty — skipped")
+    else:
+        print("  13b skipped vaso_timing_individual (no VASO feature column)")
 else:
     print("  13/14 skipped vasopressor_combinations (no drug columns in features)")
 
@@ -1522,3 +2077,303 @@ except Exception as _e14:
     print(f"  14/14 skipped vaso_receipt_logreg: {_e14}")
 
 print(f"\nAggregate CSVs written to: {AGG_DIR}")
+
+# =============================================================================
+# Section 16: Federated ICC — Site Return Packet
+#
+# Three outcomes measuring distinct aspects of vasopressin practice:
+#   1. ever_vaso         (binary)     — WHO gets vasopressin?
+#   2. first_vaso_hour   (continuous) — HOW QUICKLY is it started?
+#   3. nee_at_init       (continuous) — AT WHAT NE BURDEN is it started?
+#
+# M0 (null):  intercept only        → raw between-site ICC
+# M1 (adj):   6 case-mix covariates → residual ICC after patient-factor adjustment
+# PCV = (τ²_M0 − τ²_M1) / τ²_M0   → fraction explained by case-mix
+#
+# Binary model: score/Hessian at θ₀ (one-shot Newton, aggregated centrally)
+# Linear models: XᵀX / Xᵀy sufficient statistics (exact pooled OLS)
+# =============================================================================
+try:
+    import json as _json_icc
+    import scipy.special as _sp_spec
+    import scipy.optimize as _sp_opt
+
+    print("\n" + "=" * 60)
+    print("SECTION 16: FEDERATED ICC SITE PACKET")
+    print("=" * 60)
+
+    _COVARIATES_M1 = [
+        "sepsis_onset_sofa",
+        "initial_lactate",
+        "age",
+        "peak_nee_12h",   # computed below from features
+        "map_t0",         # computed below from features
+        "ventil_ever",
+    ]
+
+    # ── New covariates from features ──────────────────────────────────────────
+    _icc_nee_12h = (
+        features[features["time_hour"] <= 12]
+        .groupby("stay_id")["nee"].max()
+        .reset_index().rename(columns={"nee": "peak_nee_12h"})
+    )
+    _icc_map_t0 = (
+        features[features["time_hour"] <= 1]
+        .sort_values(["stay_id", "time_hour"])
+        .groupby("stay_id")["mbp"].first()
+        .reset_index().rename(columns={"mbp": "map_t0"})
+    )
+
+    # ── Build analysis dataframe ──────────────────────────────────────────────
+    _icc_df = pat[
+        ["stay_id", "ever_vaso", "first_vaso_hour", "nee_at_init", "ventil_ever"]
+    ].copy()
+    _icc_df = _icc_df.merge(
+        cohort[["stay_id", "sepsis_onset_sofa", "initial_lactate", "age"]],
+        on="stay_id", how="left",
+    )
+    _icc_df = _icc_df.merge(_icc_nee_12h, on="stay_id", how="left")
+    _icc_df = _icc_df.merge(_icc_map_t0, on="stay_id", how="left")
+
+    # ── Off-hours in local time (initiators only) ─────────────────────────────
+    _icc_tz = getattr(_cfg, "TIMEZONE", "UTC")  # _cfg still in scope from top
+    _icc_ref = "trajectory_start" if "trajectory_start" in pat.columns else "first_norepi_time"
+    _icc_ts = pat[["stay_id", _icc_ref, "first_vaso_hour", "ever_vaso"]].copy()
+    _icc_ts["_ref_utc"] = pd.to_datetime(_icc_ts[_icc_ref], utc=True, errors="coerce")
+    _icc_ts["_vaso_utc"] = (
+        _icc_ts["_ref_utc"]
+        + pd.to_timedelta(_icc_ts["first_vaso_hour"].fillna(0).astype(float), unit="h")
+    )
+    try:
+        _icc_ts["_vaso_local"] = _icc_ts["_vaso_utc"].dt.tz_convert(_icc_tz)
+    except Exception:
+        _icc_ts["_vaso_local"] = _icc_ts["_vaso_utc"]
+
+    _icc_ts["shock_hour"]   = _icc_ts["_vaso_local"].dt.hour
+    _icc_ts["shock_dow"]    = _icc_ts["_vaso_local"].dt.dayofweek   # 0=Mon, 6=Sun
+    _icc_ts["is_weekend"]   = (_icc_ts["shock_dow"] >= 5).astype(int)
+    _icc_ts["is_off_hours"] = (
+        (_icc_ts["is_weekend"] == 1)
+        | (_icc_ts["shock_hour"] < 7)
+        | (_icc_ts["shock_hour"] >= 18)
+    ).astype(int)
+    for _c16 in ["shock_hour", "shock_dow", "is_weekend", "is_off_hours"]:
+        _icc_ts.loc[_icc_ts["ever_vaso"] == 0, _c16] = np.nan
+    _icc_df = _icc_df.merge(
+        _icc_ts[["stay_id", "shock_hour", "is_weekend", "is_off_hours"]],
+        on="stay_id", how="left",
+    )
+
+    # ── Validation checks ─────────────────────────────────────────────────────
+    _icc_init = _icc_df[_icc_df["ever_vaso"] == 1]
+    _off_rate = _icc_init["is_off_hours"].mean()
+    print(f"  Off-hours initiation rate: {_off_rate:.1%}")
+    if not np.isnan(_off_rate) and not (0.35 <= _off_rate <= 0.75):
+        print("  WARNING: off-hours rate outside expected range 35–75% — check TIMEZONE setting")
+    for _c16 in _COVARIATES_M1:
+        _miss = _icc_df[_c16].isna().mean()
+        if _miss > 0.30:
+            print(f"  WARNING: {_c16} has {_miss:.0%} missing in ICC dataset")
+
+    # ── Helpers ───────────────────────────────────────────────────────────────
+    def _icc_fit_logistic(X, y):
+        """Pooled logistic MLE via BFGS. Returns coef vector."""
+        def _nll(th):
+            logit = X @ th
+            return -float(np.sum(y * logit - np.logaddexp(0, logit)))
+        def _grad(th):
+            return -(X.T @ (y - _sp_spec.expit(X @ th)))
+        return _sp_opt.minimize(
+            _nll, x0=np.zeros(X.shape[1]), jac=_grad, method="BFGS",
+            options={"maxiter": 1000},
+        ).x
+
+    def _icc_score_hess(X, y, theta):
+        """Score and Hessian of logistic log-likelihood at theta."""
+        p = _sp_spec.expit(X @ theta)
+        score = X.T @ (y - p)
+        W = p * (1.0 - p)
+        hessian = -(X.T * W) @ X
+        return score, hessian
+
+    def _icc_lm_suff(outcome_col, anchor_mu, anchor_sd):
+        """XᵀX / Xᵀy / yᵀy for linear model, standardized with anchor params."""
+        _sub = _icc_init[["stay_id", outcome_col] + _COVARIATES_M1].dropna()
+        if len(_sub) < 11:
+            return {"n": len(_sub), "suppressed": True}
+        _y  = _sub[outcome_col].values.astype(float)
+        _Xr = _sub[_COVARIATES_M1].values.astype(float)
+        _X  = np.column_stack([np.ones(len(_sub)), (_Xr - anchor_mu) / anchor_sd])
+        return {
+            "n":     int(len(_sub)),
+            "y_bar": float(_y.mean()),
+            "y_sd":  float(_y.std()),
+            "XtX":   (_X.T @ _X).tolist(),
+            "Xty":   (_X.T @ _y).tolist(),
+            "yty":   float(_y @ _y),
+        }
+
+    # ── M0: intercept-only (binary) ───────────────────────────────────────────
+    _m0_df   = _icc_df[["stay_id", "ever_vaso"]].dropna()
+    _X_m0    = np.ones((len(_m0_df), 1))
+    _y_m0    = _m0_df["ever_vaso"].values.astype(float)
+
+    # ── M1: case-mix covariates (binary) ─────────────────────────────────────
+    _m1_df   = _icc_df[["stay_id", "ever_vaso"] + _COVARIATES_M1].dropna()
+    _m1_Xraw = _m1_df[_COVARIATES_M1].values.astype(float)
+    _local_mu = _m1_Xraw.mean(axis=0)
+    _local_sd = _m1_Xraw.std(axis=0)
+    _local_sd[_local_sd == 0] = 1.0
+    _y_m1    = _m1_df["ever_vaso"].values.astype(float)
+
+    # ── Anchor site: fit theta0 and save for other sites ─────────────────────
+    _IS_ANCHOR = SITE_NAME.upper() == "UCMC"
+    _theta0_m0, _theta0_m1, _anchor_mu, _anchor_sd = None, None, _local_mu, _local_sd
+
+    if _IS_ANCHOR:
+        print("  Anchor site: fitting local logistic theta0 for M0 and M1...")
+        _theta0_m0 = _icc_fit_logistic(_X_m0, _y_m0)
+        _X_m1_fit  = np.column_stack([np.ones(len(_m1_df)),
+                                      (_m1_Xraw - _local_mu) / _local_sd])
+        _theta0_m1 = _icc_fit_logistic(_X_m1_fit, _y_m1)
+        _json_icc.dump(
+            {"theta0": _theta0_m0.tolist(), "model": "M0", "site": SITE_NAME},
+            open(AGG_DIR / "theta0_m0.json", "w"),
+        )
+        _json_icc.dump(
+            {"theta0": _theta0_m1.tolist(), "model": "M1", "site": SITE_NAME,
+             "covariates": _COVARIATES_M1,
+             "mu": _local_mu.tolist(), "sd": _local_sd.tolist()},
+            open(AGG_DIR / "theta0_m1.json", "w"),
+        )
+        print(f"  Saved theta0_m0.json + theta0_m1.json → {AGG_DIR}")
+    else:
+        # Search sibling upload_to_box dirs for anchor theta0
+        for _cand in sorted((OUTPUT_ROOT / "output").glob(
+                "upload_to_box_*/epi_analysis/theta0_m0.json")):
+            _theta0_m0 = np.array(_json_icc.load(open(_cand))["theta0"])
+            print(f"  Loaded theta0_m0 from {_cand.parent.parent.name}")
+            break
+        for _cand in sorted((OUTPUT_ROOT / "output").glob(
+                "upload_to_box_*/epi_analysis/theta0_m1.json")):
+            _t0d = _json_icc.load(open(_cand))
+            _theta0_m1 = np.array(_t0d["theta0"])
+            _anchor_mu = np.array(_t0d["mu"])
+            _anchor_sd = np.array(_t0d["sd"])
+            _anchor_sd[_anchor_sd == 0] = 1.0
+            print(f"  Loaded theta0_m1 from {_cand.parent.parent.name}")
+            break
+        if _theta0_m0 is None:
+            print("  No anchor theta0 found — fitting locally (non-anchor estimate)")
+            _theta0_m0 = _icc_fit_logistic(_X_m0, _y_m0)
+            _X_m1_fit  = np.column_stack([np.ones(len(_m1_df)),
+                                          (_m1_Xraw - _local_mu) / _local_sd])
+            _theta0_m1 = _icc_fit_logistic(_X_m1_fit, _y_m1)
+
+    # ── Score/Hessian for M0 at theta0 ───────────────────────────────────────
+    _s_m0, _h_m0 = _icc_score_hess(_X_m0, _y_m0, _theta0_m0)
+
+    # ── Score/Hessian for M1 at theta0 (using anchor standardization) ─────────
+    _X_m1_anch = np.column_stack(
+        [np.ones(len(_m1_df)), (_m1_Xraw - _anchor_mu) / _anchor_sd]
+    )
+    if _theta0_m1 is not None:
+        _s_m1, _h_m1 = _icc_score_hess(_X_m1_anch, _y_m1, _theta0_m1)
+    else:
+        _s_m1, _h_m1 = None, None
+
+    # ── Sufficient statistics for continuous outcomes (anchor standardization) ─
+    _suff_time = _icc_lm_suff("first_vaso_hour", _anchor_mu, _anchor_sd)
+    _suff_nee  = _icc_lm_suff("nee_at_init",     _anchor_mu, _anchor_sd)
+
+    # ── Assemble packet ───────────────────────────────────────────────────────
+    def _sf16(x):
+        try:
+            v = float(x)
+            return None if np.isnan(v) else v
+        except Exception:
+            return None
+
+    _n_m0, _n_m1 = len(_m0_df), len(_m1_df)
+
+    _icc_pkt = {
+        "site_id":    SITE_NAME,
+        "is_anchor":  _IS_ANCHOR,
+        "covariates_m1": _COVARIATES_M1,
+        "anchor_standardization": {
+            "mu": _anchor_mu.tolist(),
+            "sd": _anchor_sd.tolist(),
+        },
+        # ── Cohort descriptives ───────────────────────────────────────────────
+        "n_total":          int(len(_icc_df)),
+        "n_initiators":     int(_icc_df["ever_vaso"].sum()),
+        "ever_vaso_rate":   _sf16(_icc_df["ever_vaso"].mean()),
+        # ── Case-mix (Table 1 reconstruction) ────────────────────────────────
+        "covariate_stats": {
+            c: {
+                "mean":        _sf16(_icc_df[c].mean()),
+                "sd":          _sf16(_icc_df[c].std()),
+                "missing_pct": _sf16(_icc_df[c].isna().mean() * 100),
+            }
+            for c in _COVARIATES_M1
+        },
+        # ── Continuous outcome descriptives ───────────────────────────────────
+        "time_to_init_hrs": {
+            "median": _sf16(_icc_init["first_vaso_hour"].median()),
+            "q1":     _sf16(_icc_init["first_vaso_hour"].quantile(0.25)),
+            "q3":     _sf16(_icc_init["first_vaso_hour"].quantile(0.75)),
+        },
+        "nee_at_init_desc": {
+            "median": _sf16(_icc_init["nee_at_init"].median()),
+            "q1":     _sf16(_icc_init["nee_at_init"].quantile(0.25)),
+            "q3":     _sf16(_icc_init["nee_at_init"].quantile(0.75)),
+        },
+        # ── Off-hours descriptives ────────────────────────────────────────────
+        "off_hours": {
+            "off_hours_rate":   _sf16(_icc_init["is_off_hours"].mean()),
+            "weekend_rate":     _sf16(_icc_init["is_weekend"].mean()),
+            "time_to_init_off": _sf16(
+                _icc_init.loc[_icc_init["is_off_hours"] == 1, "first_vaso_hour"].mean()
+            ),
+            "time_to_init_on":  _sf16(
+                _icc_init.loc[_icc_init["is_off_hours"] == 0, "first_vaso_hour"].mean()
+            ),
+            "nee_at_init_off":  _sf16(
+                _icc_init.loc[_icc_init["is_off_hours"] == 1, "nee_at_init"].mean()
+            ),
+            "nee_at_init_on":   _sf16(
+                _icc_init.loc[_icc_init["is_off_hours"] == 0, "nee_at_init"].mean()
+            ),
+        },
+        # ── M0: binary null model ─────────────────────────────────────────────
+        "m0_binary": {
+            "n_model":  int(_n_m0),
+            "y_bar":    _sf16(_y_m0.mean()),
+            "theta0":   _theta0_m0.tolist() if _IS_ANCHOR else None,
+            "score":    _s_m0.tolist() if _n_m0 >= 11 else None,
+            "hessian":  _h_m0.tolist() if _n_m0 >= 11 else None,
+        },
+        # ── M1: binary case-mix model ─────────────────────────────────────────
+        "m1_binary": {
+            "n_model": int(_n_m1),
+            "y_bar":   _sf16(_y_m1.mean()) if _n_m1 > 0 else None,
+            "score":   _s_m1.tolist() if (_s_m1 is not None and _n_m1 >= 11) else None,
+            "hessian": _h_m1.tolist() if (_h_m1 is not None and _n_m1 >= 11) else None,
+        },
+        # ── Linear outcomes: sufficient statistics ────────────────────────────
+        "m1_time_to_init": _suff_time,
+        "m1_nee_at_init":  _suff_nee,
+    }
+
+    _pkt_path = AGG_DIR / f"site_packet_{SITE_NAME}.json"
+    with open(_pkt_path, "w") as _fout16:
+        _json_icc.dump(_icc_pkt, _fout16, indent=2,
+                       default=lambda x: None if x is None else x)
+    print(f"  Saved site packet → {_pkt_path}")
+    if _IS_ANCHOR:
+        print("  Anchor theta0 files written — distribute to other sites before they run this script")
+
+except Exception as _e16:
+    print(f"  Section 16 failed: {_e16}")
+    import traceback as _tb16
+    _tb16.print_exc()

@@ -69,7 +69,7 @@ STEROID_CATEGORIES = [
 ]
 VASOPRESSOR_CATEGORIES = [
     "norepinephrine", "epinephrine", "phenylephrine",
-    "vasopressin", "dopamine", "angiotensin",
+    "vasopressin", "dopamine", "angiotensin ii",
 ]
 
 # Override defaults with site-specific config from config/config.py
@@ -93,7 +93,7 @@ if CLIF_DIR is None or OUTPUT_ROOT is None:
     )
 
 # Patient-level (PHI) intermediate outputs — stay local, NEVER shared.
-# 02_site_summary.py / 03_site_threshold_sweep.py read from here and write the
+# 02_site_summary.py - 05_epi_analysis.py read from here and write the
 # shareable aggregates to output/upload_to_box_<SITE_NAME>/.
 PATIENT_LEVEL_DIR = OUTPUT_ROOT / "output" / f"patient_level_data_{SITE_NAME}"
 
@@ -362,56 +362,13 @@ def build_cohort(clif_dir: Path, co: ClifOrchestrator) -> tuple:
     })
     print(f"  {len(suspected):,} patients")
 
-    print("Step 2: ICU admission times from ADT...")
-    icu = get_icu_times(clif_dir)
-    suspected = suspected.merge(icu, on="hospitalization_id", how="inner")
+    print("Step 2: Sepsis-3 criteria (SOFA ≥ 2 + lactate > 2 mmol/L within 24h of infection)...")
     suspected["presumed_infection_dttm"] = tz_coerce(suspected["presumed_infection_dttm"], TIMEZONE)
-    suspected["icu_intime"] = tz_coerce(suspected["icu_intime"], TIMEZONE)
-    diff_h = (suspected["presumed_infection_dttm"] - suspected["icu_intime"]).dt.total_seconds() / 3600
-    suspected = suspected[diff_h.abs() <= 24].copy()
-    filter_log.append({
-        "step": "ICU admission (ADT) within 24h of suspected infection",
-        "n_hospitalizations": len(suspected),
-    })
-    print(f"  {len(suspected):,} with infection within 24h of ICU admit")
-
-    # Also build non-ICU any-location cohort in parallel (for secondary output)
-    any_loc = get_any_location_times(clif_dir)
-    suspected_all = identify_suspected_infection(clif_dir)
-    suspected_all = suspected_all.merge(any_loc, on="hospitalization_id", how="inner")
-    suspected_all["presumed_infection_dttm"] = tz_coerce(suspected_all["presumed_infection_dttm"], TIMEZONE)
-    suspected_all["first_loc_intime"] = tz_coerce(suspected_all["first_loc_intime"], TIMEZONE)
-    diff_all = (suspected_all["presumed_infection_dttm"] - suspected_all["first_loc_intime"]).dt.total_seconds() / 3600
-    suspected_all = suspected_all[diff_all.abs() <= 24].copy()
-    # Non-ICU = patients not in the primary ICU cohort after step 2
-    nonicu_ids_step2 = set(suspected_all["hospitalization_id"]) - set(suspected["hospitalization_id"])
-    suspected_nonicu = suspected_all[suspected_all["hospitalization_id"].isin(nonicu_ids_step2)].copy()
-
-    # Log non-ICU location breakdown for the CONSORT flowchart
-    if len(suspected_nonicu) > 0 and "location_category" in suspected_nonicu.columns:
-        loc_counts = suspected_nonicu["location_category"].fillna("unknown").value_counts()
-        for loc_cat, loc_n in loc_counts.items():
-            filter_log.append({
-                "step": f"Non-ICU: {loc_cat}",
-                "n_hospitalizations": int(loc_n),
-            })
-
-    print("Step 3: NE criteria (first NE ≤24h of ICU admit, ≥2 records)...")
-    ne = get_ne_criteria(clif_dir, icu)
-    suspected = suspected.merge(ne, on="hospitalization_id", how="inner")
-    filter_log.append({
-        "step": f"Norepinephrine within 24h of ICU admit (>=2 records)",
-        "n_hospitalizations": len(suspected),
-    })
-    print(f"  {len(suspected):,} patients")
-
-    print("Step 4: SOFA ≥ 2 via clifpy...")
-    hosp_ids = suspected["hospitalization_id"].tolist()
-    _load_sofa_tables(co, hosp_ids)
-
     suspected["start_time"] = suspected["presumed_infection_dttm"]
     suspected["end_time"] = suspected["presumed_infection_dttm"] + pd.Timedelta(hours=24)
 
+    hosp_ids = suspected["hospitalization_id"].tolist()
+    _load_sofa_tables(co, hosp_ids)
     co.create_wide_dataset(
         category_filters=REQUIRED_SOFA_CATEGORIES_BY_TABLE,
         cohort_df=suspected,
@@ -429,15 +386,11 @@ def build_cohort(clif_dir: Path, co: ClifOrchestrator) -> tuple:
                                 on="hospitalization_id", how="left")
     suspected = suspected[suspected["sofa_total"] >= SOFA_THRESHOLD].copy()
     filter_log.append({
-        "step": f"SOFA >= {SOFA_THRESHOLD} within 24h of infection",
+        "step": f"Sepsis-3: SOFA >= {SOFA_THRESHOLD} within 24h of infection",
         "n_hospitalizations": len(suspected),
     })
     print(f"  {len(suspected):,} with SOFA ≥ {SOFA_THRESHOLD}")
 
-    print("Step 5: Hemodynamic criteria (NE already applied; vasopressor criterion met)...")
-    print(f"  {len(suspected):,} patients")
-
-    print("Step 6: Elevated lactate > 2 within 24h of infection...")
     lactate = co.labs.df[co.labs.df["lab_category"] == "lactate"].copy()
     lactate["lab_result_dttm"] = tz_coerce(lactate["lab_result_dttm"], TIMEZONE)
     lac_window = lactate.merge(suspected[["hospitalization_id", "start_time", "end_time"]],
@@ -456,15 +409,60 @@ def build_cohort(clif_dir: Path, co: ClifOrchestrator) -> tuple:
     )
     lac = lac_window[lac_window["lab_value_numeric"] > LACTATE_THRESHOLD]
     elevated_ids = set(lac["hospitalization_id"])
-    cohort = suspected[suspected["hospitalization_id"].isin(elevated_ids)].copy()
-    cohort = cohort.merge(initial_lac, on="hospitalization_id", how="left")
+    suspected = suspected[suspected["hospitalization_id"].isin(elevated_ids)].copy()
+    suspected = suspected.merge(initial_lac, on="hospitalization_id", how="left")
     filter_log.append({
-        "step": f"Lactate > {LACTATE_THRESHOLD} mmol/L within 24h of infection (final septic shock cohort)",
-        "n_hospitalizations": len(cohort),
+        "step": f"Sepsis-3: lactate > {LACTATE_THRESHOLD} mmol/L within 24h of infection",
+        "n_hospitalizations": len(suspected),
     })
-    print(f"  {len(cohort):,} septic shock patients")
+    print(f"  {len(suspected):,} meeting full Sepsis-3 criteria (SOFA + lactate)")
 
-    print("Step 7: Mortality and trajectory bounds...")
+    # Save pre-ICU Sepsis-3 IDs for non-ICU CONSORT count
+    sepsis3_lac_ids = set(suspected["hospitalization_id"])
+
+    print("Step 3: ICU admission within 24h of infection...")
+    icu = get_icu_times(clif_dir)
+    suspected = suspected.merge(icu, on="hospitalization_id", how="inner")
+    suspected["icu_intime"] = tz_coerce(suspected["icu_intime"], TIMEZONE)
+    diff_h = (suspected["presumed_infection_dttm"] - suspected["icu_intime"]).dt.total_seconds() / 3600
+    suspected = suspected[diff_h.abs() <= 24].copy()
+    filter_log.append({
+        "step": "ICU admission (ADT) within 24h of suspected infection",
+        "n_hospitalizations": len(suspected),
+    })
+    print(f"  {len(suspected):,} with ICU within 24h of infection")
+
+    # Non-ICU = Sepsis-3 + lactate patients without an ICU admission (for CONSORT flowchart)
+    nonicu_ids = sepsis3_lac_ids - set(suspected["hospitalization_id"])
+    any_loc = get_any_location_times(clif_dir)
+    suspected_nonicu = (
+        identify_suspected_infection(clif_dir)
+        .merge(any_loc, on="hospitalization_id", how="inner")
+    )
+    suspected_nonicu = suspected_nonicu[
+        suspected_nonicu["hospitalization_id"].isin(nonicu_ids)
+    ].copy()
+
+    if len(suspected_nonicu) > 0 and "location_category" in suspected_nonicu.columns:
+        loc_counts = suspected_nonicu["location_category"].fillna("unknown").value_counts()
+        for loc_cat, loc_n in loc_counts.items():
+            filter_log.append({
+                "step": f"Non-ICU: {loc_cat}",
+                "n_hospitalizations": int(loc_n),
+            })
+
+    print("Step 4: NE criteria (first NE ≤24h of ICU admit, ≥2 records)...")
+    ne = get_ne_criteria(clif_dir, icu)
+    suspected = suspected.merge(ne, on="hospitalization_id", how="inner")
+    filter_log.append({
+        "step": f"Norepinephrine within 24h of ICU admit (>=2 records)",
+        "n_hospitalizations": len(suspected),
+    })
+    print(f"  {len(suspected):,} patients")
+
+    cohort = suspected.drop(columns=["start_time", "end_time"], errors="ignore")
+
+    print("Step 5: Mortality and trajectory bounds...")
     mortality = get_mortality(clif_dir)
     cohort = cohort.merge(mortality, on="hospitalization_id", how="left")
     cohort = cohort.rename(columns={"age_at_admission": "age"})
@@ -510,7 +508,7 @@ def build_cohort(clif_dir: Path, co: ClifOrchestrator) -> tuple:
         .apply(lambda x: float(int(x)) if pd.notna(x) else float("nan"))
     )
 
-    # Rename sofa to sepsis_onset_sofa (already on cohort from step 4)
+    # Rename sofa to sepsis_onset_sofa (computed in step 2)
     if "sofa_total" in cohort.columns:
         cohort = cohort.rename(columns={"sofa_total": "sepsis_onset_sofa"})
 
@@ -845,7 +843,7 @@ def add_nee(grid: pd.DataFrame, meds: pd.DataFrame) -> pd.DataFrame:
 
 
 # NEE component drugs pulled as individual dose columns (mcg/kg/min each)
-_NEE_COMPONENT_CATS = ["epinephrine", "phenylephrine", "dopamine"]
+_NEE_COMPONENT_CATS = ["epinephrine", "phenylephrine", "dopamine", "angiotensin ii"]
 
 
 def add_nee_components(grid: pd.DataFrame, meds: pd.DataFrame) -> pd.DataFrame:

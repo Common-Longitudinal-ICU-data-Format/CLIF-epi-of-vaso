@@ -10,9 +10,9 @@ All analysis scripts for the vasopressin epidemiology project.
 | `02_site_summary.py` | Compute federated-safe aggregate statistics; write shareable CSVs to `upload_to_box_<SITE>/` | Each site |
 | `03_site_threshold_sweep.py` | Per-feature threshold sweep vs clinician vasopressin action | Each site |
 | `04_site_threshold_outcome.py` | Discrete-time survival analysis of threshold-based rules (optional) | Each site |
-| `05_epi_analysis.py` | Epidemiological characterization; write figures + CSVs to `upload_to_box_<SITE>/epi_analysis/` | Each site |
+| `05_epi_analysis.py` | Epidemiological characterization + federated ICC return packet; write figures + CSVs to `upload_to_box_<SITE>/epi_analysis/` | Each site |
+| `multisite_epi_plots.py` | Cross-site epi figures + federated ICC aggregation (ICC, MOR, PCV) | Coordinating site only |
 
-The site is read from `SITE_NAME` in `config/config.py`. Pass `--site <NAME>` to `05_epi_analysis.py` to override (e.g. for MIMIC-IV).
 The site is read from `SITE_NAME` in `config/config.py`. Pass `--site <NAME>` to `05_epi_analysis.py` to override (e.g. for MIMIC-IV).
 
 ## Usage
@@ -20,23 +20,23 @@ The site is read from `SITE_NAME` in `config/config.py`. Pass `--site <NAME>` to
 ```bash
 # Extraction — writes PHI intermediate to output/patient_level_data_<SITE>/
 uv run python code/01_clif_extract.py
-uv run python code/01_clif_extract.py
 
 # Federated summary — writes shareable CSVs to output/upload_to_box_<SITE>/
-uv run python code/02_site_summary.py
 uv run python code/02_site_summary.py
 
 # Threshold sweep — writes to output/upload_to_box_<SITE>/threshold/
 uv run python code/03_site_threshold_sweep.py
-uv run python code/03_site_threshold_sweep.py
 
 # Threshold outcome (optional) — writes to output/upload_to_box_<SITE>/threshold/
 uv run python code/04_site_threshold_outcome.py
-uv run python code/04_site_threshold_outcome.py
 
-# Epidemiological analysis — writes figures + 12 aggregate CSVs to upload_to_box_<SITE>/epi_analysis/
+# Epidemiological analysis + ICC packet — writes figures + aggregate CSVs to upload_to_box_<SITE>/epi_analysis/
+# UCMC must run first (it writes theta0 anchor files that other sites load automatically)
 uv run python code/05_epi_analysis.py
 uv run python code/05_epi_analysis.py --site MIMIC   # override site name
+
+# Cross-site aggregation (coordinating site, after collecting all upload_to_box_<SITE>/ folders)
+uv run python code/multisite_epi_plots.py
 ```
 
 ## Outputs
@@ -47,9 +47,9 @@ uv run python code/05_epi_analysis.py --site MIMIC   # override site name
 | `02_site_summary.py` | `output/upload_to_box_<SITE>/` (root CSVs) | Share |
 | `03_site_threshold_sweep.py` | `output/upload_to_box_<SITE>/threshold/` | Share |
 | `04_site_threshold_outcome.py` | `output/upload_to_box_<SITE>/threshold/` | Share |
-| `05_epi_analysis.py` | `output/epi_analysis_<SITE>/` (PHI copy) + `output/upload_to_box_<SITE>/epi_analysis/` (CSVs + plots) | Share the `epi_analysis/` folder inside `upload_to_box_<SITE>/` |
+| `05_epi_analysis.py` | `output/upload_to_box_<SITE>/epi_analysis/` (CSVs + plots + ICC packet) | Share |
+| `multisite_epi_plots.py` | `cross-site output/` | Coordinating site |
 
-## 05_epi_analysis.py analyses
 ## 05_epi_analysis.py analyses
 
 | ID | Name | Description |
@@ -69,6 +69,7 @@ uv run python code/05_epi_analysis.py --site MIMIC   # override site name
 | 5B | Patient profile by NEE bin (ribbon) | Median + IQR ribbon across 7 NEE-at-initiation bins |
 | 5D | Rate of change pre-vaso | Linear slope of SOFA/lactate/MAP in final 6h before vasopressin (by NEE quartile) |
 | 5E | TOD vs SOFA at initiation | Time of day of vasopressin start vs SOFA at initiation (LOWESS) |
+| 16 | Federated ICC packet | Score/Hessian for one-shot Newton aggregation; sufficient statistics for linear outcomes |
 
 ### NEE bins
 
@@ -87,6 +88,25 @@ uv run python code/05_epi_analysis.py --site MIMIC   # override site name
 | `tod_init_features_binned.csv` | `feature, clock_hour, n, q1, median, q3, mean` |
 | `tod_init_features_lowess.csv` | `feature, clock_hour, lowess_y` |
 | `time_to_vaso_hist.csv` | `bin_left_hour, bin_right_hour, count, median_hours, p75_hours` |
-| `wait_time_histograms.csv` | `metric, hours, count, median_hours` |
+| `wait_time_histograms.csv` | `metric, hours, count, median, mean` |
 | `init_features_by_quartile.csv` | `feature, quartile_label, nee_lo, nee_hi, n, p5, q1, median, q3, p95, kw_p, mw_q1q4_p_bonf` |
 | `init_features_by_nee_bin.csv` | `feature, nee_bin, n, q1, median, q3` |
+| `vasopressor_combinations.csv` | Vasopressor co-administration combinations |
+| `vaso_receipt_logreg.csv` | Logistic regression coefficients for vasopressin receipt |
+
+### Federated ICC files written to `upload_to_box_{SITE}/epi_analysis/`
+
+| File | Contents | Site |
+|------|----------|------|
+| `theta0_m0.json` | Anchor logistic intercept (M0, intercept-only) | UCMC only |
+| `theta0_m1.json` | Anchor logistic coefficients (M1, case-mix adjusted) + covariate mu/sd for standardization | UCMC only |
+| `site_packet_<SITE>.json` | Score/Hessian at anchor θ₀ for M0 and M1; sufficient statistics (XᵀX, Xᵀy) for linear outcomes; descriptive stats and off-hours summary | All sites |
+
+**ICC covariates (M1):** `sepsis_onset_sofa`, `initial_lactate`, `age`, `peak_nee_12h` (max NEE in first 12h), `map_t0` (MAP at trajectory start), `ventil_ever`
+
+**Three outcomes decomposed:**
+1. `ever_vaso` (binary) — who gets vasopressin? Aggregated via one-shot Newton logistic regression.
+2. `first_vaso_hour` (continuous, initiators only) — how quickly is it started? Aggregated via exact OLS sufficient statistics.
+3. `nee_at_init` (continuous, initiators only) — at what NE burden is it started? Aggregated via exact OLS sufficient statistics.
+
+UCMC is the anchor site and must run `05_epi_analysis.py` first. Other sites automatically find and load UCMC's `theta0_m*.json` files from the sibling `upload_to_box_UCMC/epi_analysis/` directory.

@@ -8,7 +8,7 @@ Federated multi-site analysis of vasopressin initiation patterns in ICU patients
 
 ## Objective
 
-Characterize clinician vasopressin initiation behavior across sites, identify feature-threshold decision rules that explain initiation timing, and compare clinician practice to a reinforcement-learning (RL) policy. The project supports federated execution: each site runs extraction and summary scripts locally and shares only aggregate outputs.
+Characterize clinician vasopressin initiation behavior across sites, identify feature-threshold decision rules that explain initiation timing, and quantify how much of the between-site variation in initiation rates is attributable to case-mix differences versus practice variation (federated ICC decomposition). The project supports federated execution: each site runs extraction and summary scripts locally and shares only aggregate outputs.
 
 ## Required CLIF tables and fields
 
@@ -94,7 +94,7 @@ Writes `threshold_outcome_table.csv` and `threshold_concordance_summary.csv` to 
 uv run python code/05_epi_analysis.py
 ```
 
-Writes figures and 12 federated-safe CSVs to `output/upload_to_box_<SITE>/epi_analysis/`.
+Writes figures and aggregate CSVs to `output/upload_to_box_<SITE>/epi_analysis/`, including a federated ICC return packet (`site_packet_<SITE>.json`). UCMC must run first — it fits the anchor logistic model and writes `theta0_m0.json` and `theta0_m1.json` that other sites load automatically.
 
 ### 8. Share your upload folder
 
@@ -109,8 +109,6 @@ output/
   patient_level_data_<SITE>/         # PHI intermediate — NEVER share
     cohort.parquet
     features.parquet
-  epi_analysis_<SITE>/               # PHI figures — NEVER share
-    <site>_analysis*.png
   upload_to_box_<SITE>/              # Aggregate results — SHARE THIS FOLDER
     cohort_filter_counts.csv         ← 02_site_summary.py
     split_counts.csv                 ← 02_site_summary.py
@@ -129,7 +127,7 @@ output/
         threshold_sweep.png
         decision_tree_fidelity.png
         threshold_sweep_individual/
-    epi_analysis/                    ← 05_epi_analysis.py (CSVs + figures together)
+    epi_analysis/                    ← 05_epi_analysis.py (CSVs + figures + ICC packet)
       km_cif_by_nee_bin.csv
       km_survival_by_nee_bin.csv
       km_survival_ever_never_vaso.csv
@@ -142,6 +140,11 @@ output/
       wait_time_histograms.csv
       init_features_by_quartile.csv
       init_features_by_nee_bin.csv
+      vasopressor_combinations.csv
+      vaso_receipt_logreg.csv
+      site_packet_<SITE>.json        ← federated ICC return packet
+      theta0_m0.json                 ← anchor site (UCMC) only
+      theta0_m1.json                 ← anchor site (UCMC) only
       <site>_analysis*.png           ← figures alongside CSVs
 ```
 
@@ -154,7 +157,8 @@ output/
 │   ├── 02_site_summary.py       # Federated aggregate summary (run at each site)
 │   ├── 03_site_threshold_sweep.py  # Per-feature threshold sweep (run at each site)
 │   ├── 04_site_threshold_outcome.py  # Discrete-time survival analysis (optional, each site)
-│   ├── 05_epi_analysis.py       # Epidemiological characterization (run at each site)
+│   ├── 05_epi_analysis.py       # Epidemiological characterization + ICC packet (run at each site)
+│   ├── multisite_epi_plots.py   # Cross-site epi plots + federated ICC aggregation (coordinating site)
 │   └── README.md
 ├── config/                      # Configuration
 │   ├── config.example.py        # Copy to config/config.py and fill in site paths

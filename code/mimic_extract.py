@@ -66,35 +66,62 @@ def get_filter_counts(conn: duckdb.DuckDBPyConnection, n_excl_vaso: int, n_final
     """Count patients at each inclusion step to match cohort_filter_counts.csv format."""
     rows = []
 
+    # Step 0: All hospitalizations
     n = conn.execute(
-        "SELECT COUNT(*) FROM mimiciv_derived.icustay_detail WHERE first_icu_stay = true"
+        "SELECT COUNT(DISTINCT hadm_id) FROM mimiciv_hosp.admissions"
     ).fetchone()[0]
-    rows.append({"step": "Total first ICU stays in MIMIC-IV", "n_hospitalizations": n})
+    rows.append({"step": "Total hospitalizations in MIMIC-IV", "n_hospitalizations": n})
 
+    # Step 1: Suspected infection
+    n = conn.execute("""
+        SELECT COUNT(DISTINCT se.subject_id)
+        FROM mimiciv_derived.sepsis3 se
+        WHERE se.suspected_infection_time IS NOT NULL
+    """).fetchone()[0]
+    rows.append({"step": "IV CMS qualifying antibiotic + blood culture within 24h",
+                 "n_hospitalizations": n})
+
+    # Step 2: Sepsis-3 — SOFA >= 2
     n = conn.execute("""
         SELECT COUNT(DISTINCT se.subject_id)
         FROM mimiciv_derived.sepsis3 se
         WHERE se.sofa_score >= 2 AND se.sepsis3 = true
     """).fetchone()[0]
-    rows.append({"step": "Sepsis-3 criteria (SOFA >= 2, first per patient)", "n_hospitalizations": n})
+    rows.append({"step": "Sepsis-3: SOFA >= 2.0 within 24h of infection", "n_hospitalizations": n})
 
+    # Step 2b: Sepsis-3 — lactate > 2 mmol/L (septic shock criterion)
+    n = conn.execute("""
+        SELECT COUNT(DISTINCT se.subject_id)
+        FROM mimiciv_derived.sepsis3 se
+        JOIN mimiciv_derived.first_day_bg fl ON se.stay_id = fl.stay_id
+        WHERE se.sofa_score >= 2 AND se.sepsis3 = true
+          AND fl.lactate_max > 2.0
+    """).fetchone()[0]
+    rows.append({"step": "Sepsis-3: lactate > 2.0 mmol/L within 24h of infection",
+                 "n_hospitalizations": n})
+
+    # Step 3: ICU admission within 24h of infection
     n = conn.execute("""
         SELECT COUNT(DISTINCT se.subject_id)
         FROM mimiciv_derived.sepsis3 se
         JOIN mimiciv_derived.icustay_detail id ON se.stay_id = id.stay_id
+        JOIN mimiciv_derived.first_day_bg fl ON se.stay_id = fl.stay_id
         WHERE se.sofa_score >= 2 AND se.sepsis3 = true
+          AND fl.lactate_max > 2.0
           AND id.first_icu_stay = true
           AND se.suspected_infection_time
               BETWEEN id.icu_intime - INTERVAL '24 hours'
                   AND id.icu_intime + INTERVAL '24 hours'
     """).fetchone()[0]
-    rows.append({"step": "ICU admission (first ICU stay) within 24h of suspected infection",
+    rows.append({"step": "ICU admission (ADT) within 24h of suspected infection",
                  "n_hospitalizations": n})
 
+    # Step 4: NE within 24h of ICU admit
     n = conn.execute("""
         SELECT COUNT(DISTINCT se.subject_id)
         FROM mimiciv_derived.sepsis3 se
         JOIN mimiciv_derived.icustay_detail id ON se.stay_id = id.stay_id
+        JOIN mimiciv_derived.first_day_bg fl ON se.stay_id = fl.stay_id
         JOIN (
             SELECT ne.stay_id
             FROM mimiciv_derived.norepinephrine ne
@@ -105,6 +132,7 @@ def get_filter_counts(conn: duckdb.DuckDBPyConnection, n_excl_vaso: int, n_final
             HAVING COUNT(*) >= 2
         ) nec ON se.stay_id = nec.stay_id
         WHERE se.sofa_score >= 2 AND se.sepsis3 = true
+          AND fl.lactate_max > 2.0
           AND id.first_icu_stay = true
           AND se.suspected_infection_time
               BETWEEN id.icu_intime - INTERVAL '24 hours'
@@ -113,11 +141,7 @@ def get_filter_counts(conn: duckdb.DuckDBPyConnection, n_excl_vaso: int, n_final
     rows.append({"step": "Norepinephrine within 24h of ICU admit (>=2 records)",
                  "n_hospitalizations": n})
 
-    # Count from the already-built cohort temp table (before vaso exclusion)
-    n = conn.execute("SELECT COUNT(*) FROM cohort_septic_shock").fetchone()[0]
-    rows.append({"step": "Lactate > 2.0 mmol/L (septic shock cohort before vaso exclusion)",
-                 "n_hospitalizations": n})
-
+    # Step 5: Vasopressin exclusion (applied to the already-built cohort_septic_shock)
     rows.append({"step": "Patients on vasopressin in 24h before trajectory start (excluded)",
                  "n_hospitalizations": n_excl_vaso})
     rows.append({"step": "Final cohort after excluding pre-trajectory vasopressin",
