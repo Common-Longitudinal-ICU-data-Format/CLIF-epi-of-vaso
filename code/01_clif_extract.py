@@ -746,13 +746,12 @@ def add_vitals(grid: pd.DataFrame, clif_dir: Path) -> pd.DataFrame:
 
 
 # NEE conversion factors (mcg/kg/min scale; vasopressin handled separately)
-# Formula: NE + Epi + Phe/10 + Dopa/100 + Metaraminol/8 + AngII*10 + Vaso*2.5 (U/min)
+# Formula: NE + Epi + Phe/10 + Dopa/100 + AngII*10 + Vaso*2.5 (U/min)
 _NEE_FACTORS_MCG = {
     "norepinephrine": 1.0,
     "epinephrine":    1.0,
     "phenylephrine":  0.1,
     "dopamine":       0.01,
-    "metaraminol":    0.125,
     "angiotensin ii": 10.0,
 }
 # Vasopressin: 2.5 mcg/kg/min NE equiv per U/min
@@ -767,7 +766,6 @@ _PREFERRED_UNITS_CONT = {
     "dopamine":       "mcg/kg/min",
     "vasopressin":    "u/min",
     "vasopressine":   "u/min",
-    "metaraminol":    "mcg/kg/min",
     "angiotensin ii": "mcg/kg/min",
 }
 
@@ -799,11 +797,11 @@ def _load_and_convert_meds(co: ClifOrchestrator, stay_ids: list) -> pd.DataFrame
 
 def add_nee(grid: pd.DataFrame, meds: pd.DataFrame) -> pd.DataFrame:
     """Norepinephrine equivalent dose (mcg/kg/min):
-    NE + Epi + Phe/10 + Dopa/100 + Metaraminol/8 + AngII×10 + Vaso×2.5(U/min).
+    NE + Epi + Phe/10 + Dopa/100 + AngII×10 + Vaso×2.5(U/min).
     """
     converted = meds[meds["_convert_status"] == "success"].copy()
 
-    # ── Catecholamines + metaraminol + angiotensin II ─────────────────────────
+    # ── Catecholamines + angiotensin II ─────────────────────────
     cath = converted[
         converted["med_category"].isin(_NEE_FACTORS_MCG) &
         converted["med_dose_converted"].notna()
