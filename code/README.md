@@ -11,7 +11,6 @@ All analysis scripts for the vasopressin epidemiology project.
 | `03_site_threshold_sweep.py` | Per-feature threshold sweep vs clinician vasopressin action | Each site |
 | `04_site_threshold_outcome.py` | Discrete-time survival analysis of threshold-based rules (optional) | Each site |
 | `05_epi_analysis.py` | Epidemiological characterization + federated ICC return packet; write figures + CSVs to `upload_to_box_<SITE>/epi_analysis/` | Each site |
-| `multisite_epi_plots.py` | Cross-site epi figures + federated ICC aggregation (ICC, MOR, PCV) | Coordinating site only |
 
 The site is read from `SITE_NAME` in `config/config.py`. Pass `--site <NAME>` to `05_epi_analysis.py` to override (e.g. for MIMIC-IV).
 
@@ -33,7 +32,6 @@ uv run python code/04_site_threshold_outcome.py
 # Epidemiological analysis + ICC packet — writes figures + aggregate CSVs to upload_to_box_<SITE>/epi_analysis/
 # UCMC must run first (it writes theta0 anchor files that other sites load automatically)
 uv run python code/05_epi_analysis.py
-uv run python code/05_epi_analysis.py --site MIMIC   # override site name
 
 # Cross-site aggregation (coordinating site, after collecting all upload_to_box_<SITE>/ folders)
 uv run python code/multisite_epi_plots.py
@@ -48,7 +46,6 @@ uv run python code/multisite_epi_plots.py
 | `03_site_threshold_sweep.py` | `output/upload_to_box_<SITE>/threshold/` | Share |
 | `04_site_threshold_outcome.py` | `output/upload_to_box_<SITE>/threshold/` | Share |
 | `05_epi_analysis.py` | `output/upload_to_box_<SITE>/epi_analysis/` (CSVs + plots + ICC packet) | Share |
-| `multisite_epi_plots.py` | `cross-site output/` | Coordinating site |
 
 ## 05_epi_analysis.py analyses
 
