@@ -455,12 +455,9 @@ ax.errorbar(
           np.maximum(_pat_2a["ci_hi"] - _pat_2a["prop"], 0)],
     fmt="none", ecolor="black", capsize=4,
 )
-for _xi, _r in zip(_x2a, _pat_2a.itertuples()):
-    ax.text(_xi, float(_r.prop) + 0.02, f"n={int(_r.n_total):,}",
-            ha="center", va="bottom", fontsize=8)
 ax.set_xticks(_x2a)
 ax.set_xticklabels(
-    [str(g) for g in _pat_2a["pre_vaso_nee_group"]],
+    [f"{g}\nn={int(r.n_total):,}" for g, r in zip(_pat_2a["pre_vaso_nee_group"], _pat_2a.itertuples())],
     rotation=30, ha="right",
 )
 ax.set_xlabel("Pre-vaso max NEE bin (μg/kg/min)", fontsize=11)
@@ -622,7 +619,6 @@ ax.set_ylabel("Proportion of patient-hours", fontsize=11)
 ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda y, _: f"{y:.0%}"))
 ax.set_xlim(left=0)
 ax.set_ylim(0, 1)
-ax.legend(fontsize=10)
 ax.set_title(
     f"{SITE_NAME}: Patient-hours by NEE dose and vasopressin state  (≥20 obs per bin)\n"
     f"grey = never been on vaso  |  blue = on vaso this hour  |  red = was on vaso, came off",
@@ -1127,6 +1123,9 @@ _bp_nee = _ax_nee.boxplot(
 for _patch in _bp_nee["boxes"]:
     _patch.set_facecolor(PALETTE[0])
     _patch.set_alpha(0.7)
+for _i, (_med_line, _data) in enumerate(zip(_bp_nee["medians"], _nee_threshold_data)):
+    _med_val = float(np.median(_data)) if len(_data) else 0.0
+    _ax_nee.text(_i, _med_val, f"{_med_val:.1f}", ha="center", va="bottom", fontsize=8, color="black")
 _ax_nee.set_xticks(range(len(NE_NEE_THRESHOLDS)))
 _ax_nee.set_xticklabels([f">{t}" for t in NE_NEE_THRESHOLDS], rotation=30, ha="right")
 _ax_nee.set_xlabel("NEE threshold (μg/kg/min)", fontsize=10)
@@ -1148,6 +1147,9 @@ if _HAS_NE_COL:
     for _patch in _bp_ne["boxes"]:
         _patch.set_facecolor(PALETTE[1])
         _patch.set_alpha(0.7)
+    for _i, (_med_line, _data) in enumerate(zip(_bp_ne["medians"], _ne_threshold_data)):
+        _med_val = float(np.median(_data)) if len(_data) else 0.0
+        _ax_ne.text(_i, _med_val, f"{_med_val:.1f}", ha="center", va="bottom", fontsize=8, color="black")
     _ax_ne.set_xticks(range(len(NE_NEE_THRESHOLDS)))
     _ax_ne.set_xticklabels([f">{t}" for t in NE_NEE_THRESHOLDS], rotation=30, ha="right")
     _ax_ne.set_xlabel("NE threshold (μg/kg/min)", fontsize=10)
@@ -2420,6 +2422,35 @@ try:
     else:
         _s_m1, _h_m1 = None, None
 
+    # ── Local intercepts for MOR/AMOR: federated DerSimonian-Laird variance ──────
+    # Each site returns its logistic intercept + within-site variance under anchor
+    # standardization.  The central node pools these via DerSimonian-Laird to
+    # estimate σ²_u_null (M0) and σ²_u_adj (M1), then computes MOR, AMOR, PCV.
+    _local_m0_intercept, _local_m0_intercept_var = None, None
+    _local_m1_intercept, _local_m1_intercept_var = None, None
+
+    # M0 (intercept-only): closed-form from site outcome prevalence
+    _p_m0 = float(_y_m0.mean()) if len(_y_m0) >= 11 else None
+    if _p_m0 is not None and 0.0 < _p_m0 < 1.0:
+        _local_m0_intercept = float(np.log(_p_m0 / (1.0 - _p_m0)))
+        _local_m0_intercept_var = float(1.0 / (len(_y_m0) * _p_m0 * (1.0 - _p_m0)))
+
+    # M1 (case-mix adjusted): fit local logistic under anchor standardization.
+    # Anchor already has the MLE from theta-fitting above; non-anchor sites fit
+    # their own local logistic so the central node sees J site-specific intercepts.
+    if len(_m1_df) >= 11:
+        try:
+            if _IS_ANCHOR:
+                _amor_fit  = _theta0_m1               # local MLE already available
+                _amor_h    = _h_m1                    # Hessian at local MLE
+            else:
+                _amor_fit  = _icc_fit_logistic(_X_m1_anch, _y_m1)
+                _, _amor_h = _icc_score_hess(_X_m1_anch, _y_m1, _amor_fit)
+            _local_m1_intercept     = float(_amor_fit[0])
+            _local_m1_intercept_var = float(np.linalg.inv(-_amor_h)[0, 0])
+        except Exception as _e_amor:
+            print(f"  WARNING: MOR local M1 intercept fit failed: {_e_amor}")
+
     # ── Sufficient statistics for continuous outcomes (anchor standardization) ─
     _suff_time = _icc_lm_suff("first_vaso_hour", _anchor_mu, _anchor_sd)
     _suff_nee  = _icc_lm_suff("nee_at_init",     _anchor_mu, _anchor_sd)
@@ -2485,18 +2516,23 @@ try:
         },
         # ── M0: binary null model ─────────────────────────────────────────────
         "m0_binary": {
-            "n_model":  int(_n_m0),
-            "y_bar":    _sf16(_y_m0.mean()),
-            "theta0":   _theta0_m0.tolist() if _IS_ANCHOR else None,
-            "score":    _s_m0.tolist() if _n_m0 >= 11 else None,
-            "hessian":  _h_m0.tolist() if _n_m0 >= 11 else None,
+            "n_model":             int(_n_m0),
+            "y_bar":               _sf16(_y_m0.mean()),
+            "theta0":              _theta0_m0.tolist() if _IS_ANCHOR else None,
+            "score":               _s_m0.tolist() if _n_m0 >= 11 else None,
+            "hessian":             _h_m0.tolist() if _n_m0 >= 11 else None,
+            "local_intercept":     _sf16(_local_m0_intercept),
+            "local_intercept_var": _sf16(_local_m0_intercept_var),
         },
         # ── M1: binary case-mix model ─────────────────────────────────────────
         "m1_binary": {
-            "n_model": int(_n_m1),
-            "y_bar":   _sf16(_y_m1.mean()) if _n_m1 > 0 else None,
-            "score":   _s_m1.tolist() if (_s_m1 is not None and _n_m1 >= 11) else None,
-            "hessian": _h_m1.tolist() if (_h_m1 is not None and _n_m1 >= 11) else None,
+            "n_model":             int(_n_m1),
+            "y_bar":               _sf16(_y_m1.mean()) if _n_m1 > 0 else None,
+            "theta0":              _theta0_m1.tolist() if (_IS_ANCHOR and _theta0_m1 is not None) else None,
+            "score":               _s_m1.tolist() if (_s_m1 is not None and _n_m1 >= 11) else None,
+            "hessian":             _h_m1.tolist() if (_h_m1 is not None and _n_m1 >= 11) else None,
+            "local_intercept":     _sf16(_local_m1_intercept),
+            "local_intercept_var": _sf16(_local_m1_intercept_var),
         },
         # ── Linear outcomes: sufficient statistics ────────────────────────────
         "m1_time_to_init": _suff_time,
