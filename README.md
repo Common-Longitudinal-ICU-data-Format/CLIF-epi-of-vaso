@@ -8,7 +8,9 @@ Federated multi-site analysis of vasopressin initiation patterns in ICU patients
 
 ## Objective
 
-Characterize clinician vasopressin initiation behavior across sites, identify feature-threshold decision rules that explain initiation timing, and quantify how much of the between-site variation in initiation rates is attributable to case-mix differences versus practice variation (federated ICC decomposition). The project supports federated execution: each site runs extraction and summary scripts locally and shares only aggregate outputs.
+Characterize clinician vasopressin initiation behavior across sites — baseline characteristics, timing relative to shock onset, vasopressor combinations, and how much of the between-site variation in initiation rates is attributable to case-mix differences versus practice variation (federated ICC decomposition). The project supports federated execution: each site runs extraction and summary scripts locally and shares only aggregate outputs.
+
+Feature-threshold decision-rule identification, optimal-threshold testing, and subphenotype/subgroup analysis (formerly part of this repo, before its own renumbering) have moved to the sibling **CLIF-OPT-VASO** repo, which shares this repo's extraction scripts (01/01b) as a starting point.
 
 ## Required CLIF tables and fields
 
@@ -72,33 +74,19 @@ uv run python code/02_site_summary.py
 
 Writes aggregate CSVs to `output/upload_to_box_<SITE>/`.
 
-### 5. Run threshold analysis
+### 5. Run epidemiological analysis
 
 ```bash
-uv run python code/03_site_threshold_sweep.py
-```
-
-Writes `threshold_comparison_table.csv`, `patient_level_table.csv`, and plots to `output/upload_to_box_<SITE>/threshold/`.
-
-### 6. Run threshold outcome analysis (optional)
-
-```bash
-uv run python code/04_site_threshold_outcome.py
-```
-
-Writes `threshold_outcome_table.csv` and `threshold_concordance_summary.csv` to `output/upload_to_box_<SITE>/threshold/`.
-
-### 7. Run epidemiological analysis
-
-```bash
-uv run python code/05_epi_analysis.py
+uv run python code/03_epi_analysis.py
 ```
 
 Writes figures and aggregate CSVs to `output/upload_to_box_<SITE>/epi_analysis/`, including a federated ICC return packet (`site_packet_<SITE>.json`).
 
 **UCMC runs first** (with `FEDERATED_ICC_ANCHOR = None` in config). **All other sites** uncomment the pre-filled `FEDERATED_ICC_ANCHOR` block in `config.example.py` before running. See [`config/README.md`](config/README.md) for details.
 
-### 8. Share your upload folder
+See `code/run_pipeline.py` to run the full per-site pipeline (01-04) in one command.
+
+### 6. Share your upload folder
 
 **Share only `output/upload_to_box_<SITE>/`** with the coordinating site. This folder contains no patient-level data.
 
@@ -109,56 +97,62 @@ See [`code/README.md`](code/README.md) for full script documentation.
 ```
 output/
   patient_level_data_<SITE>/         # PHI intermediate — NEVER share
-    cohort.parquet
+    cohort_sepsis3.parquet
+    cohort_rhee.parquet
     features.parquet
   upload_to_box_<SITE>/              # Aggregate results — SHARE THIS FOLDER
-    cohort_filter_counts.csv         ← 02_site_summary.py
-    split_counts.csv                 ← 02_site_summary.py
-    baseline_table1.csv              ← 02_site_summary.py
-    feature_at_initiation.csv        ← 02_site_summary.py
-    feature_thresholds_youden.csv    ← 02_site_summary.py
-    feature_roc_curves.csv           ← 02_site_summary.py
-    threshold/                       ← 03_site_threshold_sweep.py + 04_site_threshold_outcome.py
-      threshold_comparison_table.csv
-      patient_level_table.csv
-      patient_level_confounders.csv
-      threshold_sweep_data.csv
-      threshold_outcome_table.csv    ← 04_site_threshold_outcome.py (optional)
-      threshold_concordance_summary.csv
-      plots/
-        threshold_sweep.png
-        decision_tree_fidelity.png
-        threshold_sweep_individual/
-    epi_analysis/                    ← 05_epi_analysis.py (CSVs + figures + ICC packet)
-      km_cif_by_nee_bin.csv
-      km_survival_by_nee_bin.csv
-      km_survival_ever_never_vaso.csv
-      nee_proportion_on_vaso.csv
-      nee_vaso_state_hours.csv
-      feature_dist_nee_vaso.csv
-      tod_init_features_binned.csv
-      tod_init_features_lowess.csv
-      time_to_vaso_hist.csv
-      wait_time_histograms.csv
-      init_features_by_quartile.csv
-      init_features_by_nee_bin.csv
-      vasopressor_combinations.csv
-      vaso_receipt_logreg.csv
-      site_packet_<SITE>.json        ← federated ICC return packet
-      <site>_analysis*.png           ← figures alongside CSVs
+    cohort_comparison/                ← 02b_cohort_comparison_summary.py
+      cohort_comparison_stats.json
+    timing/                           ← 04b_ne_infection_timing_summary.py (CLIF sites only)
+      timing_stats.json
+    <cohort>/                         # sepsis3/ or rhee/
+      cohort_filter_counts.csv        ← 02_site_summary.py
+      split_counts.csv                ← 02_site_summary.py
+      baseline_table1.csv             ← 02_site_summary.py
+      feature_at_initiation.csv       ← 02_site_summary.py
+      feature_thresholds_youden.csv   ← 02_site_summary.py
+      feature_roc_curves.csv          ← 02_site_summary.py
+      epi_analysis/                   ← 03_epi_analysis.py (CSVs + figures + ICC packet)
+        km_cif_by_nee_bin.csv
+        km_survival_by_nee_bin.csv
+        km_survival_ever_never_vaso.csv
+        nee_proportion_on_vaso.csv
+        nee_vaso_state_hours.csv
+        feature_dist_nee_vaso.csv
+        tod_init_features_binned.csv
+        tod_init_features_lowess.csv
+        time_to_vaso_hist.csv
+        wait_time_histograms.csv
+        init_features_by_quartile.csv
+        init_features_by_nee_bin.csv
+        vasopressor_combinations.csv
+        vaso_receipt_logreg.csv
+        site_packet_<SITE>.json       ← federated ICC return packet
+        <site>_analysis*.png          ← figures alongside CSVs
 ```
+
+Threshold/rule-optimality outputs (`<cohort>/threshold/`, `global_rules_<cohort>.json`, etc.) are produced by the sibling **CLIF-OPT-VASO** repo's pipeline instead.
 
 ## Directory structure
 
 ```
 .
-├── code/                        # All analysis scripts
-│   ├── 01_clif_extract.py       # CLIF 2.1.0 cohort extraction
-│   ├── 02_site_summary.py       # Federated aggregate summary (run at each site)
-│   ├── 03_site_threshold_sweep.py  # Per-feature threshold sweep (run at each site)
-│   ├── 04_site_threshold_outcome.py  # Discrete-time survival analysis (optional, each site)
-│   ├── 05_epi_analysis.py       # Epidemiological characterization + ICC packet (run at each site)
-│   ├── multisite_epi_plots.py   # Cross-site epi plots + federated ICC aggregation (coordinating site)
+├── code/                              # All analysis scripts
+│   ├── 00_mimic_extract_duckdb.py     # Builds intermediate MIMIC DuckDB (optional, MIMIC only)
+│   ├── 01_clif_extract.py             # CLIF 2.1.0 cohort extraction (per CLIF site)
+│   ├── 01b_mimic_extract.py           # MIMIC-CLIF cohort extraction (per site)
+│   ├── 02_site_summary.py             # Federated aggregate summary (per site, per cohort)
+│   ├── 02b_cohort_comparison_summary.py  # sepsis3 vs rhee cohort comparison stats (per site)
+│   ├── 03_epi_analysis.py             # Epidemiological characterization + ICC packet (per site)
+│   ├── 04_site_variation_analysis.py  # Patient/ward/hospital variance decomposition (per site)
+│   ├── 04b_ne_infection_timing_summary.py  # NE-vs-infection timing stats (per site, CLIF only)
+│   ├── 05_multisite_epi_plots.py      # Multi-site epi comparison figures (coordinating site)
+│   ├── 06_cross_site_variation_analysis.py  # Pooled GEE + DL meta-analysis (coordinating site)
+│   ├── 07_cross_site_vasopressin_analysis.py  # Cross-site epi comparison tables + plots (coordinating site)
+│   ├── 08_consolidated_report.py      # One HTML report, 4 sections (coordinating site)
+│   ├── 09_ne_infection_timing.py      # NE-vs-infection timing report (coordinating site)
+│   ├── run_pipeline.py                # Orchestrates 01-04/04b for one or more sites
+│   ├── run_coordinating_pipeline.py   # Orchestrates 05-09 at the coordinating site
 │   └── README.md
 ├── config/                      # Configuration
 │   ├── config.example.py        # Copy to config/config.py and fill in site paths
@@ -170,3 +164,6 @@ output/
 ├── pyproject.toml               # Dependencies and project metadata
 └── uv.lock                      # Pinned, reproducible dependency versions
 ```
+
+Feature-threshold/rule-optimality analysis and its own copy of the extraction
+scripts live in the sibling **CLIF-OPT-VASO** repo.

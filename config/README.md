@@ -44,7 +44,7 @@ The scripts create two per-site subfolders under `<OUTPUT_ROOT>/output/`:
 
 ## Federated ICC setup
 
-`05_epi_analysis.py` decomposes between-site variation in vasopressin initiation into case-mix vs. practice components (ICC/MOR/PCV). This requires all sites to evaluate their local likelihood at a common anchor point fitted at UCMC.
+`03_epi_analysis.py` decomposes between-site variation in vasopressin initiation into case-mix vs. practice components (ICC/MOR/PCV). This requires all sites to evaluate their local likelihood at a common anchor point fitted at UCMC.
 
 **If your site is UCMC:** leave `FEDERATED_ICC_ANCHOR = None`. The script will fit the anchor model and print the values to share with other sites.
 
@@ -68,4 +68,4 @@ FEDERATED_ICC_ANCHOR = {
 # Covariate order: sepsis_onset_sofa, initial_lactate, age, peak_nee_12h, map_t0, ventil_ever
 ```
 
-Then run `05_epi_analysis.py` as normal. The script will use UCMC's fitted parameters to standardize your site's covariates and compute score/Hessian on a common scale, enabling the coordinating site to pool results across all sites.
+Then run `03_epi_analysis.py` as normal. The script will use UCMC's fitted parameters to standardize your site's covariates and compute score/Hessian on a common scale, enabling the coordinating site to pool results across all sites.

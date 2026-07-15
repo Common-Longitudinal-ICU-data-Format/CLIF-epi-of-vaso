@@ -2,108 +2,146 @@
 
 All analysis scripts for the vasopressin epidemiology project.
 
+## Cohort structure
+
+Two cohorts are identified relative to first norepinephrine (NE) administration (t=0, ±24h window):
+
+| Cohort | Criteria |
+|--------|----------|
+| **sepsis3** | CMS qualifying IV abx + blood culture within 24h of each other, both within ±24h of NE start; lactate > 2 mmol/L within ±24h of NE start |
+| **rhee** | Blood culture within ±24h of NE start; first qualifying IV abx within 2 calendar days; ≥4 consecutive qualifying antibiotic days (≤1-day gap) or course ends ≤1 day before discharge/death; lactate ≥ 2 mmol/L within ±24h of NE start |
+
+Each extraction script produces `cohort_sepsis3.parquet`, `cohort_rhee.parquet`, and a shared `features.parquet` (hourly features for the union of both cohorts). Downstream scripts accept `--cohort sepsis3|rhee`.
+
+---
+
+## Related repo: CLIF-OPT-VASO
+
+Feature-threshold decision-rule identification, optimal-threshold testing, and
+subphenotype/subgroup clustering (formerly steps `03`, `11`, `14`, `15` in this repo, run
+through a 4-phase federated pipeline) have moved to the sibling **CLIF-OPT-VASO** repo. It
+carries its own copy of the `00`/`01a`/`01b` extraction scripts plus
+`09b_threshold_cross_site_comparison.py` (the kappa/AUROC/feature-ranking half of what used
+to be this repo's `07_cross_site_vasopressin_analysis.py`).
+
 ## Script order
 
-| Script | Purpose | Run at |
-|--------|---------|--------|
-| `01_clif_extract.py` | Extract septic shock cohort and hourly features from CLIF 2.1.0 parquet tables | Each CLIF site |
-| `02_site_summary.py` | Compute federated-safe aggregate statistics; write shareable CSVs to `upload_to_box_<SITE>/` | Each site |
-| `03_site_threshold_sweep.py` | Per-feature threshold sweep vs clinician vasopressin action | Each site |
-| `04_site_threshold_outcome.py` | Discrete-time survival analysis of threshold-based rules (optional) | Each site |
-| `05_epi_analysis.py` | Epidemiological characterization + federated ICC return packet; write figures + CSVs to `upload_to_box_<SITE>/epi_analysis/` | Each site |
+### Per-site scripts (run at each participating institution)
 
-The site is read from `SITE_NAME` in `config/config.py`. Pass `--site <NAME>` to `05_epi_analysis.py` to override (e.g. for MIMIC-IV).
+| Script | Purpose |
+|--------|---------|
+| `01_clif_extract.py` | Extract dual-cohort septic shock cohort + hourly features from CLIF 2.1.0 parquet tables |
+| `01b_mimic_extract.py` | Same as 01 but for MIMIC-IV (uses `prescriptions.csv.gz` + `microbiologyevents.csv.gz`) |
+| `02_site_summary.py` | Compute federated-safe aggregate statistics; write shareable CSVs to `upload_to_box_<SITE>/<cohort>/` |
+| `02b_cohort_comparison_summary.py` | Federated-safe Sepsis-3 vs Rhee cohort-comparison stats (overlap, baseline/vaso-init tables, boxplot 5-number summaries); write `upload_to_box_<SITE>/cohort_comparison/cohort_comparison_stats.json` — feeds `08_consolidated_report.py` |
+| `03_epi_analysis.py` | Epidemiological characterization; write figures + CSVs to `upload_to_box_<SITE>/<cohort>/epi_analysis/` |
+| `04_site_variation_analysis.py` | Site-specific hospital/ICU variation analysis: GEE logistic, discrete-time hazard (ICC/MOR), MELR moments; write `site_variation_packet_<cohort>_<SITE>.json` |
+| `04b_ne_infection_timing_summary.py` | CLIF sites only (UCMC/NU-style raw CLIF layout, not MIMIC): federated-safe NE-vs-suspected-infection timing stats (suppressed histograms, median/IQR, Sepsis-3-at-anchor histograms); write `upload_to_box_<SITE>/timing/timing_stats.json` — feeds `09_ne_infection_timing.py` |
+
+### Coordinating-site scripts (run at UCMC/coordinating institution only)
+
+| Script | Purpose |
+|--------|---------|
+| `05_multisite_epi_plots.py` | Multi-site epi comparison figures from per-site aggregate CSVs |
+| `06_cross_site_variation_analysis.py` | Pooled GEE (UCMC+NU+MIMIC patient-level) + DL meta-analysis of all site packets; sensitivity: sepsis3 vs rhee |
+| `07_cross_site_vasopressin_analysis.py` | Cross-site epi comparison tables + forest plots (baseline, initiation features, CONSORT, vasopressor combinations/timing, federated MELR/DTH) |
+| `08_consolidated_report.py` | One HTML report, 4 sections (who's in the cohort, who gets vasopressin, when, sources of variation) — supersedes the former `10_make_summary_report.py` and `12_cohort_comparison_report.py` |
+| `09_ne_infection_timing.py` | NE-to-infection timing analysis — reads only `upload_to_box_<SITE>/timing/` (from `04b_ne_infection_timing_summary.py`), no PHI |
+
+`08` and `09` used to read `output/patient_level_data_<SITE>/` (and, for `09`, raw CLIF tables via
+hardcoded UCMC/NU paths) directly, which only worked when run on a machine with access to every
+site's raw data. They're now split into a per-site aggregate writer (`02b`/`04b`, PHI in, aggregate
+out) and a coordinating-site reader (`08`/`09`, aggregate in only) — the same pattern `02` /
+`04_site_variation_analysis.py` already used. See `run_pipeline.py` and `run_coordinating_pipeline.py`.
+
+---
 
 ## Usage
 
 ```bash
-# Extraction — writes PHI intermediate to output/patient_level_data_<SITE>/
-uv run python code/01_clif_extract.py
+# ── PER-SITE ────────────────────────────────────────────────────────────────
 
-# Federated summary — writes shareable CSVs to output/upload_to_box_<SITE>/
-uv run python code/02_site_summary.py
+# Extraction (writes PHI intermediate to output/patient_level_data_<SITE>/)
+uv run python code/01_clif_extract.py            # CLIF sites
+uv run python code/01b_mimic_extract.py           # MIMIC-IV
 
-# Threshold sweep — writes to output/upload_to_box_<SITE>/threshold/
-uv run python code/03_site_threshold_sweep.py
+# Federated summary (writes shareable CSVs to output/upload_to_box_<SITE>/<cohort>/)
+uv run python code/02_site_summary.py --cohort sepsis3
+uv run python code/02_site_summary.py --cohort rhee
 
-# Threshold outcome (optional) — writes to output/upload_to_box_<SITE>/threshold/
-uv run python code/04_site_threshold_outcome.py
+# Cohort-comparison summary (sepsis3 vs rhee; needs both cohort files, no --cohort flag)
+uv run python code/02b_cohort_comparison_summary.py
 
-# Epidemiological analysis + ICC packet — writes figures + aggregate CSVs to upload_to_box_<SITE>/epi_analysis/
-# UCMC must run first (it writes theta0 anchor files that other sites load automatically)
-uv run python code/05_epi_analysis.py
+# Epidemiological analysis
+uv run python code/03_epi_analysis.py --cohort sepsis3
+uv run python code/03_epi_analysis.py --cohort rhee
 
-# Cross-site aggregation (coordinating site, after collecting all upload_to_box_<SITE>/ folders)
-uv run python code/multisite_epi_plots.py
+# Site variation analysis (ICC/MOR/GEE + MELR packet)
+uv run python code/04_site_variation_analysis.py --cohort both
+
+# NE-infection timing summary (CLIF sites only, not MIMIC; no --site override — reads
+# config.py's CLIF_DIR directly, same as 01)
+uv run python code/04b_ne_infection_timing_summary.py
+
+# ── COORDINATING SITE (after collecting all upload_to_box_<SITE>/ folders) ──
+
+uv run python code/05_multisite_epi_plots.py
+uv run python code/06_cross_site_variation_analysis.py --cohort both
+uv run python code/07_cross_site_vasopressin_analysis.py
+uv run python code/08_consolidated_report.py --cohort both --embed
+uv run python code/09_ne_infection_timing.py
 ```
+
+Or drive all of the above with the two orchestrator scripts:
+`run_pipeline.py` (per-site) -> `run_coordinating_pipeline.py` (coordinating site).
+
+See the sibling **CLIF-OPT-VASO** repo for the threshold/rule-optimality pipeline
+(its own `run_pipeline.py` / `run_coordinating_pipeline.py` / `run_validation_pipeline.py`
+/ `run_coordinating_validation_pipeline.py`, 4 phases).
+
+---
 
 ## Outputs
 
 | Script | Output location | Notes |
 |--------|----------------|-------|
-| `01_clif_extract.py` | `output/patient_level_data_<SITE>/` | PHI — never shared |
-| `02_site_summary.py` | `output/upload_to_box_<SITE>/` (root CSVs) | Share |
-| `03_site_threshold_sweep.py` | `output/upload_to_box_<SITE>/threshold/` | Share |
-| `04_site_threshold_outcome.py` | `output/upload_to_box_<SITE>/threshold/` | Share |
-| `05_epi_analysis.py` | `output/upload_to_box_<SITE>/epi_analysis/` (CSVs + plots + ICC packet) | Share |
+| `01_clif_extract.py` | `output/patient_level_data_<SITE>/cohort_sepsis3.parquet`<br>`output/patient_level_data_<SITE>/cohort_rhee.parquet`<br>`output/patient_level_data_<SITE>/features.parquet` | PHI — never shared |
+| `02_site_summary.py` | `output/upload_to_box_<SITE>/<cohort>/` | Share |
+| `02b_cohort_comparison_summary.py` | `output/upload_to_box_<SITE>/cohort_comparison/cohort_comparison_stats.json` | Share |
+| `03_epi_analysis.py` | `output/upload_to_box_<SITE>/<cohort>/epi_analysis/` | Share |
+| `04_site_variation_analysis.py` | `output/upload_to_box_<SITE>/<cohort>/site_variation_packet_<cohort>_<SITE>.json` | Share |
+| `04b_ne_infection_timing_summary.py` | `output/upload_to_box_<SITE>/timing/timing_stats.json` | Share |
+| `06_cross_site_variation_analysis.py` | `output/cross_site_results/<cohort>/` | Coordinating site |
 
-## 05_epi_analysis.py analyses
+---
+
+## `03_epi_analysis.py` analyses
 
 | ID | Name | Description |
 |----|------|-------------|
 | 0 | Time-to-vaso by pre-vaso NEE bin | Cumulative incidence of vasopressin initiation, stratified by max NEE before vaso start |
-| 1 | KM survival by pre-vaso NEE bin | Kaplan–Meier survival curves, 7 NEE-dose strata (pre-vaso max NEE); event = death within 120h trajectory (`death_in_window`) |
-| 1.5 | KM ever vs never vaso | Kaplan–Meier survival — ever-vasopressin vs never-vasopressin; event = death within 120h trajectory |
-| 2B | NEE vs vaso proportion | Proportion of patient-hours on vasopressin by NEE bin (0.1 μg/kg/min bins, Wilson 95% CI) |
-| 2B_stratified | NEE vs vaso by care unit | Same proportion, stratified by location_type/location_category if available |
-| 2C | Stacked bar — vaso state by NEE | Patient-hours: never on vaso (grey) / on vaso (blue) / came off (red) |
-| 2D | NEE component drugs pre-vaso | Vasopressor drug mix in 24h before vasopressin initiation |
-| 3 | Feature distributions by NEE × vaso | Boxplots of 7 clinical features per NEE bin × ever/never vasopressin |
-| 3_TOD | Time-of-day at initiation | 2-D density heatmaps (continuous) and proportion bars (binary) by clock hour of vaso start |
-| 4a | Time-to-vaso histogram | Distribution of first vasopressin hour (2 h bins) |
-| 4d | Waiting time histograms | Hours above NE > 0.25 / lactate > 2 / MAP < 65 thresholds before vasopressin |
-| 5A | Patient profile by NEE quartile (violin) | 11 features at initiation, Kruskal-Wallis + Q1 vs Q4 Mann-Whitney (Bonferroni) |
-| 5B | Patient profile by NEE bin (ribbon) | Median + IQR ribbon across 7 NEE-at-initiation bins |
-| 5D | Rate of change pre-vaso | Linear slope of SOFA/lactate/MAP in final 6h before vasopressin (by NEE quartile) |
-| 5E | TOD vs SOFA at initiation | Time of day of vasopressin start vs SOFA at initiation (LOWESS) |
-| 16 | Federated ICC packet | Score/Hessian for one-shot Newton aggregation; sufficient statistics for linear outcomes |
+| 1 | KM survival by pre-vaso NEE bin | Kaplan–Meier survival curves, 7 NEE-dose strata |
+| 1.5 | KM ever vs never vaso | Kaplan–Meier survival — ever-vaso vs never-vaso |
+| 2B | NEE vs vaso proportion | Proportion of patient-hours on vasopressin by NEE bin |
+| 3 | Feature distributions by NEE × vaso | Boxplots of clinical features per NEE bin × ever/never vaso |
+| 4a | Time-to-vaso histogram | Distribution of first vasopressin hour |
+| 4d | Waiting time histograms | Hours above NE/lactate/MAP thresholds before vasopressin |
+| 5A–5E | Patient profile by NEE | Features at initiation by NEE quartile; rate of change; time-of-day |
 
-### NEE bins
+ICC/hazard/effects models → **`04_site_variation_analysis.py`**
 
-`[0, 0.1, 0.2, 0.3, 0.5, 0.7, 1.0, ∞)` → labels `<0.1`, `0.1–0.2`, `0.2–0.3`, `0.3–0.5`, `0.5–0.7`, `0.7–1.0`, `>1.0` (μg/kg/min)
+## `04_site_variation_analysis.py` analyses
 
-### Aggregate CSV files written to `upload_to_box_{SITE}/epi_analysis/`
+| Analysis | Model | Output |
+|----------|-------|--------|
+| GEE logistic (time-varying) | `vaso_on ~ SOFA + age + rcs(NEE, 4) + rcs(time_hour, 4)`, clustering by patient | Coefficients + OR in JSON packet |
+| Discrete-time hazard | Logit GLMM: `h(t) = alpha_t + beta_SOFA + beta_NEE + u_icu`; clog-log GLM | ICC, MOR, baseline hazard plot |
+| MELR moments | 3rd-order moment statistics for federated MELR pooling | JSON packet |
 
-| File | Columns |
-|------|---------|
-| `km_cif_by_nee_bin.csv` | `nee_bin, time_hour, cif, ci_lo, ci_hi, n_at_risk, n_total, n_events` |
-| `km_survival_by_nee_bin.csv` | `nee_bin, time_hour, km_survival, ci_lo, ci_hi, n_at_risk, n_total` |
-| `km_survival_ever_never_vaso.csv` | `group, time_hour, km_survival, ci_lo, ci_hi, n_at_risk, n_total` |
-| `nee_proportion_on_vaso.csv` | `nee_bin_mid, n_obs, prop, ci_lo, ci_hi` |
-| `nee_vaso_state_hours.csv` | `nee_bin_mid, n_total, prop_never_on, prop_on_vaso, prop_came_off` |
-| `feature_dist_nee_vaso.csv` | `feature, nee_bin, vaso_status, n, p5, q1, median, q3, p95` |
-| `tod_init_features_binned.csv` | `feature, clock_hour, n, q1, median, q3, mean` |
-| `tod_init_features_lowess.csv` | `feature, clock_hour, lowess_y` |
-| `time_to_vaso_hist.csv` | `bin_left_hour, bin_right_hour, count, median_hours, p75_hours` |
-| `wait_time_histograms.csv` | `metric, hours, count, median, mean` |
-| `init_features_by_quartile.csv` | `feature, quartile_label, nee_lo, nee_hi, n, p5, q1, median, q3, p95, kw_p, mw_q1q4_p_bonf` |
-| `init_features_by_nee_bin.csv` | `feature, nee_bin, n, q1, median, q3` |
-| `vasopressor_combinations.csv` | Vasopressor co-administration combinations |
-| `vaso_receipt_logreg.csv` | Logistic regression coefficients for vasopressin receipt |
+## `06_cross_site_variation_analysis.py` analyses
 
-### Federated ICC files written to `upload_to_box_{SITE}/epi_analysis/`
-
-| File | Contents | Site |
-|------|----------|------|
-| `theta0_m0.json` | Anchor logistic intercept (M0, intercept-only) | UCMC only |
-| `theta0_m1.json` | Anchor logistic coefficients (M1, case-mix adjusted) + covariate mu/sd for standardization | UCMC only |
-| `site_packet_<SITE>.json` | Score/Hessian at anchor θ₀ for M0 and M1; sufficient statistics (XᵀX, Xᵀy) for linear outcomes; descriptive stats and off-hours summary | All sites |
-
-**ICC covariates (M1):** `sepsis_onset_sofa`, `initial_lactate`, `age`, `peak_nee_12h` (max NEE in first 12h), `map_t0` (MAP at trajectory start), `ventil_ever`
-
-**Three outcomes decomposed:**
-1. `ever_vaso` (binary) — who gets vasopressin? Aggregated via one-shot Newton logistic regression.
-2. `first_vaso_hour` (continuous, initiators only) — how quickly is it started? Aggregated via exact OLS sufficient statistics.
-3. `nee_at_init` (continuous, initiators only) — at what NE burden is it started? Aggregated via exact OLS sufficient statistics.
-
-UCMC is the anchor site and must run `05_epi_analysis.py` first. It prints a `FEDERATED_ICC_ANCHOR` dict that the coordinating site distributes; other sites paste it into their `config/config.py` before running. See `config/README.md` for the full setup procedure.
+| Analysis | Data | Output |
+|----------|------|--------|
+| Pooled GEE | Patient-level UCMC + NU + MIMIC | OR for SOFA and NEE with site fixed effects |
+| DL meta-analysis | All site `site_variation_packet_*.json` files | Pooled OR, I², τ², ICC/MOR across all sites |
+| Sensitivity | Sepsis-3 vs Rhee side-by-side | CSV comparison table |

@@ -5,11 +5,11 @@
 Federated-safe aggregate summary for a septic shock cohort.
 
 Reads (PHI, local only):
-  output/patient_level_data_<SITE>/cohort.parquet
-  output/patient_level_data_<SITE>/features.parquet
-  output/patient_level_data_<SITE>/cohort_filter_counts.csv
+  output/patient_level_data_<SITE>/cohort_<cohort>.parquet   (sepsis3 or rhee)
+  output/patient_level_data_<SITE>/features.parquet          (union; filtered here to cohort)
+  output/patient_level_data_<SITE>/cohort_filter_counts_<cohort>.csv
 
-Writes only aggregate CSVs to output/upload_to_box_<SITE>/ — no patient-level data leaves the site.
+Writes only aggregate CSVs to output/upload_to_box_<SITE>/<cohort>/ — no patient-level data leaves the site.
 
 Privacy guarantees
   - No row-level values, identifiers, free text, or exact dates in any output.
@@ -24,8 +24,9 @@ Outcome for analyses 4 and 5
   Threshold selected by max Youden's J on TRAIN split; carried unchanged to val/test.
 
 Usage:
-    uv run python code/02_site_summary.py
-    (site is read from config/config.py — SITE_NAME)
+    uv run python code/02_site_summary.py                     # defaults to sepsis3 cohort
+    uv run python code/02_site_summary.py --cohort rhee
+    uv run python code/02_site_summary.py --cohort sepsis3 --site MIMIC
 """
 
 import sys
@@ -53,13 +54,21 @@ def _load_site_config():
     spec.loader.exec_module(mod)
     return mod
 
+import argparse as _ap
+_parser = _ap.ArgumentParser(add_help=False)
+_parser.add_argument("--site",   default=None, help="Override SITE_NAME from config")
+_parser.add_argument("--cohort", default="sepsis3", choices=["sepsis3", "rhee"],
+                     help="Which cohort file to read (cohort_<cohort>.parquet)")
+_cli_args, _ = _parser.parse_known_args()
+
 _cfg = _load_site_config()
 if _cfg is None:
     raise SystemExit(
         "ERROR: config/config.py not found.\n"
         "Copy config/config.example.py to config/config.py and set SITE_NAME, CLIF_DIR, OUTPUT_ROOT."
     )
-SITE_NAME   = getattr(_cfg, "SITE_NAME", "UCMC")
+SITE_NAME   = _cli_args.site   if _cli_args.site   else getattr(_cfg, "SITE_NAME", "UCMC")
+COHORT_NAME = _cli_args.cohort if _cli_args.cohort else "sepsis3"
 OUTPUT_ROOT = getattr(_cfg, "OUTPUT_ROOT", None)
 if OUTPUT_ROOT is None:
     raise SystemExit("ERROR: OUTPUT_ROOT is not set in config/config.py.")
@@ -84,9 +93,55 @@ ANALYSIS_FEATURES_BIN  = ["ventil", "rrt", "steroid"]
 ANALYSIS_FEATURES      = ANALYSIS_FEATURES_CONT + ANALYSIS_FEATURES_BIN
 
 # Baseline table
-BL_CONTINUOUS  = ["age", "weight", "sepsis_onset_sofa", "initial_lactate", "traj_hours"]
+BL_CONTINUOUS  = ["age", "weight", "sepsis_onset_sofa", "initial_lactate", "traj_hours",
+                   "icu_los_days", "hospital_los_days"]
 BL_BINARY      = ["hospital_death"]
-BL_CATEGORICAL = ["gender", "race", "location_category", "location_type"]
+BL_CATEGORICAL = ["gender", "race", "location_category", "location_type", "hospital_type",
+                   "traj_end_reason"]
+
+# Continuous features aggregated in the new ICU-type / hospital initiation
+# breakdown CSVs (subset of ANALYSIS_FEATURES_CONT — everything except
+# fluids, which isn't part of the cross-site box/whisker-by-group plots).
+GROUP_BREAKDOWN_FEATURES = ["time_hour", "norepinephrine", "nee", "mbp", "sofa", "lactate", "creatinine", "bun"]
+
+# ICU-type canonicalization (same mapping used in 04_site_variation_analysis.py,
+# kept in sync for consistent labels across baseline tables and variance analyses).
+_ICU_CANON = {
+    "medical_icu": "MICU", "micu": "MICU",
+    "cardiac_icu": "CICU", "cicu": "CICU", "coronary_icu": "CICU",
+    "surgical_icu": "SICU", "sicu": "SICU",
+    "mixed_neuro_icu": "Neuro ICU", "neuro_icu": "Neuro ICU", "neuro_sicu": "Neuro ICU",
+    "mixed_cardiothoracic_icu": "CT ICU", "cardiothoracic_icu": "CT ICU",
+    "cardiothoracic_surgical_icu": "CT ICU",
+    "burn_icu": "Burn ICU",
+    "general_icu": "Mixed/General ICU", "mixed_icu": "Mixed/General ICU",
+    "medical intensive care unit (micu)": "MICU",
+    "cardiac vascular intensive care unit (cvicu)": "CICU",
+    "coronary care unit (ccu)": "CICU",
+    "surgical intensive care unit (sicu)": "SICU",
+    "trauma sicu (tsicu)": "SICU",
+    "medical/surgical intensive care unit (micu/sicu)": "Mixed/General ICU",
+    "neuro surgical intensive care unit (neuro sicu)": "Neuro ICU",
+    "intensive care unit (icu)": "Mixed/General ICU",
+}
+
+
+def _canon_icu_series(raw: pd.Series) -> pd.Series:
+    """Canonicalize raw location_type/location_name strings into ICU-type labels."""
+    low = raw.astype(str).str.lower().str.strip()
+    is_missing = raw.isna() | low.isin(["none", "nan", ""])
+    canon = low.map(_ICU_CANON).fillna("Other ICU")
+    canon[is_missing] = np.nan
+    return canon
+
+
+def _canon_hospital_type(raw: pd.Series) -> pd.Series:
+    """Canonicalize raw hospital_type strings into academic/community/unknown."""
+    low = raw.astype(str).str.lower().str.strip()
+    is_missing = raw.isna() | low.isin(["none", "nan", ""])
+    canon = low.where(low.isin(["academic", "community"]), "unknown")
+    canon[is_missing] = np.nan
+    return canon
 
 # ============================================================
 # HELPERS
@@ -129,8 +184,12 @@ def _smd_bin(p1, p2):
 
 def load_and_split():
     """Load cohort + features; add ever_vaso flag; split 70/15/15 by patient."""
-    coh  = pd.read_parquet(INPUT_DIR / "cohort.parquet")
-    feat = pd.read_parquet(INPUT_DIR / "features.parquet")
+    coh_all = pd.read_parquet(INPUT_DIR / f"cohort_{COHORT_NAME}.parquet")
+    feat_all = pd.read_parquet(INPUT_DIR / "features.parquet")
+    # Filter features to this cohort's patients
+    feat_all = feat_all[feat_all["stay_id"].isin(set(coh_all["stay_id"]))].copy()
+    coh  = coh_all
+    feat = feat_all
 
     # Exclude patients on vasopressin at or before t=0
     feat = feat.sort_values(["stay_id", "time_hour"])
@@ -185,8 +244,8 @@ def load_and_split():
 # ============================================================
 
 def write_filter_counts():
-    src = INPUT_DIR / "cohort_filter_counts.csv"
-    dst = OUTPUT_DIR / "cohort_filter_counts.csv"
+    src = INPUT_DIR / f"cohort_filter_counts_{COHORT_NAME}.csv"
+    dst = OUTPUT_DIR / f"cohort_filter_counts_{COHORT_NAME}.csv"
     shutil.copy2(src, dst)
     print(f"  Copied  {dst.name}")
 
@@ -305,6 +364,12 @@ def _cat_rows(variable, col, groups_df, group_n):
 
 
 def write_baseline_table1(coh):
+    coh = coh.copy()
+    if "location_type" in coh.columns:
+        coh["location_type"] = _canon_icu_series(coh["location_type"])
+    if "hospital_type" in coh.columns:
+        coh["hospital_type"] = _canon_hospital_type(coh["hospital_type"])
+
     groups_df = {
         "vaso":    coh[coh["ever_vaso"] == 1],
         "no_vaso": coh[coh["ever_vaso"] == 0],
@@ -332,16 +397,39 @@ def write_baseline_table1(coh):
 # OUTPUT 4: feature_at_initiation.csv
 # ============================================================
 
-def write_feature_at_initiation(feat):
-    """Aggregate feature values at the first vasopressin initiation timestep."""
+def _initiation_rows(feat):
+    """First 0→1 vasopressin-action transition per patient, shared by both
+    the flat and the group-level feature-at-initiation writers."""
     fs = feat.sort_values(["stay_id", "time_hour"]).copy()
     fs["prev_vaso"] = fs.groupby("stay_id")["action_vaso"].shift(1).fillna(0)
-
-    # First 0→1 transition per patient
-    init = (
+    return (
         fs[(fs["action_vaso"] == 1) & (fs["prev_vaso"] == 0)]
         .drop_duplicates(subset=["stay_id"], keep="first")
     )
+
+
+def _feature_stats_row(arr: pd.Series, n_total: int, extra: dict | None = None) -> dict:
+    """One suppressed mean/sd/median/q25/q75/min/max row for a numeric array,
+    given the (unfiltered) group total used for n_missing."""
+    n      = len(arr)
+    n_miss = n_total - n
+    row = dict(extra or {})
+    row.update({"n": _n_str(n), "n_missing": n_miss})
+    if n >= SUPPRESS_K:
+        row.update({
+            "mean":   _r(arr.mean()),   "sd":     _r(arr.std()),
+            "median": _r(arr.median()), "q25":    _r(arr.quantile(0.25)),
+            "q75":    _r(arr.quantile(0.75)),
+            "min":    _r(arr.min()),    "max":    _r(arr.max()),
+        })
+    else:
+        row.update({k: None for k in ("mean", "sd", "median", "q25", "q75", "min", "max")})
+    return row
+
+
+def write_feature_at_initiation(feat):
+    """Aggregate feature values at the first vasopressin initiation timestep."""
+    init = _initiation_rows(feat)
     n_total = len(init)
 
     rows = []
@@ -349,23 +437,61 @@ def write_feature_at_initiation(feat):
         if col not in init.columns:
             continue
         arr = pd.to_numeric(init[col], errors="coerce").dropna()
-        n     = len(arr)
-        n_miss = n_total - n
-        row   = {"feature": col, "n": _n_str(n), "n_missing": n_miss}
-        if n >= SUPPRESS_K:
-            row.update({
-                "mean":   _r(arr.mean()),   "sd":     _r(arr.std()),
-                "median": _r(arr.median()), "q25":    _r(arr.quantile(0.25)),
-                "q75":    _r(arr.quantile(0.75)),
-                "min":    _r(arr.min()),    "max":    _r(arr.max()),
-            })
-        else:
-            row.update({k: None for k in ("mean", "sd", "median", "q25", "q75", "min", "max")})
-        rows.append(row)
+        rows.append(_feature_stats_row(arr, n_total, extra={"feature": col}))
 
     out = OUTPUT_DIR / "feature_at_initiation.csv"
     pd.DataFrame(rows).to_csv(out, index=False)
     print(f"  Wrote   {out.name}")
+
+
+def write_feature_at_initiation_by_group(coh, feat):
+    """Feature values at initiation, broken down by ICU type and by hospital —
+    feeds the cross-site box/whisker-by-group plots (GROUP_BREAKDOWN_FEATURES,
+    not the full ANALYSIS_FEATURES list). The hospital breakdown also carries
+    each hospital's (canonicalized) hospital_type through, so the report can
+    label/color hospitals by academic vs community."""
+    init = _initiation_rows(feat)
+
+    group_specs = [
+        ("location_type", "feature_at_initiation_by_icu.csv", _canon_icu_series, False),
+        ("hospital_id",   "feature_at_initiation_by_hospital.csv", None, True),
+    ]
+    for group_col, fname, canon_fn, with_hospital_type in group_specs:
+        if group_col not in coh.columns:
+            print(f"  SKIP {fname}: no '{group_col}' column for this site")
+            continue
+
+        keep_cols = ["stay_id", group_col]
+        if with_hospital_type and "hospital_type" in coh.columns:
+            keep_cols.append("hospital_type")
+        group_map = coh[keep_cols].copy()
+        if canon_fn is not None:
+            group_map[group_col] = canon_fn(group_map[group_col])
+        if "hospital_type" in group_map.columns:
+            group_map["hospital_type"] = _canon_hospital_type(group_map["hospital_type"])
+        group_map = group_map.dropna(subset=[group_col])
+
+        merged = init.merge(group_map, on="stay_id", how="inner")
+        if merged.empty:
+            print(f"  SKIP {fname}: no initiating patients with a known '{group_col}'")
+            continue
+
+        rows = []
+        for grp, sub in merged.groupby(group_col):
+            n_grp_total = len(sub)
+            extra = {"group_column": group_col, "group": grp}
+            if "hospital_type" in sub.columns:
+                modal = sub["hospital_type"].mode(dropna=True)
+                extra["hospital_type"] = modal.iloc[0] if len(modal) else None
+            for col in GROUP_BREAKDOWN_FEATURES:
+                if col not in sub.columns:
+                    continue
+                arr = pd.to_numeric(sub[col], errors="coerce").dropna()
+                rows.append(_feature_stats_row(arr, n_grp_total, extra={**extra, "feature": col}))
+
+        out = OUTPUT_DIR / fname
+        pd.DataFrame(rows).to_csv(out, index=False)
+        print(f"  Wrote   {out.name}")
 
 
 # ============================================================
@@ -568,7 +694,9 @@ Columns: split, outcome_group (ever_vaso_yes/no/total), n_patients.
 
 ### baseline_table1.csv
 Baseline characteristics stratified by eventual vasopressin (vaso/no_vaso) and overall.
-One row per variable (or per level for categoricals).
+One row per variable (or per level for categoricals). location_type and hospital_type are
+canonicalized (ICU-type / academic-vs-community labels) before counting so spelling/casing
+differences across sites don't fragment categories.
 Columns: variable, level, type, smd,
   {{group}}_n, {{group}}_n_missing, {{group}}_mean, {{group}}_sd,
   {{group}}_median, {{group}}_q25, {{group}}_q75, {{group}}_min, {{group}}_max, {{group}}_pct
@@ -579,6 +707,16 @@ sizes are near K.
 ### feature_at_initiation.csv
 Feature values at the first vasopressin initiation timestep per initiating patient.
 Columns: feature, n, n_missing, mean, sd, median, q25, q75, min, max.
+
+### feature_at_initiation_by_icu.csv / feature_at_initiation_by_hospital.csv
+Same feature-at-initiation statistics as feature_at_initiation.csv, but broken down by
+ICU type (canonicalized location_type) or by hospital_id, restricted to
+{', '.join(GROUP_BREAKDOWN_FEATURES)} — feeds the cross-site ICU-type/hospital box-and-whisker
+at-initiation plots. Absent for sites without a usable location_type/hospital_id column,
+or where a site has fewer than 2 groups (e.g. single-hospital sites for the hospital file).
+The hospital file also carries a hospital_type column (academic/community/unknown,
+canonicalized) alongside each hospital_id group.
+Columns: group_column, group, hospital_type, feature, n, n_missing, mean, sd, median, q25, q75, min, max.
 
 ### feature_thresholds_youden.csv
 Per-feature (× split) threshold performance for imminent initiation.
@@ -607,33 +745,37 @@ def main():
 
     # Read patient-level intermediate (PHI, local); write shareable aggregates.
     INPUT_DIR  = OUTPUT_ROOT / "output" / f"patient_level_data_{SITE_NAME}"
-    OUTPUT_DIR = OUTPUT_ROOT / "output" / f"upload_to_box_{SITE_NAME}"
+    OUTPUT_DIR = OUTPUT_ROOT / "output" / f"upload_to_box_{SITE_NAME}" / COHORT_NAME
 
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     print(f"Site:   {SITE_NAME}")
+    print(f"Cohort: {COHORT_NAME}")
     print(f"Input:  {INPUT_DIR}")
     print(f"Output: {OUTPUT_DIR}\n")
 
-    print("[1/6] Filter counts")
+    print("[1/7] Filter counts")
     write_filter_counts()
 
-    print("[2/6] Loading + splitting")
+    print("[2/7] Loading + splitting")
     coh, feat = load_and_split()
     tr, va, te = [(coh["split"] == s).sum() for s in ("train", "val", "test")]
     print(f"  {len(coh):,} patients  train={tr}  val={va}  test={te}")
     print(f"  Ever-vaso: {coh['ever_vaso'].sum():,}  "
           f"Never-vaso: {(coh['ever_vaso']==0).sum():,}")
 
-    print("[3/6] Split counts")
+    print("[3/7] Split counts")
     write_split_counts(coh)
 
-    print("[4/6] Baseline table 1")
+    print("[4/7] Baseline table 1")
     write_baseline_table1(coh)
 
-    print("[5/6] Feature at initiation")
+    print("[5/7] Feature at initiation")
     write_feature_at_initiation(feat)
 
-    print("[6/6] ROC / threshold analysis")
+    print("[6/7] Feature at initiation, by ICU type / by hospital")
+    write_feature_at_initiation_by_group(coh, feat)
+
+    print("[7/7] ROC / threshold analysis")
     write_roc_outputs(feat)
 
     write_readme()

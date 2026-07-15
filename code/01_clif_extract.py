@@ -1,20 +1,31 @@
 # -*- coding: utf-8 -*-
 #!/usr/bin/env python3
 """
-CLIF 2.1.0 external validation: cohort identification and hourly feature extraction.
+CLIF 2.1.0 cohort identification and hourly feature extraction.
 
-Outputs (in OUTPUT_ROOT/output/patient_level_data_<SITE_NAME>/ — PHI, local only):
-  cohort.parquet          — cohort demographics and outcomes
-  features.parquet        — hourly feature time series
-  cohort_filter_counts.csv — patient counts at each filter step
+Two cohorts are identified, both anchored at t=0 = first NE administration:
 
+  Sepsis-3 (CMS): CMS qualifying IV abx + blood culture within 24 h of each other
+                  + lactate > 2 mmol/L, all within ±24 h of NE start.
+
+  Rhee/CDC ASE:   Blood culture within ±24 h of NE start
+                  + first qualifying IV abx within 2 calendar days of culture
+                  + ≥4 consecutive qualifying antibiotic days (≤1-day gap allowed),
+                    or antibiotic course running until ≤1 day before discharge/death
+                  + lactate >= 2 mmol/L within ±24 h of NE start.
+
+Outputs (OUTPUT_ROOT/output/patient_level_data_<SITE_NAME>/ — PHI, local only):
+  cohort_sepsis3.parquet        — Sepsis-3 cohort demographics and outcomes
+  cohort_rhee.parquet           — Rhee/CDC ASE cohort demographics and outcomes
+  features.parquet              — hourly features for union of both cohorts
+  cohort_filter_counts_sepsis3.csv
+  cohort_filter_counts_rhee.csv
 """
 
 import sys
 import io
 import warnings
 
-# Force UTF-8 stdout on Windows to handle Unicode in print statements
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 elif sys.stdout.encoding and sys.stdout.encoding.lower() != "utf-8":
@@ -25,7 +36,8 @@ from pathlib import Path
 
 try:
     from clifpy import ClifOrchestrator
-    from clifpy.utils.sofa import REQUIRED_SOFA_CATEGORIES_BY_TABLE
+    from clifpy.utils.sofa import REQUIRED_SOFA_CATEGORIES_BY_TABLE, DEVICE_RANK_DICT
+    from clifpy.utils.comorbidity import calculate_cci
 except ModuleNotFoundError:
     print("Install clifpy: pip install clifpy")
     sys.exit(1)
@@ -34,11 +46,7 @@ warnings.filterwarnings("ignore")
 
 
 def _load_site_config():
-    """Load config/config.py by file path. Returns the module, or None if absent.
-
-    Loading by path (rather than ``import config``) avoids the ``config/``
-    directory being picked up as an empty namespace package.
-    """
+    """Load config/config.py by file path to avoid namespace-package collision."""
     import importlib.util as _ilu
     cfg_path = Path(__file__).parent.parent / "config" / "config.py"
     if not cfg_path.exists():
@@ -50,16 +58,15 @@ def _load_site_config():
 
 
 # ---------------------------------------------------------------------------
-# Configuration — defaults (override in config/config.py, copied from config.example.py)
+# Configuration — defaults (override in config/config.py)
 # ---------------------------------------------------------------------------
-CLIF_DIR    = None   # REQUIRED — set in config/config.py
-OUTPUT_ROOT = None   # REQUIRED — set in config/config.py
+CLIF_DIR    = None   # REQUIRED
+OUTPUT_ROOT = None   # REQUIRED
 SITE_NAME   = "UCMC"
 TIMEZONE = "UTC"
 TRAJECTORY_HOURS = 120
-NE_WINDOW_HOURS = 24   # NE must start within 24h of ICU admit
-MIN_NE_RECORDS = 2     # ≥2 NE administrations (matches OVISS criterion)
-SOFA_THRESHOLD = 2.0
+MIN_NE_RECORDS = 2     # ≥2 NE administrations
+SOFA_THRESHOLD = 2.0   # kept for config compatibility; not used as inclusion criterion
 LACTATE_THRESHOLD = 2.0
 MAP_THRESHOLD = 65.0
 
@@ -72,13 +79,11 @@ VASOPRESSOR_CATEGORIES = [
     "vasopressin", "dopamine", "angiotensin ii",
 ]
 
-# Override defaults with site-specific config from config/config.py
 _cfg = _load_site_config()
 if _cfg is not None:
     for _k in (
         "CLIF_DIR", "OUTPUT_ROOT", "SITE_NAME", "TIMEZONE", "TRAJECTORY_HOURS",
-        "NE_WINDOW_HOURS", "MIN_NE_RECORDS", "SOFA_THRESHOLD",
-        "LACTATE_THRESHOLD", "MAP_THRESHOLD",
+        "MIN_NE_RECORDS", "SOFA_THRESHOLD", "LACTATE_THRESHOLD", "MAP_THRESHOLD",
         "STEROID_CATEGORIES", "VASOPRESSOR_CATEGORIES",
     ):
         if hasattr(_cfg, _k):
@@ -92,9 +97,6 @@ if CLIF_DIR is None or OUTPUT_ROOT is None:
         "Copy config/config.example.py to config/config.py and set your site-specific paths."
     )
 
-# Patient-level (PHI) intermediate outputs — stay local, NEVER shared.
-# 02_site_summary.py - 05_epi_analysis.py read from here and write the
-# shareable aggregates to output/upload_to_box_<SITE_NAME>/.
 PATIENT_LEVEL_DIR = OUTPUT_ROOT / "output" / f"patient_level_data_{SITE_NAME}"
 
 
@@ -102,7 +104,6 @@ PATIENT_LEVEL_DIR = OUTPUT_ROOT / "output" / f"patient_level_data_{SITE_NAME}"
 # Utility
 # ---------------------------------------------------------------------------
 def tz_coerce(s: pd.Series, tz: str) -> pd.Series:
-    """Localize naive datetimes; convert already-aware ones."""
     if pd.api.types.is_datetime64_any_dtype(s):
         if s.dt.tz is None:
             return s.dt.tz_localize(tz, ambiguous="NaT", nonexistent="NaT")
@@ -111,59 +112,277 @@ def tz_coerce(s: pd.Series, tz: str) -> pd.Series:
 
 
 def tz_strip(s: pd.Series) -> pd.Series:
-    """Remove timezone info — returns tz-naive UTC datetimes for comparison."""
     if pd.api.types.is_datetime64_any_dtype(s) and s.dt.tz is not None:
         return s.dt.tz_localize(None)
     return s
 
 
 def to_naive_utc(s: pd.Series) -> pd.Series:
-    """Robustly convert any datetime-like series to tz-naive UTC.
-
-    Handles tz-aware, tz-naive, and object-dtype (mixed) columns — including
-    the case where pd.concat of tz-aware + tz-naive parquets produces object dtype.
-    """
     return pd.to_datetime(s, utc=True).dt.tz_localize(None)
 
 
 # ---------------------------------------------------------------------------
-# Phase A-1: Suspected infection (antibiotics + blood culture within 24h)
+# Phase A-1: NE starts — t=0 anchor
 # ---------------------------------------------------------------------------
-def identify_suspected_infection(clif_dir: Path, time_window_hours: int = 24) -> pd.DataFrame:
+def get_all_ne_starts(clif_dir: Path) -> pd.DataFrame:
+    """First NE administration per hospitalization with ≥MIN_NE_RECORDS records.
+
+    No infection constraint — sepsis criteria are checked separately within
+    a ±24 h window around this anchor.
+    Returns: hospitalization_id, first_norepi_time
+    """
+    meds = pd.read_parquet(clif_dir / "clif_medication_admin_continuous.parquet")
+    ne = meds[meds["med_category"] == "norepinephrine"][
+        ["hospitalization_id", "admin_dttm"]
+    ].copy()
+    ne["admin_dttm"] = to_naive_utc(ne["admin_dttm"])
+    ne_agg = (ne.groupby("hospitalization_id")
+                .agg(first_norepi_time=("admin_dttm", "min"),
+                     n_ne=("admin_dttm", "count"))
+                .reset_index())
+    return ne_agg[ne_agg["n_ne"] >= MIN_NE_RECORDS].drop(columns="n_ne")
+
+
+# ---------------------------------------------------------------------------
+# Phase A-2: Shared source data helpers
+# ---------------------------------------------------------------------------
+def get_abx_records(clif_dir: Path) -> pd.DataFrame:
+    """CMS qualifying IV antibiotics with UTC timestamp and calendar date."""
     meds_i = pd.read_parquet(clif_dir / "clif_medication_admin_intermittent.parquet")
+    abx = meds_i[meds_i["med_group"] == "CMS_sepsis_qualifying_antibiotics"][
+        ["hospitalization_id", "admin_dttm"]
+    ].copy()
+    abx["admin_dttm"] = to_naive_utc(abx["admin_dttm"])
+    abx["abx_date"] = abx["admin_dttm"].dt.date
+    return abx
+
+
+def get_blood_cultures(clif_dir: Path) -> pd.DataFrame:
+    """Blood buffy-coat culture records with UTC timestamp and calendar date."""
     cultures = pd.read_parquet(clif_dir / "clif_microbiology_culture.parquet")
-
-    abx = meds_i[meds_i["med_group"] == "CMS_sepsis_qualifying_antibiotics"][["hospitalization_id", "admin_dttm"]].copy()
-
     blood_cx = cultures[
         (cultures["fluid_category"] == "blood_buffy") &
         cultures["collect_dttm"].notna() &
         (cultures["method_category"] == "culture")
     ][["hospitalization_id", "collect_dttm"]].copy()
-
-    merged = abx.merge(blood_cx, on="hospitalization_id", how="inner")
-    merged["time_diff"] = (
-        (merged["admin_dttm"] - merged["collect_dttm"]).dt.total_seconds().abs() / 3600
-    )
-    merged = merged[merged["time_diff"] <= time_window_hours].copy()
-    merged["presumed_infection_dttm"] = merged[["admin_dttm", "collect_dttm"]].min(axis=1)
-
-    return (merged.groupby("hospitalization_id")
-                  .agg(presumed_infection_dttm=("presumed_infection_dttm", "min"))
-                  .reset_index())
+    blood_cx["collect_dttm"] = to_naive_utc(blood_cx["collect_dttm"])
+    blood_cx["culture_date"] = blood_cx["collect_dttm"].dt.date
+    return blood_cx
 
 
 # ---------------------------------------------------------------------------
-# Phase A-2: ICU admission/discharge times from ADT
+# Phase A-3a: Sepsis-3 (CMS) cohort
+# ---------------------------------------------------------------------------
+def identify_sepsis3_cohort(
+    clif_dir: Path,
+    ne_df: pd.DataFrame,
+    window_hours: int = 24,
+) -> pd.DataFrame:
+    """Sepsis-3 (CMS) criteria within ±window_hours of NE start (t=0):
+      1. CMS qualifying IV abx + blood culture within 24 h of each other
+      2. Both events within ±window_hours of NE start
+      3. Lactate > LACTATE_THRESHOLD within ±window_hours of NE start
+
+    Returns: hospitalization_id, presumed_infection_dttm, initial_lactate
+    """
+    abx = get_abx_records(clif_dir)
+    blood_cx = get_blood_cultures(clif_dir)
+
+    ne = ne_df[["hospitalization_id", "first_norepi_time"]].copy()
+    ne["t0"] = to_naive_utc(pd.to_datetime(ne["first_norepi_time"], utc=True))
+    ne["win_start"] = ne["t0"] - pd.Timedelta(hours=window_hours)
+    ne["win_end"]   = ne["t0"] + pd.Timedelta(hours=window_hours)
+
+    # Filter abx to window
+    abx_win = abx.merge(ne[["hospitalization_id", "win_start", "win_end"]], on="hospitalization_id")
+    abx_win = abx_win[
+        (abx_win["admin_dttm"] >= abx_win["win_start"]) &
+        (abx_win["admin_dttm"] <= abx_win["win_end"])
+    ]
+
+    # Filter cultures to window
+    cx_win = blood_cx.merge(ne[["hospitalization_id", "win_start", "win_end"]], on="hospitalization_id")
+    cx_win = cx_win[
+        (cx_win["collect_dttm"] >= cx_win["win_start"]) &
+        (cx_win["collect_dttm"] <= cx_win["win_end"])
+    ]
+
+    # Pair abx + culture within 24 h of each other
+    paired = abx_win[["hospitalization_id", "admin_dttm"]].merge(
+        cx_win[["hospitalization_id", "collect_dttm"]], on="hospitalization_id"
+    )
+    paired["diff_h"] = (
+        (paired["admin_dttm"] - paired["collect_dttm"]).dt.total_seconds().abs() / 3600
+    )
+    paired = paired[paired["diff_h"] <= 24].copy()
+    paired["infection_anchor"] = paired[["admin_dttm", "collect_dttm"]].min(axis=1)
+
+    infection = (paired.groupby("hospitalization_id")
+                       .agg(presumed_infection_dttm=("infection_anchor", "min"))
+                       .reset_index())
+
+    if infection.empty:
+        infection["initial_lactate"] = np.nan
+        return infection
+
+    # Lactate check
+    labs = pd.read_parquet(clif_dir / "clif_labs.parquet")
+    lac_df = labs[labs["lab_category"] == "lactate"][
+        ["hospitalization_id", "lab_result_dttm", "lab_value_numeric"]
+    ].copy()
+    lac_df["lab_result_dttm"] = to_naive_utc(lac_df["lab_result_dttm"])
+
+    lac_merged = lac_df.merge(
+        ne[["hospitalization_id", "win_start", "win_end"]], on="hospitalization_id"
+    )
+    lac_win = lac_merged[
+        (lac_merged["lab_result_dttm"] >= lac_merged["win_start"]) &
+        (lac_merged["lab_result_dttm"] <= lac_merged["win_end"]) &
+        lac_merged["lab_value_numeric"].notna()
+    ]
+
+    initial_lac = (
+        lac_win.sort_values("lab_result_dttm")
+        .groupby("hospitalization_id")["lab_value_numeric"]
+        .first()
+        .reset_index()
+        .rename(columns={"lab_value_numeric": "initial_lactate"})
+    )
+
+    elevated_ids = set(lac_win.loc[lac_win["lab_value_numeric"] > LACTATE_THRESHOLD, "hospitalization_id"])
+    infection = infection[infection["hospitalization_id"].isin(elevated_ids)].copy()
+    infection = infection.merge(initial_lac, on="hospitalization_id", how="left")
+    return infection
+
+
+# ---------------------------------------------------------------------------
+# Phase A-3b: Rhee/CDC ASE cohort
+# ---------------------------------------------------------------------------
+def identify_rhee_cohort(
+    clif_dir: Path,
+    ne_df: pd.DataFrame,
+    mortality_df: pd.DataFrame,
+    window_hours: int = 24,
+) -> pd.DataFrame:
+    """Rhee/CDC Adult Sepsis Event criteria within ±window_hours of NE start (t=0):
+      1. Blood culture within ±window_hours of NE start
+      2. First qualifying IV abx within 2 calendar days of culture date
+      3. ≥4 consecutive qualifying antibiotic calendar days (≤1-day gap allowed),
+         OR antibiotic course runs until ≤1 day before discharge/death
+
+    Returns: hospitalization_id, blood_culture_dttm
+    """
+    abx = get_abx_records(clif_dir)
+    blood_cx = get_blood_cultures(clif_dir)
+
+    ne = ne_df[["hospitalization_id", "first_norepi_time"]].copy()
+    ne["t0"] = to_naive_utc(pd.to_datetime(ne["first_norepi_time"], utc=True))
+    ne["win_start"] = ne["t0"] - pd.Timedelta(hours=window_hours)
+    ne["win_end"]   = ne["t0"] + pd.Timedelta(hours=window_hours)
+
+    # Step 1: Blood culture within ±window_hours of NE start
+    cx_win = blood_cx.merge(
+        ne[["hospitalization_id", "win_start", "win_end"]], on="hospitalization_id"
+    )
+    cx_win = cx_win[
+        (cx_win["collect_dttm"] >= cx_win["win_start"]) &
+        (cx_win["collect_dttm"] <= cx_win["win_end"])
+    ].copy()
+    if cx_win.empty:
+        return pd.DataFrame(columns=["hospitalization_id", "blood_culture_dttm"])
+
+    earliest_cx = (cx_win.sort_values("collect_dttm")
+                         .groupby("hospitalization_id")
+                         .first()
+                         .reset_index()[["hospitalization_id", "collect_dttm", "culture_date"]])
+
+    # Step 2: First qualifying IV abx within 2 calendar days of culture
+    abx_cx = abx.merge(earliest_cx[["hospitalization_id", "culture_date"]], on="hospitalization_id")
+    abx_cx["day_diff"] = (
+        pd.to_datetime(abx_cx["abx_date"]) -
+        pd.to_datetime(abx_cx["culture_date"])
+    ).dt.days.abs()
+    qualifying_abx = abx_cx[abx_cx["day_diff"] <= 2].copy()
+    if qualifying_abx.empty:
+        return pd.DataFrame(columns=["hospitalization_id", "blood_culture_dttm"])
+
+    first_abx = (qualifying_abx.sort_values("abx_date")
+                                .groupby("hospitalization_id")["abx_date"]
+                                .first()
+                                .reset_index()
+                                .rename(columns={"abx_date": "first_abx_date"}))
+
+    candidates = earliest_cx.merge(first_abx, on="hospitalization_id")
+    if candidates.empty:
+        return pd.DataFrame(columns=["hospitalization_id", "blood_culture_dttm"])
+
+    # Step 3: ≥4 consecutive antibiotic calendar days (≤1-day gap allowed)
+    cand_ids = set(candidates["hospitalization_id"])
+    abx_cands = (abx[abx["hospitalization_id"].isin(cand_ids)]
+                 [["hospitalization_id", "abx_date"]]
+                 .drop_duplicates()
+                 .merge(candidates[["hospitalization_id", "first_abx_date"]], on="hospitalization_id"))
+    abx_cands = abx_cands[abx_cands["abx_date"] >= abx_cands["first_abx_date"]].copy()
+    abx_cands["abx_date_dt"] = pd.to_datetime(abx_cands["abx_date"])
+    abx_cands = abx_cands.sort_values(["hospitalization_id", "abx_date_dt"])
+
+    abx_cands["prev_dt"] = (abx_cands.groupby("hospitalization_id")["abx_date_dt"]
+                                      .shift(1))
+    abx_cands["gap_days"] = (
+        (abx_cands["abx_date_dt"] - abx_cands["prev_dt"]).dt.days.fillna(1)
+    )
+    # gap > 2 means >1 calendar-day gap → break in consecutive run
+    abx_cands["new_run"] = (abx_cands["gap_days"] > 2).astype(int)
+    first_row = abx_cands.groupby("hospitalization_id").cumcount() == 0
+    abx_cands.loc[first_row, "new_run"] = 1
+    abx_cands["run_id"] = abx_cands.groupby("hospitalization_id")["new_run"].cumsum()
+
+    run_lengths = (abx_cands.groupby(["hospitalization_id", "run_id"])
+                             .size()
+                             .reset_index(name="run_len"))
+    max_run = (run_lengths.groupby("hospitalization_id")["run_len"]
+                          .max()
+                          .reset_index(name="max_run_days"))
+    last_abx = (abx_cands.groupby("hospitalization_id")["abx_date_dt"]
+                          .max()
+                          .reset_index(name="last_abx_dt"))
+
+    # Discharge/death date for early-termination criterion
+    discharge = mortality_df[["hospitalization_id", "discharge_dttm", "deathtime"]].copy()
+    discharge["end_dt"] = pd.to_datetime(discharge.apply(
+        lambda r: r["deathtime"] if pd.notna(r["deathtime"]) else r["discharge_dttm"],
+        axis=1,
+    ), utc=True).dt.tz_localize(None).dt.normalize()
+
+    rhee_check = (max_run
+                  .merge(last_abx, on="hospitalization_id")
+                  .merge(discharge[["hospitalization_id", "end_dt"]], on="hospitalization_id", how="left"))
+
+    rhee_check["days_before_end"] = (
+        (rhee_check["end_dt"] - rhee_check["last_abx_dt"]).dt.days
+    )
+    # Criterion: ≥4 consecutive days, OR course ends within 1 day of discharge/death
+    rhee_check["meets"] = (
+        (rhee_check["max_run_days"] >= 4) |
+        (rhee_check["days_before_end"].fillna(99) <= 1)
+    )
+
+    qualifying = set(rhee_check.loc[rhee_check["meets"], "hospitalization_id"])
+    result = candidates[candidates["hospitalization_id"].isin(qualifying)].copy()
+    return result[["hospitalization_id", "collect_dttm"]].rename(
+        columns={"collect_dttm": "blood_culture_dttm"}
+    )
+
+
+# ---------------------------------------------------------------------------
+# Phase A-4: ICU admission/discharge times from ADT
 # ---------------------------------------------------------------------------
 def get_icu_times(clif_dir: Path) -> pd.DataFrame:
     adt = pd.read_parquet(clif_dir / "clif_adt.parquet")
     icu_rows = adt[adt["location_category"] == "icu"].sort_values("in_dttm")
-    # First ICU entry per patient (for intime) and last exit (for outtime)
     agg = (icu_rows.groupby("hospitalization_id")
            .agg(icu_intime=("in_dttm", "first"), icu_outtime=("out_dttm", "last"))
            .reset_index())
-    # location_type of first ICU stay
     first_loc_type = (icu_rows.groupby("hospitalization_id")
                       .first()
                       .reset_index()
@@ -176,11 +395,6 @@ def get_icu_times(clif_dir: Path) -> pd.DataFrame:
 
 
 def get_any_location_times(clif_dir: Path) -> pd.DataFrame:
-    """First ADT entry (any location_category) per hospitalization.
-
-    Used to build the non-ICU parallel cohort — returns the first location
-    a patient appears at during the hospitalization, plus its category/type.
-    """
     adt = pd.read_parquet(clif_dir / "clif_adt.parquet")
     first = (adt.sort_values("in_dttm")
              .groupby("hospitalization_id")
@@ -198,37 +412,53 @@ def get_any_location_times(clif_dir: Path) -> pd.DataFrame:
     return first
 
 
-# ---------------------------------------------------------------------------
-# Phase A-3: NE-specific criteria (first NE within 24h of ICU admit, ≥2 records)
-# ---------------------------------------------------------------------------
-def get_ne_criteria(clif_dir: Path, icu_df: pd.DataFrame) -> pd.DataFrame:
-    meds = pd.read_parquet(clif_dir / "clif_medication_admin_continuous.parquet")
-    ne = meds[meds["med_category"] == "norepinephrine"][
-        ["hospitalization_id", "admin_dttm", "med_dose"]
-    ].copy()
+_LOC_T0_OPTIONAL_COLS = ["location_type", "hospital_id", "hospital_type"]
 
-    ne = ne.merge(icu_df[["hospitalization_id", "icu_intime"]], on="hospitalization_id")
-    ne["admin_dttm"] = to_naive_utc(ne["admin_dttm"])
-    ne["icu_intime"] = to_naive_utc(ne["icu_intime"])
 
-    window_end = ne["icu_intime"] + pd.Timedelta(hours=NE_WINDOW_HOURS)
-    ne_win = ne[(ne["admin_dttm"] >= ne["icu_intime"]) & (ne["admin_dttm"] <= window_end)]
+def get_location_at_t0(clif_dir: Path, cohort: pd.DataFrame) -> pd.DataFrame:
+    """ADT location (category, type, hospital) at t=0 (first_norepi_time) per
+    patient. hospital_id/hospital_type identify the individual community or
+    academic hospital within this CLIF site's data pool (a site may bundle
+    multiple hospitals)."""
+    adt = pd.read_parquet(clif_dir / "clif_adt.parquet")
+    adt["in_dttm"]  = to_naive_utc(adt["in_dttm"])
+    adt["out_dttm"] = to_naive_utc(adt["out_dttm"].fillna(pd.Timestamp("2100-01-01")))
 
-    ne_agg = (ne_win.groupby("hospitalization_id")
-                    .agg(first_norepi_time=("admin_dttm", "min"),
-                         n_ne=("admin_dttm", "count"))
+    t0 = (cohort[["stay_id", "first_norepi_time"]]
+          .rename(columns={"stay_id": "hospitalization_id"})
+          .copy())
+    t0["t0"] = to_naive_utc(t0["first_norepi_time"])
+
+    loc_cols = ["hospitalization_id", "in_dttm", "out_dttm", "location_category"]
+    loc_cols += [c for c in _LOC_T0_OPTIONAL_COLS if c in adt.columns]
+
+    merged = t0.merge(adt[loc_cols], on="hospitalization_id", how="left")
+    active = merged[
+        (merged["t0"] >= merged["in_dttm"]) &
+        (merged["t0"] <  merged["out_dttm"])
+    ]
+    active = (active.sort_values("in_dttm")
+                    .groupby("hospitalization_id")
+                    .last()
                     .reset_index())
-    return ne_agg[ne_agg["n_ne"] >= MIN_NE_RECORDS].drop(columns="n_ne")
+
+    all_cols = ["location_category"] + _LOC_T0_OPTIONAL_COLS
+    keep = ["hospitalization_id"] + [c for c in all_cols if c in active.columns]
+    result = active[keep].rename(columns={"hospitalization_id": "stay_id"})
+    for c in all_cols:
+        if c not in result.columns:
+            result[c] = np.nan
+    return result
 
 
 # ---------------------------------------------------------------------------
-# Phase A-4: Mortality and trajectory bounds
+# Phase A-5: Mortality, demographics, trajectory helpers
 # ---------------------------------------------------------------------------
 def get_mortality(clif_dir: Path) -> pd.DataFrame:
     patient = pd.read_parquet(clif_dir / "clif_patient.parquet")[["patient_id", "death_dttm"]]
     hosp = pd.read_parquet(clif_dir / "clif_hospitalization.parquet")[
         ["patient_id", "hospitalization_id", "discharge_category", "discharge_dttm",
-         "age_at_admission"]
+         "admission_dttm", "age_at_admission"]
     ]
     m = hosp.merge(patient, on="patient_id", how="left")
     m["hospital_death"] = (
@@ -239,14 +469,11 @@ def get_mortality(clif_dir: Path) -> pd.DataFrame:
         else (r["discharge_dttm"] if r["hospital_death"] == 1 else pd.NaT),
         axis=1,
     )
-    return m[["hospitalization_id", "hospital_death", "deathtime", "age_at_admission"]]
+    return m[["hospitalization_id", "hospital_death", "deathtime",
+              "discharge_dttm", "admission_dttm", "age_at_admission"]]
 
 
-# ---------------------------------------------------------------------------
-# Phase A-4b: Patient demographics (age, sex, race, weight)
-# ---------------------------------------------------------------------------
 def get_demographics(clif_dir: Path, stay_ids: set) -> pd.DataFrame:
-    """Age, gender (M/F), and normalized race for cohort patients."""
     patient = pd.read_parquet(clif_dir / "clif_patient.parquet")[
         ["patient_id", "sex_category", "race_category", "ethnicity_category"]
     ]
@@ -255,9 +482,7 @@ def get_demographics(clif_dir: Path, stay_ids: set) -> pd.DataFrame:
     ]
     demo = hosp[hosp["hospitalization_id"].isin(stay_ids)].merge(patient, on="patient_id", how="left")
     demo = demo.rename(columns={"hospitalization_id": "stay_id"})
-
     demo["gender"] = demo["sex_category"].map({"Male": "M", "Female": "F"})
-
     demo["race"] = demo.apply(
         lambda r: "Hispanic" if r["ethnicity_category"] == "Hispanic" else r["race_category"],
         axis=1,
@@ -266,7 +491,7 @@ def get_demographics(clif_dir: Path, stay_ids: set) -> pd.DataFrame:
 
 
 def get_vaso_pretraj(clif_dir: Path, cohort: pd.DataFrame) -> pd.DataFrame:
-    """1 if vasopressin was administered in the 24h before trajectory_start, else 0."""
+    """1 if vasopressin was administered in the 24 h before trajectory_start, else 0."""
     meds = pd.read_parquet(clif_dir / "clif_medication_admin_continuous.parquet")
     vaso = meds[meds["med_category"] == "vasopressin"][
         ["hospitalization_id", "admin_dttm"]
@@ -280,7 +505,7 @@ def get_vaso_pretraj(clif_dir: Path, cohort: pd.DataFrame) -> pd.DataFrame:
 
     in_window = (
         (vaso["admin_dttm"] >= vaso["traj_start"] - pd.Timedelta(hours=24)) &
-        (vaso["admin_dttm"] <  vaso["traj_start"])
+        (vaso["admin_dttm"] <  vaso["traj_start"] + pd.Timedelta(hours=1))
     )
     pretraj_ids = set(vaso.loc[in_window, "stay_id"])
     return pd.DataFrame({
@@ -290,23 +515,39 @@ def get_vaso_pretraj(clif_dir: Path, cohort: pd.DataFrame) -> pd.DataFrame:
 
 
 def get_weight_at_onset(clif_dir: Path, cohort: pd.DataFrame) -> pd.DataFrame:
-    """Median weight_kg per patient during their trajectory window."""
+    """First recorded weight_kg per patient in the hospitalization."""
     vitals = pd.read_parquet(clif_dir / "clif_vitals.parquet")
     w = vitals[vitals["vital_category"] == "weight_kg"][
         ["hospitalization_id", "recorded_dttm", "vital_value"]
     ].rename(columns={"hospitalization_id": "stay_id", "vital_value": "weight"})
+    w = w[w["weight"].notna() & w["stay_id"].isin(set(cohort["stay_id"]))].copy()
     w["recorded_dttm"] = to_naive_utc(w["recorded_dttm"])
+    return (w.sort_values("recorded_dttm")
+             .groupby("stay_id")["weight"]
+             .first()
+             .reset_index())
 
-    bounds = cohort[["stay_id", "trajectory_start", "trajectory_end"]].copy()
-    bounds["trajectory_start"] = to_naive_utc(pd.to_datetime(bounds["trajectory_start"], utc=True))
-    bounds["trajectory_end"]   = to_naive_utc(pd.to_datetime(bounds["trajectory_end"],   utc=True))
-    w = w.merge(bounds, on="stay_id")
-    w = w[(w["recorded_dttm"] >= w["trajectory_start"]) & (w["recorded_dttm"] <= w["trajectory_end"])]
-    return w.groupby("stay_id")["weight"].median().reset_index()
+
+def get_cci(clif_dir: Path, hosp_ids: set) -> pd.DataFrame:
+    """Charlson Comorbidity Index per hospitalization (via clifpy, ICD10CM only).
+
+    Falls back to NaN if clif_hospital_diagnosis.parquet is absent (optional table).
+    """
+    path = clif_dir / "clif_hospital_diagnosis.parquet"
+    if not path.exists():
+        return pd.DataFrame({"stay_id": list(hosp_ids), "cci_score": np.nan})
+    dx = pd.read_parquet(path)
+    dx = dx[dx["hospitalization_id"].isin(hosp_ids)]
+    if dx.empty:
+        return pd.DataFrame({"stay_id": list(hosp_ids), "cci_score": np.nan})
+    cci = calculate_cci(dx)
+    return cci[["hospitalization_id", "cci_score"]].rename(
+        columns={"hospitalization_id": "stay_id"}
+    )
 
 
 # ---------------------------------------------------------------------------
-# Phase A-5: clifpy SOFA helpers
+# Phase A-6: clifpy SOFA helpers
 # ---------------------------------------------------------------------------
 def _load_sofa_tables(co: ClifOrchestrator, hosp_ids: list) -> None:
     co.load_table("labs", filters={
@@ -325,7 +566,6 @@ def _load_sofa_tables(co: ClifOrchestrator, hosp_ids: list) -> None:
     co.load_table("medication_admin_continuous", filters={"hospitalization_id": hosp_ids})
     co.load_table("respiratory_support", filters={"hospitalization_id": hosp_ids})
 
-    # Mark meds as pre-converted (NE is already in mcg/kg/min)
     med_df = co.medication_admin_continuous.df.copy()
     med_df = med_df[med_df["med_dose"].notna() & med_df["med_dose_unit"].notna()]
     co.medication_admin_continuous.df = med_df
@@ -340,38 +580,22 @@ def _add_missing_med_cols(co: ClifOrchestrator) -> None:
             co.wide_df[col] = 0.0
 
 
-# ---------------------------------------------------------------------------
-# Phase A: Full cohort assembly
-# ---------------------------------------------------------------------------
-def build_cohort(clif_dir: Path, co: ClifOrchestrator) -> tuple:
-    filter_log = []
+def compute_sofa_at_ne_start(ne_df: pd.DataFrame, co: ClifOrchestrator) -> pd.DataFrame:
+    """SOFA score in the 24 h window starting at first_norepi_time.
 
-    print("\nStep 0: Total hospitalizations in CLIF site...")
-    hosp_all = pd.read_parquet(clif_dir / "clif_hospitalization.parquet")[["hospitalization_id"]]
-    filter_log.append({
-        "step": "Total hospitalizations in CLIF site",
-        "n_hospitalizations": len(hosp_all),
-    })
-    print(f"  {len(hosp_all):,} total hospitalizations")
+    Returns: hospitalization_id, sepsis_onset_sofa
+    """
+    sofa_window = ne_df[["hospitalization_id", "first_norepi_time"]].copy()
+    sofa_window["start_time"] = tz_coerce(
+        pd.to_datetime(sofa_window["first_norepi_time"]), TIMEZONE
+    )
+    sofa_window["end_time"] = sofa_window["start_time"] + pd.Timedelta(hours=24)
 
-    print("\nStep 1: Suspected infection (IV abx + blood culture within 24h)...")
-    suspected = identify_suspected_infection(clif_dir)
-    filter_log.append({
-        "step": "IV CMS qualifying antibiotic + blood culture within 24h",
-        "n_hospitalizations": len(suspected),
-    })
-    print(f"  {len(suspected):,} patients")
-
-    print("Step 2: Sepsis-3 criteria (SOFA ≥ 2 + lactate > 2 mmol/L within 24h of infection)...")
-    suspected["presumed_infection_dttm"] = tz_coerce(suspected["presumed_infection_dttm"], TIMEZONE)
-    suspected["start_time"] = suspected["presumed_infection_dttm"]
-    suspected["end_time"] = suspected["presumed_infection_dttm"] + pd.Timedelta(hours=24)
-
-    hosp_ids = suspected["hospitalization_id"].tolist()
+    hosp_ids = sofa_window["hospitalization_id"].tolist()
     _load_sofa_tables(co, hosp_ids)
     co.create_wide_dataset(
         category_filters=REQUIRED_SOFA_CATEGORIES_BY_TABLE,
-        cohort_df=suspected,
+        cohort_df=sofa_window,
         return_dataframe=True,
     )
     _add_missing_med_cols(co)
@@ -382,104 +606,52 @@ def build_cohort(clif_dir: Path, co: ClifOrchestrator) -> tuple:
         remove_outliers=True,
         create_new_wide_df=False,
     )
-    suspected = suspected.merge(sofa[["hospitalization_id", "sofa_total"]],
-                                on="hospitalization_id", how="left")
-    suspected = suspected[suspected["sofa_total"] >= SOFA_THRESHOLD].copy()
-    filter_log.append({
-        "step": f"Sepsis-3: SOFA >= {SOFA_THRESHOLD} within 24h of infection",
-        "n_hospitalizations": len(suspected),
-    })
-    print(f"  {len(suspected):,} with SOFA ≥ {SOFA_THRESHOLD}")
-
-    lactate = co.labs.df[co.labs.df["lab_category"] == "lactate"].copy()
-    lactate["lab_result_dttm"] = tz_coerce(lactate["lab_result_dttm"], TIMEZONE)
-    lac_window = lactate.merge(suspected[["hospitalization_id", "start_time", "end_time"]],
-                               on="hospitalization_id")
-    lac_window = lac_window[
-        (lac_window["lab_result_dttm"] >= lac_window["start_time"]) &
-        (lac_window["lab_result_dttm"] < lac_window["end_time"]) &
-        lac_window["lab_value_numeric"].notna()
-    ]
-    initial_lac = (
-        lac_window.sort_values("lab_result_dttm")
-        .groupby("hospitalization_id")["lab_value_numeric"]
-        .first()
-        .reset_index()
-        .rename(columns={"lab_value_numeric": "initial_lactate"})
+    return sofa[["hospitalization_id", "sofa_total"]].rename(
+        columns={"sofa_total": "sepsis_onset_sofa"}
     )
-    lac = lac_window[lac_window["lab_value_numeric"] > LACTATE_THRESHOLD]
-    elevated_ids = set(lac["hospitalization_id"])
-    suspected = suspected[suspected["hospitalization_id"].isin(elevated_ids)].copy()
-    suspected = suspected.merge(initial_lac, on="hospitalization_id", how="left")
-    filter_log.append({
-        "step": f"Sepsis-3: lactate > {LACTATE_THRESHOLD} mmol/L within 24h of infection",
-        "n_hospitalizations": len(suspected),
-    })
-    print(f"  {len(suspected):,} meeting full Sepsis-3 criteria (SOFA + lactate)")
 
-    # Save pre-ICU Sepsis-3 IDs for non-ICU CONSORT count
-    sepsis3_lac_ids = set(suspected["hospitalization_id"])
 
-    print("Step 3: ICU admission within 24h of infection...")
-    icu = get_icu_times(clif_dir)
-    suspected = suspected.merge(icu, on="hospitalization_id", how="inner")
-    suspected["icu_intime"] = tz_coerce(suspected["icu_intime"], TIMEZONE)
-    diff_h = (suspected["presumed_infection_dttm"] - suspected["icu_intime"]).dt.total_seconds() / 3600
-    suspected = suspected[diff_h.abs() <= 24].copy()
-    filter_log.append({
-        "step": "ICU admission (ADT) within 24h of suspected infection",
-        "n_hospitalizations": len(suspected),
-    })
-    print(f"  {len(suspected):,} with ICU within 24h of infection")
+# ---------------------------------------------------------------------------
+# Phase A-7: Cohort DataFrame assembly helper
+# ---------------------------------------------------------------------------
+def _assemble_cohort_df(
+    label_df: pd.DataFrame,
+    ne_df: pd.DataFrame,
+    icu_df: pd.DataFrame,
+    mortality_df: pd.DataFrame,
+) -> pd.DataFrame:
+    """Merge label_df (sepsis3 or rhee IDs) with NE times, ICU, and mortality;
+    compute trajectory bounds and death_hour.
 
-    # Non-ICU = Sepsis-3 + lactate patients without an ICU admission (for CONSORT flowchart)
-    nonicu_ids = sepsis3_lac_ids - set(suspected["hospitalization_id"])
-    any_loc = get_any_location_times(clif_dir)
-    suspected_nonicu = (
-        identify_suspected_infection(clif_dir)
-        .merge(any_loc, on="hospitalization_id", how="inner")
+    label_df must have hospitalization_id as key; other columns are preserved.
+    Returns a DataFrame with stay_id replacing hospitalization_id.
+    """
+    cohort = label_df.merge(ne_df, on="hospitalization_id", how="inner")
+    cohort = cohort.merge(icu_df, on="hospitalization_id", how="left")
+    cohort["icu_intime"] = tz_coerce(cohort["icu_intime"], TIMEZONE)
+    cohort = cohort.merge(
+        mortality_df.rename(columns={"age_at_admission": "age"}),
+        on="hospitalization_id", how="left",
     )
-    suspected_nonicu = suspected_nonicu[
-        suspected_nonicu["hospitalization_id"].isin(nonicu_ids)
-    ].copy()
 
-    if len(suspected_nonicu) > 0 and "location_category" in suspected_nonicu.columns:
-        loc_counts = suspected_nonicu["location_category"].fillna("unknown").value_counts()
-        for loc_cat, loc_n in loc_counts.items():
-            filter_log.append({
-                "step": f"Non-ICU: {loc_cat}",
-                "n_hospitalizations": int(loc_n),
-            })
-
-    print("Step 4: NE criteria (first NE ≤24h of ICU admit, ≥2 records)...")
-    ne = get_ne_criteria(clif_dir, icu)
-    suspected = suspected.merge(ne, on="hospitalization_id", how="inner")
-    filter_log.append({
-        "step": f"Norepinephrine within 24h of ICU admit (>=2 records)",
-        "n_hospitalizations": len(suspected),
-    })
-    print(f"  {len(suspected):,} patients")
-
-    cohort = suspected.drop(columns=["start_time", "end_time"], errors="ignore")
-
-    print("Step 5: Mortality and trajectory bounds...")
-    mortality = get_mortality(clif_dir)
-    cohort = cohort.merge(mortality, on="hospitalization_id", how="left")
-    cohort = cohort.rename(columns={"age_at_admission": "age"})
-
-    for col in ["icu_intime", "icu_outtime", "first_norepi_time",
-                "presumed_infection_dttm", "deathtime"]:
+    for col in ["icu_intime", "icu_outtime", "first_norepi_time", "deathtime",
+                "admission_dttm", "discharge_dttm"]:
         if col in cohort.columns:
             cohort[col] = tz_coerce(cohort[col], TIMEZONE)
 
-    cohort["trajectory_start"] = cohort[
-        ["icu_intime", "first_norepi_time", "presumed_infection_dttm"]
-    ].max(axis=1)
+    # ICU/hospital length of stay (days) — full stay, independent of the
+    # vasopressin trajectory window/cap below.
+    cohort["icu_los_days"] = (
+        (cohort["icu_outtime"] - cohort["icu_intime"]).dt.total_seconds() / 86400
+    )
+    cohort["hospital_los_days"] = (
+        (cohort["discharge_dttm"] - cohort["admission_dttm"]).dt.total_seconds() / 86400
+    )
 
+    cohort["trajectory_start"] = cohort["first_norepi_time"]
     traj_cap = cohort["trajectory_start"] + pd.Timedelta(hours=TRAJECTORY_HOURS)
 
-    # Ensure all candidate end times are tz-aware UTC before taking min
-    def to_utc(s):
+    def _to_tz(s):
         s = pd.to_datetime(s, utc=False)
         if s.dt.tz is None:
             s = s.dt.tz_localize(TIMEZONE, ambiguous="NaT", nonexistent="NaT")
@@ -487,13 +659,15 @@ def build_cohort(clif_dir: Path, co: ClifOrchestrator) -> tuple:
             s = s.dt.tz_convert(TIMEZONE)
         return s
 
-    icu_out = to_utc(cohort["icu_outtime"])
-    cap     = to_utc(traj_cap)
-    death   = to_utc(cohort["deathtime"])
-
-    cohort["trajectory_end"] = pd.concat(
-        [icu_out.rename("e"), cap.rename("e"), death.rename("e")], axis=1
-    ).min(axis=1)
+    # Column order = tie-break priority (death > discharge > hour_cap) for the
+    # rare case two candidates land on the exact same timestamp.
+    _end_candidates = pd.DataFrame({
+        "death":     _to_tz(cohort["deathtime"]),
+        "discharge": _to_tz(cohort["icu_outtime"]),
+        "hour_cap":  _to_tz(traj_cap),
+    })
+    cohort["trajectory_end"] = _end_candidates.min(axis=1)
+    cohort["traj_end_reason"] = _end_candidates.idxmin(axis=1)
 
     cohort["traj_hours"] = (
         (cohort["trajectory_end"] - cohort["trajectory_start"])
@@ -508,46 +682,189 @@ def build_cohort(clif_dir: Path, co: ClifOrchestrator) -> tuple:
         .apply(lambda x: float(int(x)) if pd.notna(x) else float("nan"))
     )
 
-    # Rename sofa to sepsis_onset_sofa (computed in step 2)
-    if "sofa_total" in cohort.columns:
-        cohort = cohort.rename(columns={"sofa_total": "sepsis_onset_sofa"})
-
-    # Year of ICU admission from ADT in_dttm
-    cohort["anchor_year_group"] = cohort["icu_intime"].dt.year.astype(str)
+    cohort["anchor_year_group"] = cohort["first_norepi_time"].dt.year.astype(str)
     cohort = cohort.rename(columns={"hospitalization_id": "stay_id"})
+    return cohort
 
-    print("  Adding demographics (sex, race)...")
-    demo = get_demographics(clif_dir, set(cohort["stay_id"]))
-    cohort = cohort.merge(demo, on="stay_id", how="left")
 
-    print("  Adding weight from vitals...")
-    weight_df = get_weight_at_onset(clif_dir, cohort)
-    cohort = cohort.merge(weight_df, on="stay_id", how="left")
+# ---------------------------------------------------------------------------
+# Phase A: Full cohort assembly
+# ---------------------------------------------------------------------------
+def build_cohort(clif_dir: Path, co: ClifOrchestrator) -> tuple:
+    """Identify Sepsis-3 and Rhee/CDC ASE cohorts with t=0 at NE start.
 
-    print("  Checking vasopressin in 24h before trajectory start...")
-    vaso_pretraj = get_vaso_pretraj(clif_dir, cohort)
-    cohort = cohort.merge(vaso_pretraj, on="stay_id", how="left")
-    cohort["vaso_before_traj"] = cohort["vaso_before_traj"].fillna(0).astype(int)
+    Returns: (cohort_sepsis3, cohort_rhee, filter_log_sepsis3, filter_log_rhee)
+    Each cohort DataFrame has the same schema as the old cohort.parquet.
+    """
+    filter_s3   = []
+    filter_rhee = []
 
-    n_excl_vaso = int((cohort["vaso_before_traj"] == 1).sum())
-    print(f"  {n_excl_vaso:,} patients excluded for vasopressin in 24h before trajectory start")
-    filter_log.append({
-        "step": "Patients on vasopressin in 24h before trajectory start (excluded)",
-        "n_hospitalizations": n_excl_vaso,
+    print("\nStep 0: Total hospitalizations in CLIF site...")
+    hosp_all = pd.read_parquet(clif_dir / "clif_hospitalization.parquet")[["hospitalization_id"]]
+    n_total = len(hosp_all)
+    filter_s3.append({"step": "Total hospitalizations in CLIF site", "n_hospitalizations": n_total})
+    filter_rhee.append({"step": "Total hospitalizations in CLIF site", "n_hospitalizations": n_total})
+    print(f"  {n_total:,} total hospitalizations")
+
+    print(f"\nStep 1: All NE starts (≥{MIN_NE_RECORDS} records, t=0 anchor)...")
+    ne_df = get_all_ne_starts(clif_dir)
+    for fl in [filter_s3, filter_rhee]:
+        fl.append({"step": f"NE started (>={MIN_NE_RECORDS} records)", "n_hospitalizations": len(ne_df)})
+    print(f"  {len(ne_df):,} patients with NE")
+
+    print("\nStep 2: Mortality/discharge info...")
+    mortality = get_mortality(clif_dir)
+
+    print("\nStep 3a: Sepsis-3 (CMS) criteria within ±24 h of NE start...")
+    print("         [abx + blood culture within 24 h + lactate > 2 mmol/L]")
+    sepsis3_df = identify_sepsis3_cohort(clif_dir, ne_df, window_hours=24)
+    filter_s3.append({
+        "step": "Sepsis-3 (CMS): abx + culture within 24 h + lactate > 2 (within ±24 h of NE start)",
+        "n_hospitalizations": len(sepsis3_df),
     })
-    print("  Excluding patients on vasopressin in 24h before trajectory start...")
-    cohort = cohort[cohort["vaso_before_traj"] == 0].copy()
-    filter_log.append({
-        "step": "Final cohort after excluding pre-trajectory vasopressin",
-        "n_hospitalizations": len(cohort),
-    })
-    print(f"  {len(cohort):,} remaining after exclusion")
+    print(f"  {len(sepsis3_df):,} meet Sepsis-3 (CMS) criteria")
 
-    return cohort, co, filter_log, suspected_nonicu
+    print("\nStep 3b: Rhee/CDC ASE criteria within ±24 h of NE start...")
+    print("         [blood culture + ≥4 consecutive antibiotic days + lactate >= 2 mmol/L]")
+    rhee_df = identify_rhee_cohort(clif_dir, ne_df, mortality, window_hours=24)
+    filter_rhee.append({
+        "step": "Rhee/CDC ASE: blood culture + ≥4 consecutive abx days (within ±24 h of NE start)",
+        "n_hospitalizations": len(rhee_df),
+    })
+    print(f"  {len(rhee_df):,} meet Rhee/CDC ASE criteria")
+
+    union_ids = (set(sepsis3_df["hospitalization_id"]) |
+                 set(rhee_df["hospitalization_id"]))
+    ne_union = ne_df[ne_df["hospitalization_id"].isin(union_ids)].copy()
+    print(f"\n  Union: {len(ne_union):,} unique patients in either cohort")
+
+    print("\nStep 4: ICU times...")
+    icu = get_icu_times(clif_dir)
+
+    print("\nStep 5: Assembling cohort DataFrames with trajectory bounds...")
+    cohort_s3   = _assemble_cohort_df(sepsis3_df, ne_union, icu, mortality)
+    cohort_rhee = _assemble_cohort_df(rhee_df,   ne_union, icu, mortality)
+
+    print("\nStep 6: SOFA at NE start (union cohort via clifpy)...")
+    sofa_df = compute_sofa_at_ne_start(ne_union, co)
+    sofa_map = sofa_df.set_index("hospitalization_id")["sepsis_onset_sofa"]
+    cohort_s3["sepsis_onset_sofa"]   = cohort_s3["stay_id"].map(sofa_map)
+    cohort_rhee["sepsis_onset_sofa"] = cohort_rhee["stay_id"].map(sofa_map)
+
+    print("\nStep 7: Initial lactate within ±24 h of NE start...")
+    # Sepsis-3 initial_lactate already computed in identify_sepsis3_cohort
+    lac_s3_map = sepsis3_df.set_index("hospitalization_id")["initial_lactate"]
+    cohort_s3["initial_lactate"] = cohort_s3["stay_id"].map(lac_s3_map)
+
+    # Rhee: first lactate within ±24 h of NE start; must be >= LACTATE_THRESHOLD
+    labs = pd.read_parquet(clif_dir / "clif_labs.parquet")
+    lac_df = labs[labs["lab_category"] == "lactate"][
+        ["hospitalization_id", "lab_result_dttm", "lab_value_numeric"]
+    ].copy()
+    lac_df["lab_result_dttm"] = to_naive_utc(lac_df["lab_result_dttm"])
+    rhee_ids = set(cohort_rhee["stay_id"])
+    ne_win = ne_union[ne_union["hospitalization_id"].isin(rhee_ids)].copy()
+    ne_win["t0"] = to_naive_utc(pd.to_datetime(ne_win["first_norepi_time"], utc=True))
+    ne_win["win_start"] = ne_win["t0"] - pd.Timedelta(hours=24)
+    ne_win["win_end"]   = ne_win["t0"] + pd.Timedelta(hours=24)
+    lac_rhee = lac_df.merge(
+        ne_win[["hospitalization_id", "win_start", "win_end"]], on="hospitalization_id"
+    )
+    lac_rhee = lac_rhee[
+        (lac_rhee["lab_result_dttm"] >= lac_rhee["win_start"]) &
+        (lac_rhee["lab_result_dttm"] <= lac_rhee["win_end"]) &
+        lac_rhee["lab_value_numeric"].notna()
+    ]
+    rhee_lac = (lac_rhee.sort_values("lab_result_dttm")
+                .groupby("hospitalization_id")["lab_value_numeric"]
+                .first()
+                .reset_index()
+                .rename(columns={"lab_value_numeric": "initial_lactate",
+                                 "hospitalization_id": "stay_id"}))
+    cohort_rhee = cohort_rhee.merge(rhee_lac, on="stay_id", how="left")
+
+    n_before_lac = len(cohort_rhee)
+    cohort_rhee = cohort_rhee[cohort_rhee["initial_lactate"] >= LACTATE_THRESHOLD].copy()
+    filter_rhee.append({
+        "step": f"Lactate < {LACTATE_THRESHOLD} or missing (within ±24 h of NE start) (excluded)",
+        "n_hospitalizations": n_before_lac - len(cohort_rhee),
+    })
+    print(f"  {len(cohort_rhee):,} meet Rhee/CDC ASE + lactate >= {LACTATE_THRESHOLD} criteria")
+
+    print("\nStep 8: Demographics, weight, vasopressin pre-trajectory, location, CCI...")
+    all_stay_ids = set(cohort_s3["stay_id"]) | set(cohort_rhee["stay_id"])
+    union_for_shared = (pd.concat([
+        cohort_s3[["stay_id", "trajectory_start", "trajectory_end"]],
+        cohort_rhee[["stay_id", "trajectory_start", "trajectory_end"]],
+    ]).drop_duplicates(subset=["stay_id"]))
+
+    demo = get_demographics(clif_dir, all_stay_ids)
+    weight_df = get_weight_at_onset(clif_dir, union_for_shared)
+    vaso_pre = get_vaso_pretraj(clif_dir, union_for_shared)
+    cci_df = get_cci(clif_dir, all_stay_ids)
+
+    for cohort in [cohort_s3, cohort_rhee]:
+        cohort.merge(demo, on="stay_id", how="left")  # don't reassign yet; done below
+    cohort_s3   = cohort_s3.merge(demo, on="stay_id", how="left")
+    cohort_s3   = cohort_s3.merge(weight_df, on="stay_id", how="left")
+    cohort_s3   = cohort_s3.merge(vaso_pre, on="stay_id", how="left")
+    cohort_s3   = cohort_s3.merge(cci_df, on="stay_id", how="left")
+    cohort_rhee = cohort_rhee.merge(demo, on="stay_id", how="left")
+    cohort_rhee = cohort_rhee.merge(weight_df, on="stay_id", how="left")
+    cohort_rhee = cohort_rhee.merge(vaso_pre, on="stay_id", how="left")
+    cohort_rhee = cohort_rhee.merge(cci_df, on="stay_id", how="left")
+
+    for cohort in [cohort_s3, cohort_rhee]:
+        cohort["vaso_before_traj"] = cohort["vaso_before_traj"].fillna(0).astype(int)
+
+    print("\nStep 9: Excluding patients with vasopressin before trajectory start...")
+    for fl, cohort in [(filter_s3, cohort_s3), (filter_rhee, cohort_rhee)]:
+        n_excl = int((cohort["vaso_before_traj"] == 1).sum())
+        fl.append({"step": "Vasopressin in 24 h before trajectory start (excluded)",
+                   "n_hospitalizations": n_excl})
+
+    cohort_s3   = cohort_s3[cohort_s3["vaso_before_traj"] == 0].copy()
+    cohort_rhee = cohort_rhee[cohort_rhee["vaso_before_traj"] == 0].copy()
+
+    print("\nStep 10: Location at t=0 (ADT row active at NE start)...")
+    union_for_loc = (pd.concat([
+        cohort_s3[["stay_id", "first_norepi_time"]],
+        cohort_rhee[["stay_id", "first_norepi_time"]],
+    ]).drop_duplicates(subset=["stay_id"]))
+    loc_t0 = get_location_at_t0(clif_dir, union_for_loc)
+
+    cohort_s3   = cohort_s3.drop(columns=_LOC_T0_OPTIONAL_COLS, errors="ignore")
+    cohort_s3   = cohort_s3.merge(loc_t0, on="stay_id", how="left")
+    cohort_rhee = cohort_rhee.drop(columns=_LOC_T0_OPTIONAL_COLS, errors="ignore")
+    cohort_rhee = cohort_rhee.merge(loc_t0, on="stay_id", how="left")
+
+    print("\nStep 11: Excluding patients in OR/procedural areas at NE start...")
+    _OR_CATS = frozenset({"or", "procedure_room", "procedural", "pacu", "operating_room"})
+    for _lbl, _fl, _c in [("Sepsis-3", filter_s3, cohort_s3),
+                           ("Rhee",     filter_rhee, cohort_rhee)]:
+        _loc = _c["location_category"].fillna("").str.lower().str.strip()
+        _n   = int(_loc.isin(_OR_CATS).sum())
+        _fl.append({"step": "Location at t=0 = OR/procedural/PACU (excluded)",
+                    "n_hospitalizations": _n})
+        print(f"  {_lbl}: excluding {_n} patients in OR/procedural/PACU at t=0")
+    cohort_s3   = cohort_s3[
+        ~cohort_s3["location_category"].fillna("").str.lower().str.strip().isin(_OR_CATS)
+    ].copy()
+    cohort_rhee = cohort_rhee[
+        ~cohort_rhee["location_category"].fillna("").str.lower().str.strip().isin(_OR_CATS)
+    ].copy()
+
+    filter_s3.append({"step": "Final Sepsis-3 cohort", "n_hospitalizations": len(cohort_s3)})
+    filter_rhee.append({"step": "Final Rhee cohort",    "n_hospitalizations": len(cohort_rhee)})
+    print(f"  Sepsis-3 final: {len(cohort_s3):,} | Rhee final: {len(cohort_rhee):,}")
+
+    return cohort_s3, cohort_rhee, filter_s3, filter_rhee
 
 
 # ---------------------------------------------------------------------------
 # Phase B: Hourly feature extraction
+# (Functions below are unchanged from original — NE-first t=0 anchor means
+#  trajectory_start = first_norepi_time for all cohort patients.)
 # ---------------------------------------------------------------------------
 def build_hourly_grid(cohort: pd.DataFrame) -> pd.DataFrame:
     """Build per-patient hourly rows. All timestamps are tz-naive UTC."""
@@ -658,7 +975,6 @@ def add_rrt(grid: pd.DataFrame, clif_dir: Path) -> pd.DataFrame:
     rrt_all = pd.read_parquet(clif_dir / "clif_crrt_therapy.parquet")[
         ["hospitalization_id", "recorded_dttm"]
     ].copy()
-
     rrt_all = rrt_all.rename(columns={"hospitalization_id": "stay_id"})
     rrt_all["recorded_dttm"] = to_naive_utc(rrt_all["recorded_dttm"])
 
@@ -697,8 +1013,6 @@ def add_steroids(grid: pd.DataFrame, clif_dir: Path) -> pd.DataFrame:
     grid = grid.merge(st_hr[["stay_id", "time_hour", "_given"]],
                       on=["stay_id", "time_hour"], how="left")
     grid["_given"] = grid["_given"].fillna(0).astype(int)
-
-    # steroid = 1 if given this epoch OR the immediately preceding epoch
     grid["steroid"] = (
         (grid["_given"] | grid.groupby("stay_id")["_given"].shift(1, fill_value=0))
         .astype(int)
@@ -708,26 +1022,21 @@ def add_steroids(grid: pd.DataFrame, clif_dir: Path) -> pd.DataFrame:
 
 
 def add_vitals(grid: pd.DataFrame, clif_dir: Path) -> pd.DataFrame:
-    """Add heart_rate, spo2, temperature (last value within each hour window).
-
-    Avoids a full cartesian merge by binning each vital observation to its
-    trajectory hour before joining on (stay_id, time_hour).
-    """
     vitals = pd.read_parquet(clif_dir / "clif_vitals.parquet")
-    target = vitals[vitals["vital_category"].isin(["heart_rate", "spo2", "temp_c"])][
+    target = vitals[vitals["vital_category"].isin(
+        ["heart_rate", "spo2", "temp_c", "respiratory_rate"]
+    )][
         ["hospitalization_id", "recorded_dttm", "vital_category", "vital_value"]
     ].copy()
     target = target.rename(columns={"hospitalization_id": "stay_id"})
     target["recorded_dttm"] = to_naive_utc(target["recorded_dttm"])
-    target = target.dropna(subset=["recorded_dttm"])  # NaT timestamps can't convert to hour offset
+    target = target.dropna(subset=["recorded_dttm"])
 
-    # trajectory_start for each patient = start_time at time_hour == 0
     traj_start = (grid[grid["time_hour"] == 0][["stay_id", "start_time"]]
                   .rename(columns={"start_time": "traj_start"}))
     target = target.merge(traj_start, on="stay_id", how="inner")
     target["time_hour"] = ((target["recorded_dttm"] - target["traj_start"])
                            .dt.total_seconds() / 3600).astype(int)
-    # Keep only records inside the trajectory window
     max_hour = grid.groupby("stay_id")["time_hour"].max().rename("max_hour")
     target = target.merge(max_hour, on="stay_id", how="inner")
     target = target[(target["time_hour"] >= 0) & (target["time_hour"] <= target["max_hour"])]
@@ -745,8 +1054,6 @@ def add_vitals(grid: pd.DataFrame, clif_dir: Path) -> pd.DataFrame:
     return grid
 
 
-# NEE conversion factors (mcg/kg/min scale; vasopressin handled separately)
-# Formula: NE + Epi + Phe/10 + Dopa/100 + AngII*10 + Vaso*2.5 (U/min)
 _NEE_FACTORS_MCG = {
     "norepinephrine": 1.0,
     "epinephrine":    1.0,
@@ -754,10 +1061,8 @@ _NEE_FACTORS_MCG = {
     "dopamine":       0.01,
     "angiotensin ii": 10.0,
 }
-# Vasopressin: 2.5 mcg/kg/min NE equiv per U/min
 _VASO_FACTOR_U_MIN = 2.5
 _ASSUMED_WEIGHT_KG = 70.0
-
 
 _PREFERRED_UNITS_CONT = {
     "norepinephrine": "mcg/kg/min",
@@ -771,19 +1076,46 @@ _PREFERRED_UNITS_CONT = {
 
 
 def _load_and_convert_meds(co: ClifOrchestrator, stay_ids: list) -> pd.DataFrame:
-    """Load continuous meds via clifpy and convert to preferred clinical units.
-
-    Uses clifpy's unit converter so weight-based conversions (e.g. mcg/min →
-    mcg/kg/min) draw patient weight from the vitals table automatically.
-    Returns a df with admin_dttm as tz-naive UTC and stay_id replacing
-    hospitalization_id.  Only rows with _convert_status == 'success' have
-    a valid med_dose_converted; others should be filtered out by callers.
-    """
     co.load_table("medication_admin_continuous", filters={"hospitalization_id": stay_ids})
     co.load_table("vitals", filters={
         "hospitalization_id": stay_ids,
         "vital_category": ["weight_kg"],
     })
+
+    if co.vitals is not None and co.vitals.df is not None:
+        w_df = (
+            co.vitals.df[co.vitals.df["vital_category"] == "weight_kg"]
+            [["hospitalization_id", "recorded_dttm", "vital_value"]]
+            .dropna(subset=["vital_value"])
+            .rename(columns={"vital_value": "weight_kg"})
+            .sort_values("recorded_dttm")
+        )
+        if not w_df.empty:
+            med_df = co.medication_admin_continuous.df.copy().sort_values("admin_dttm")
+            med_keys = med_df[["hospitalization_id", "admin_dttm"]].drop_duplicates()
+
+            wt_bwd = pd.merge_asof(
+                med_keys, w_df,
+                left_on="admin_dttm", right_on="recorded_dttm",
+                by="hospitalization_id", direction="backward",
+            )[["hospitalization_id", "admin_dttm", "weight_kg"]]
+
+            wt_fwd = pd.merge_asof(
+                med_keys, w_df,
+                left_on="admin_dttm", right_on="recorded_dttm",
+                by="hospitalization_id", direction="forward",
+            )[["hospitalization_id", "admin_dttm", "weight_kg"]].rename(
+                columns={"weight_kg": "_wt_fwd"}
+            )
+
+            wt = wt_bwd.merge(wt_fwd, on=["hospitalization_id", "admin_dttm"])
+            wt["weight_kg"] = wt["weight_kg"].fillna(wt["_wt_fwd"])
+            wt = wt[["hospitalization_id", "admin_dttm", "weight_kg"]]
+
+            co.medication_admin_continuous.df = med_df.merge(
+                wt, on=["hospitalization_id", "admin_dttm"], how="left"
+            )
+
     co.convert_dose_units_for_continuous_meds(
         preferred_units=_PREFERRED_UNITS_CONT,
         save_to_table=True,
@@ -796,19 +1128,14 @@ def _load_and_convert_meds(co: ClifOrchestrator, stay_ids: list) -> pd.DataFrame
 
 
 def add_nee(grid: pd.DataFrame, meds: pd.DataFrame) -> pd.DataFrame:
-    """Norepinephrine equivalent dose (mcg/kg/min):
-    NE + Epi + Phe/10 + Dopa/100 + AngII×10 + Vaso×2.5(U/min).
-    """
     converted = meds[meds["_convert_status"] == "success"].copy()
 
-    # ── Catecholamines + angiotensin II ─────────────────────────
     cath = converted[
         converted["med_category"].isin(_NEE_FACTORS_MCG) &
         converted["med_dose_converted"].notna()
     ][["stay_id", "admin_dttm", "med_category", "med_dose_converted"]].copy()
     cath["nee_contrib"] = cath["med_dose_converted"] * cath["med_category"].map(_NEE_FACTORS_MCG)
 
-    # ── Vasopressin (U/min → NEE via _VASO_FACTOR_U_MIN) ─────────────────────
     vaso_cats = {"vasopressin", "vasopressine", "terlipressin"}
     vaso = converted[
         converted["med_category"].str.lower().isin(vaso_cats) &
@@ -817,7 +1144,6 @@ def add_nee(grid: pd.DataFrame, meds: pd.DataFrame) -> pd.DataFrame:
     vaso["nee_contrib"] = vaso["med_dose_converted"] * _VASO_FACTOR_U_MIN
     vaso["med_category"] = "vasopressin"
 
-    # ── Combine, expand to intervals, and aggregate ───────────────────────────
     contrib = pd.concat([
         cath[["stay_id", "admin_dttm", "med_category", "nee_contrib"]],
         vaso[["stay_id", "admin_dttm", "med_category", "nee_contrib"]],
@@ -826,7 +1152,9 @@ def add_nee(grid: pd.DataFrame, meds: pd.DataFrame) -> pd.DataFrame:
     contrib["end_dttm"] = (contrib.groupby(["stay_id", "med_category"])["admin_dttm"]
                                    .shift(-1)
                                    .fillna(pd.Timestamp("2100-01-01")))
-    contrib.loc[contrib["nee_contrib"] == 0.0, "end_dttm"] = contrib.loc[contrib["nee_contrib"] == 0.0, "admin_dttm"]
+    contrib.loc[contrib["nee_contrib"] == 0.0, "end_dttm"] = (
+        contrib.loc[contrib["nee_contrib"] == 0.0, "admin_dttm"]
+    )
 
     g = grid[["stay_id", "time_hour", "start_time", "end_time"]]
     c_g = contrib.merge(g, on="stay_id")
@@ -840,16 +1168,10 @@ def add_nee(grid: pd.DataFrame, meds: pd.DataFrame) -> pd.DataFrame:
     return grid
 
 
-# NEE component drugs pulled as individual dose columns (mcg/kg/min each)
 _NEE_COMPONENT_CATS = ["epinephrine", "phenylephrine", "dopamine", "angiotensin ii"]
 
 
 def add_nee_components(grid: pd.DataFrame, meds: pd.DataFrame) -> pd.DataFrame:
-    """Add per-hour mean dose columns for each NEE component drug (mcg/kg/min).
-
-    Columns added: epinephrine, phenylephrine, dopamine.
-    Norepinephrine and vasopressin are already extracted by add_ne_dose/add_vaso_dose.
-    """
     converted = meds[meds["_convert_status"] == "success"].copy()
     g = grid[["stay_id", "time_hour", "start_time", "end_time"]]
 
@@ -885,15 +1207,15 @@ def add_nee_components(grid: pd.DataFrame, meds: pd.DataFrame) -> pd.DataFrame:
 
 def add_labs(grid: pd.DataFrame, clif_dir: Path) -> pd.DataFrame:
     labs = pd.read_parquet(clif_dir / "clif_labs.parquet")
-    target = labs[labs["lab_category"].isin(["bun", "creatinine", "lactate", "wbc", "platelet_count"])][
-        ["hospitalization_id", "lab_result_dttm", "lab_category", "lab_value_numeric"]
-    ].copy()
+    target = labs[labs["lab_category"].isin(
+        ["bun", "creatinine", "lactate", "wbc", "platelet_count",
+         "hemoglobin", "bilirubin_total", "po2_arterial"]
+    )][["hospitalization_id", "lab_result_dttm", "lab_category", "lab_value_numeric"]].copy()
     target = target.rename(columns={"hospitalization_id": "stay_id"})
     target["lab_result_dttm"] = to_naive_utc(target["lab_result_dttm"])
 
     g = grid[["stay_id", "time_hour", "end_time"]]
     lab_g = target.merge(g, on="stay_id")
-    # Last observed value up to end of each hour (LOCF basis)
     lab_win = lab_g[lab_g["lab_result_dttm"] < lab_g["end_time"]]
     lab_last = (lab_win.sort_values("lab_result_dttm")
                 .groupby(["stay_id", "time_hour", "lab_category"])["lab_value_numeric"]
@@ -903,14 +1225,15 @@ def add_labs(grid: pd.DataFrame, clif_dir: Path) -> pd.DataFrame:
                                      values="lab_value_numeric")
                 .reset_index())
     lab_wide.columns.name = None
-    if "platelet_count" in lab_wide.columns:
-        lab_wide = lab_wide.rename(columns={"platelet_count": "platelet"})
+    lab_wide = lab_wide.rename(columns={
+        "platelet_count": "platelet",
+        "bilirubin_total": "bilirubin",
+    })
     grid = grid.merge(lab_wide, on=["stay_id", "time_hour"], how="left")
     return grid
 
 
 def add_gcs(grid: pd.DataFrame, clif_dir: Path) -> pd.DataFrame:
-    """GCS total (last observed up to end of each hour) from patient_assessments."""
     pa_path = clif_dir / "clif_patient_assessments.parquet"
     if not pa_path.exists():
         grid["gcs"] = np.nan
@@ -933,22 +1256,48 @@ def add_gcs(grid: pd.DataFrame, clif_dir: Path) -> pd.DataFrame:
     return grid
 
 
-def add_fluids(grid: pd.DataFrame, clif_dir: Path, cohort: pd.DataFrame) -> pd.DataFrame:
-    """Total fluid volume (mL) delivered per clock hour.
+# Canonical respiratory device categories (SOFA-respiratory axis), Room Air
+# is the reference/no-support level for the regression covariate.
+_DEVICE_CATEGORIES = list(DEVICE_RANK_DICT.keys())
 
-    Source: clif_medication_admin_continuous where med_group == 'fluids_electrolytes'.
-    Only mL-based units are converted to volume; mEq units are excluded (no concentration).
-      mL/hr    → volume = rate × overlap_hours
-      mL/kg/hr → volume = rate × weight_kg × overlap_hours (cohort weight; 70 kg fallback)
-    Multiple concurrent fluids sum independently.
-    Carry-forward: each dose runs until the next record for that (patient, med_category).
-    Stop signal: mar_action_category == 'stop' OR dose == 0.
-    end_dttm is computed over ALL records (including null-dose stops) so stop events
-    correctly terminate the preceding infusion even when dose is null.
-    """
+
+def add_resp_support(grid: pd.DataFrame, clif_dir: Path) -> pd.DataFrame:
+    """Hourly device_category + fio2_set (last observed within the hour,
+    then forward-filled per stay_id — these are persistent device/ventilator
+    settings, not one-off measurements, so LOCF avoids dropping hours where
+    nothing was re-documented)."""
+    resp_path = clif_dir / "clif_respiratory_support.parquet"
+    if not resp_path.exists():
+        grid["device_category"] = np.nan
+        grid["fio2_set"] = np.nan
+        return grid
+
+    resp = pd.read_parquet(resp_path)[
+        ["hospitalization_id", "recorded_dttm", "device_category", "fio2_set"]
+    ].copy()
+    resp = resp.rename(columns={"hospitalization_id": "stay_id"})
+    resp["recorded_dttm"] = to_naive_utc(resp["recorded_dttm"])
+    resp["device_category"] = (
+        resp["device_category"].where(resp["device_category"].isin(_DEVICE_CATEGORIES))
+    )
+
+    g = grid[["stay_id", "time_hour", "end_time"]]
+    resp_g = resp.merge(g, on="stay_id")
+    resp_win = resp_g[resp_g["recorded_dttm"] < resp_g["end_time"]]
+    resp_last = (resp_win.sort_values("recorded_dttm")
+                 .groupby(["stay_id", "time_hour"])[["device_category", "fio2_set"]]
+                 .last().reset_index())
+    grid = grid.merge(resp_last, on=["stay_id", "time_hour"], how="left")
+
+    grid = grid.sort_values(["stay_id", "time_hour"])
+    grid["device_category"] = grid.groupby("stay_id")["device_category"].ffill()
+    grid["fio2_set"] = grid.groupby("stay_id")["fio2_set"].ffill()
+    return grid
+
+
+def add_fluids(grid: pd.DataFrame, clif_dir: Path, cohort: pd.DataFrame) -> pd.DataFrame:
     meds = pd.read_parquet(clif_dir / "clif_medication_admin_continuous.parquet")
 
-    # All fluids_electrolytes records — needed to compute correct end_dttm via shift(-1)
     all_fl = meds[meds["med_group"] == "fluids_electrolytes"][
         ["hospitalization_id", "admin_dttm", "med_category",
          "med_dose", "med_dose_unit", "mar_action_category"]
@@ -957,19 +1306,16 @@ def add_fluids(grid: pd.DataFrame, clif_dir: Path, cohort: pd.DataFrame) -> pd.D
     all_fl["admin_dttm"] = to_naive_utc(all_fl["admin_dttm"])
     all_fl = all_fl.sort_values(["stay_id", "med_category", "admin_dttm"])
 
-    # end_dttm = next record's admin_dttm within the same (patient, fluid type)
     all_fl["end_dttm"] = (
         all_fl.groupby(["stay_id", "med_category"])["admin_dttm"]
         .shift(-1)
         .fillna(pd.Timestamp("2100-01-01"))
     )
 
-    # Terminate at stop records (mar_action_category == 'stop' or dose == 0)
     action_lo = all_fl["mar_action_category"].str.lower().fillna("").str.strip()
     is_stop = (action_lo == "stop") | (all_fl["med_dose"].fillna(-1) == 0.0)
     all_fl.loc[is_stop, "end_dttm"] = all_fl.loc[is_stop, "admin_dttm"]
 
-    # Keep only valid dose records for volume calculation
     unit_norm = all_fl["med_dose_unit"].str.lower().str.strip()
     fluids = all_fl[
         all_fl["med_dose"].notna() &
@@ -977,7 +1323,6 @@ def add_fluids(grid: pd.DataFrame, clif_dir: Path, cohort: pd.DataFrame) -> pd.D
         ~is_stop
     ].copy()
 
-    # Resolve mL/kg/hr → mL/hr using cohort weight (70 kg if missing)
     weight_map = cohort.set_index("stay_id")["weight"].fillna(_ASSUMED_WEIGHT_KG)
     fluids["weight_kg"] = fluids["stay_id"].map(weight_map).fillna(_ASSUMED_WEIGHT_KG)
     per_kg = fluids["med_dose_unit"].str.lower().str.strip() == "ml/kg/hr"
@@ -1006,9 +1351,7 @@ def add_fluids(grid: pd.DataFrame, clif_dir: Path, cohort: pd.DataFrame) -> pd.D
 
 
 def add_explicitly_stopped(grid: pd.DataFrame, clif_dir: Path) -> pd.DataFrame:
-    """Detect explicit NE/vasopressin cessation events from mar_action_name or dose=0."""
-    meds_path = clif_dir / "clif_medication_admin_continuous.parquet"
-    meds = pd.read_parquet(meds_path)[
+    meds = pd.read_parquet(clif_dir / "clif_medication_admin_continuous.parquet")[
         ["hospitalization_id", "admin_dttm", "med_category", "med_dose", "mar_action_name"]
     ].copy()
     meds = meds.rename(columns={"hospitalization_id": "stay_id"})
@@ -1042,13 +1385,6 @@ def add_explicitly_stopped(grid: pd.DataFrame, clif_dir: Path) -> pd.DataFrame:
 
 
 def add_mar_actions(grid: pd.DataFrame, clif_dir: Path) -> pd.DataFrame:
-    """Last mar_action_group per hour for NE and vasopressin.
-
-    Columns: ne_mar_action, vaso_mar_action (str, NaN if no record that hour).
-    Lets downstream code distinguish true absence of dose records from
-    held/stopped/running entries — important for detecting gaps in continuous meds.
-    Falls back to mar_action_name if mar_action_group is not present.
-    """
     meds = pd.read_parquet(clif_dir / "clif_medication_admin_continuous.parquet")
 
     action_col = next(
@@ -1089,10 +1425,8 @@ def add_mar_actions(grid: pd.DataFrame, clif_dir: Path) -> pd.DataFrame:
 
 
 def add_hourly_sofa(grid: pd.DataFrame, co: ClifOrchestrator) -> pd.DataFrame:
-    """Compute SOFA per patient using clifpy, broadcast to all patient-hours."""
     cohort_ids = grid["stay_id"].unique().tolist()
 
-    # Build one row per patient covering their full trajectory window
     traj = (grid.groupby("stay_id")
             .agg(start_time=("start_time", "min"), end_time=("end_time", "max"))
             .reset_index()
@@ -1122,9 +1456,6 @@ def add_hourly_sofa(grid: pd.DataFrame, co: ClifOrchestrator) -> pd.DataFrame:
     return grid
 
 
-# ---------------------------------------------------------------------------
-# Phase B: Assemble full feature table
-# ---------------------------------------------------------------------------
 def build_features(cohort: pd.DataFrame, co: ClifOrchestrator, clif_dir: Path) -> pd.DataFrame:
     print("\nBuilding hourly grid...")
     grid = build_hourly_grid(cohort)
@@ -1151,7 +1482,7 @@ def build_features(cohort: pd.DataFrame, co: ClifOrchestrator, clif_dir: Path) -
     print("Adding steroids...")
     grid = add_steroids(grid, clif_dir)
 
-    print("Adding vitals (heart rate, SpO2, temperature)...")
+    print("Adding vitals (heart rate, SpO2, temperature, respiratory rate)...")
     grid = add_vitals(grid, clif_dir)
 
     print("Adding NEE (norepinephrine equivalent dose)...")
@@ -1160,11 +1491,19 @@ def build_features(cohort: pd.DataFrame, co: ClifOrchestrator, clif_dir: Path) -
     print("Adding NEE component doses (epinephrine, phenylephrine, dopamine)...")
     grid = add_nee_components(grid, meds)
 
-    print("Adding labs (BUN, creatinine, lactate)...")
+    print("Adding labs (BUN, creatinine, lactate, WBC, platelet, hemoglobin, bilirubin)...")
     grid = add_labs(grid, clif_dir)
 
     print("Adding GCS (last observed per hour)...")
     grid = add_gcs(grid, clif_dir)
+
+    print("Adding respiratory support (device_category, FiO2)...")
+    grid = add_resp_support(grid, clif_dir)
+    po2_ok  = grid["po2_arterial"].between(0, 700)
+    fio2_ok = grid["fio2_set"].between(0.21, 1.0)
+    grid["p_f_ratio"] = np.where(
+        po2_ok & fio2_ok, grid["po2_arterial"] / grid["fio2_set"], np.nan
+    )
 
     print("Adding explicit cessation flags (NE/vasopressin stopped events)...")
     grid = add_explicitly_stopped(grid, clif_dir)
@@ -1178,13 +1517,9 @@ def build_features(cohort: pd.DataFrame, co: ClifOrchestrator, clif_dir: Path) -
     print("Adding fluids (mL/hr × overlap hours from fluids_electrolytes meds)...")
     grid = add_fluids(grid, clif_dir, cohort)
 
-    # Unavailable in CLIF 2.1.0 — zero-fill
     grid["urine_output"] = 0.0
-
-    # action_vaso: vasopressin > 0 at this hour (mirrors MIMIC SQL vaso_hourly.action_vaso)
     grid["action_vaso"] = (grid["vaso_dose"] > 0).astype(int)
 
-    # death: 1 only at the epoch during which the patient died
     grid = grid.merge(cohort[["stay_id", "death_hour"]], on="stay_id", how="left")
     grid["death"] = (grid["time_hour"] == grid["death_hour"]).astype(int)
     grid = grid.drop(columns=["death_hour"])
@@ -1198,6 +1533,17 @@ def build_features(cohort: pd.DataFrame, co: ClifOrchestrator, clif_dir: Path) -
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
+_COHORT_COLS = [
+    "stay_id", "hospital_death", "anchor_year_group",
+    "traj_hours", "death_hour", "first_norepi_time", "trajectory_start",
+    "age", "gender", "race", "weight",
+    "sepsis_onset_sofa", "initial_lactate", "cci_score",
+    "vaso_before_traj", "location_category", "location_type",
+    "hospital_id", "hospital_type",
+    "icu_los_days", "hospital_los_days", "traj_end_reason",
+]
+
+
 def main():
     PATIENT_LEVEL_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -1211,60 +1557,57 @@ def main():
     print("=" * 60)
     print("PHASE A: COHORT IDENTIFICATION")
     print("=" * 60)
-    cohort, co, filter_log, suspected_nonicu = build_cohort(CLIF_DIR, co)
+    cohort_s3, cohort_rhee, filter_s3, filter_rhee = build_cohort(CLIF_DIR, co)
 
-    print(f"\nFinal ICU cohort: {len(cohort):,} patients")
-    print(f"  Mortality:        {cohort['hospital_death'].mean():.1%}")
-    print(f"  Median traj_hours: {cohort['traj_hours'].median():.0f}h")
+    print(f"\nSepsis-3 cohort: {len(cohort_s3):,} patients  "
+          f"(mortality {cohort_s3['hospital_death'].mean():.1%})")
+    print(f"Rhee cohort:     {len(cohort_rhee):,} patients  "
+          f"(mortality {cohort_rhee['hospital_death'].mean():.1%})")
 
-    # location_category is always "icu" for this cohort; location_type varies
-    cohort_out = cohort[[
-        "stay_id", "hospital_death", "anchor_year_group",
-        "traj_hours", "death_hour", "first_norepi_time", "trajectory_start",
-        "age", "gender", "race", "weight",
-        "sepsis_onset_sofa", "initial_lactate",
-        "vaso_before_traj", "location_type",
-    ]].copy()
-    cohort_out["location_category"] = "icu"
-    cohort_path = PATIENT_LEVEL_DIR / "cohort.parquet"
-    cohort_out.to_parquet(cohort_path, index=False)
-    print(f"Saved {cohort_path}")
-
-    filter_csv = PATIENT_LEVEL_DIR / "cohort_filter_counts.csv"
-    pd.DataFrame(filter_log).to_csv(filter_csv, index=False)
-    print(f"Saved {filter_csv}")
-
-    # Non-ICU cohort: save minimal info for exploratory use
-    if suspected_nonicu is not None and len(suspected_nonicu) > 0:
-        print(f"\nNon-ICU patients meeting infection + location within 24h: "
-              f"{len(suspected_nonicu):,}")
-        nonicu_out = suspected_nonicu[[
-            "hospitalization_id",
-            "location_category", "location_type",
-            "presumed_infection_dttm", "first_loc_intime",
-        ]].rename(columns={"hospitalization_id": "stay_id"})
-        nonicu_path = PATIENT_LEVEL_DIR / "cohort_nonicu_step2.parquet"
-        nonicu_out.to_parquet(nonicu_path, index=False)
-        print(f"Saved non-ICU step-2 candidates → {nonicu_path}")
-        print("  (NE/SOFA/lactate filters not yet applied to non-ICU cohort)")
+    pd.DataFrame(filter_s3).to_csv(
+        PATIENT_LEVEL_DIR / "cohort_filter_counts_sepsis3.csv", index=False
+    )
+    pd.DataFrame(filter_rhee).to_csv(
+        PATIENT_LEVEL_DIR / "cohort_filter_counts_rhee.csv", index=False
+    )
+    print("Saved filter count CSVs.")
 
     print("\n" + "=" * 60)
-    print("PHASE B: FEATURE EXTRACTION")
+    print("PHASE B: FEATURE EXTRACTION (union of both cohorts)")
     print("=" * 60)
-    features = build_features(cohort, co, CLIF_DIR)
 
-    print(f"\nFeatures summary:")
-    print(f"  Rows: {len(features):,}")
-    print(f"  NE>0 steps: {(features['norepinephrine'] > 0).mean():.1%}")
-    print(f"  MBP missing: {features['mbp'].isna().mean():.1%}")
-    print(f"  SOFA mean: {features['sofa'].mean():.1f}")
+    # Union cohort for features: one row per stay_id (prefer Sepsis-3 row where duplicated)
+    union_cohort = (pd.concat([cohort_s3, cohort_rhee])
+                    .drop_duplicates(subset=["stay_id"])
+                    .reset_index(drop=True))
 
+    features = build_features(union_cohort, co, CLIF_DIR)
+
+    # Validate: NE > 0 at t=0 for every patient
+    ne_at_t0 = features[features["time_hour"] == 0].set_index("stay_id")["norepinephrine"]
+    no_ne_ids = set(ne_at_t0[ne_at_t0 == 0].index)
+    if no_ne_ids:
+        print(f"\n  WARNING: {len(no_ne_ids)} patients have NE=0 at t=0 — excluded.")
+        features   = features[~features["stay_id"].isin(no_ne_ids)].copy()
+        cohort_s3  = cohort_s3[~cohort_s3["stay_id"].isin(no_ne_ids)].copy()
+        cohort_rhee = cohort_rhee[~cohort_rhee["stay_id"].isin(no_ne_ids)].copy()
+
+    print(f"\nFeatures: {len(features):,} rows | "
+          f"{features['stay_id'].nunique():,} patients")
+
+    # Save — select only the standard schema columns that exist
+    def _save_cohort(df, path):
+        cols = [c for c in _COHORT_COLS if c in df.columns]
+        df[cols].to_parquet(path, index=False)
+
+    _save_cohort(cohort_s3,   PATIENT_LEVEL_DIR / "cohort_sepsis3.parquet")
+    _save_cohort(cohort_rhee, PATIENT_LEVEL_DIR / "cohort_rhee.parquet")
     features.to_parquet(PATIENT_LEVEL_DIR / "features.parquet", index=False)
-    print(f"Saved {PATIENT_LEVEL_DIR / 'features.parquet'}")
 
-    print("\nDone. Patient-level outputs (local only) written to:")
-    print(f"  {PATIENT_LEVEL_DIR / 'cohort.parquet'}")
-    print(f"  {PATIENT_LEVEL_DIR / 'features.parquet'}")
+    print(f"\nOutputs written to {PATIENT_LEVEL_DIR}/")
+    print("  cohort_sepsis3.parquet")
+    print("  cohort_rhee.parquet")
+    print("  features.parquet  (union — filter to cohort IDs in downstream scripts)")
 
 
 if __name__ == "__main__":
