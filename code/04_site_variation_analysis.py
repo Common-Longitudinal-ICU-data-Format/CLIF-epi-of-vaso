@@ -141,6 +141,18 @@ _DEFAULT_COLORS = ["#4e79a7", "#e15759", "#59a14f", "#f28e2b", "#b07aa1", "#76b7
 MIN_ICU_N_PATIENTS = 30
 MIN_HOSPITAL_N_PATIENTS = 30
 
+# fit_site_logistic fits ~15 parameters (6 continuous SOFA-component covariates
+# + rrt + device dummies + 3 NEE-spline + 3 time-spline terms) with no
+# separation guard. A group with few vaso_on=1 hours (or a rare device
+# category) can hit quasi-complete separation, inflating the intercept SE
+# into the thousands — MIN_ICU_N_PATIENTS/MIN_HOSPITAL_N_PATIENTS only gate on
+# patient count, which doesn't catch this since event rate varies by group.
+# Group-level fits with an intercept SE at or above this threshold are kept in
+# the packet (for transparency) but excluded from DL pooling — same cutoff
+# already used in 06_cross_site_variation_analysis.py's intercept plots to
+# flag unusable points.
+MAX_STABLE_INTERCEPT_SE = 10.0
+
 # ICU-type canonicalization (same mapping used in 03_epi_analysis.py /
 # 06_cross_site_variation_analysis.py, kept in sync for consistent labels).
 _ICU_CANON = {
@@ -721,19 +733,26 @@ def fit_grouped_variance(
         try:
             group_models[grp] = fit_site_logistic(sub, cohort_label, f"{site}:{grp}")
             m = group_models[grp]
+            se = m["coefficients"]["intercept"]["se"]
+            m["stable"] = bool(se < MAX_STABLE_INTERCEPT_SE)
+            flag = "" if m["stable"] else "  [UNSTABLE — likely separation; excluded from DL pooling]"
             print(f"    [{grp}] n={m['n_patients']:,}  vaso_on={m['n_vaso_on']:,}  "
-                  f"α={m['coefficients']['intercept']['beta']:+.4f}")
+                  f"α={m['coefficients']['intercept']['beta']:+.4f} (SE={se:.3f}){flag}")
         except Exception as _e:
             print(f"    WARNING: model fit failed for {label} '{grp}': {_e}")
 
-    if len(group_models) < 2:
-        print(f"  <2 {label}s with >= {min_n} patients — skipping {label}-level variance.")
+    stable_models = {g: m for g, m in group_models.items() if m.get("stable", True)}
+    if len(stable_models) < 2:
+        print(f"  <2 stable {label}s with >= {min_n} patients — skipping {label}-level variance.")
         return {"group_column": group_col, "group_models": group_models}
 
-    alphas    = np.array([m["coefficients"]["intercept"]["beta"] for m in group_models.values()])
-    alpha_var = np.array([m["coefficients"]["intercept"]["se"]   for m in group_models.values()]) ** 2
+    alphas    = np.array([m["coefficients"]["intercept"]["beta"] for m in stable_models.values()])
+    alpha_var = np.array([m["coefficients"]["intercept"]["se"]   for m in stable_models.values()]) ** 2
     dl = _dl_pool(alphas, alpha_var)
 
+    n_excluded = len(group_models) - len(stable_models)
+    if n_excluded:
+        print(f"  {label.capitalize()}-level DL: excluded {n_excluded} unstable group(s) from pooling")
     print(f"  {label.capitalize()}-level DL: τ²={dl['tau2']:.4f}  ICC={dl['icc']:.3f}  "
           f"MOR={dl['mor']:.3f}  (k={dl['k']} {label}s)")
 
