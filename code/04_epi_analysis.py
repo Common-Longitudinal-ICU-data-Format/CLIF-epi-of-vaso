@@ -878,7 +878,8 @@ if _comp_avail and len(ever_vaso_ids) > 0:
             _MIN_CELL = 11  # suppress cells derived from fewer than this many patients/patient-hours
             _full_pre = _fv[_fv["rel_hour"] < 0]
             if len(_full_pre) > 0:
-                _n_drugs_per_pt = _full_pre.groupby("stay_id")[_comp_avail].apply(lambda d: (d > 0).any().sum())
+                _drug_used_per_pt = _full_pre.groupby("stay_id")[_comp_avail].apply(lambda d: (d > 0).any())
+                _n_drugs_per_pt = _drug_used_per_pt.sum(axis=1)
                 _n_pt = len(_n_drugs_per_pt)
                 _ok_n = _n_pt >= _MIN_CELL
                 pd.DataFrame([{
@@ -901,6 +902,28 @@ if _comp_avail and len(ever_vaso_ids) > 0:
                     })
                 pd.DataFrame(_count_rows).to_csv(OUT_DIR / "pressor_count_distribution.csv", index=False)
 
+                # ── Which non-NE drug(s) make up each pressor-count level ──────────
+                # e.g. of patients on exactly 2 pressors (NE + 1 other), what % had
+                # each specific other drug — marginal presence, so at k=2 the drugs'
+                # percentages are mutually exclusive (~sum to 100%), while at k>=3
+                # they overlap (a patient on 3 pressors counts toward 2 drugs' %).
+                _non_ne_drugs = [c for c in _comp_avail if c != "norepinephrine"]
+                _combo_rows = []
+                for _k in range(2, len(_comp_avail) + 1):
+                    _mask_k = _n_drugs_per_pt == _k
+                    _n_at_k = int(_mask_k.sum())
+                    if _n_at_k < _MIN_CELL:
+                        continue
+                    for _c in _non_ne_drugs:
+                        _n_with = int(_drug_used_per_pt.loc[_mask_k, _c].sum())
+                        _ok_combo = _n_with >= _MIN_CELL
+                        _combo_rows.append({
+                            "n_pressors": _k, "drug": _c, "n_total_at_k": _n_at_k,
+                            "n_with_drug": _n_with if _ok_combo else None,
+                            "pct": round(_n_with / _n_at_k * 100, 1) if _ok_combo else None,
+                        })
+                pd.DataFrame(_combo_rows).to_csv(OUT_DIR / "pressor_combo_breakdown.csv", index=False)
+
                 _dose_rows = []
                 for _c in _comp_avail:
                     if _c == "norepinephrine":
@@ -918,7 +941,7 @@ if _comp_avail and len(ever_vaso_ids) > 0:
                     })
                 pd.DataFrame(_dose_rows).to_csv(OUT_DIR / "pressor_dose_distribution.csv", index=False)
                 print("  Saved pressor_count_summary.csv, pressor_count_distribution.csv, "
-                      "pressor_dose_distribution.csv")
+                      "pressor_combo_breakdown.csv, pressor_dose_distribution.csv")
             else:
                 print("  Skipped pressor_count/dose distribution (no pre-vaso hours found)")
     else:
