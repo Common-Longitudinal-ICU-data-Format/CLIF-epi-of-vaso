@@ -24,7 +24,7 @@ Outcome for analyses 4 and 5
   Threshold selected by max Youden's J on TRAIN split; carried unchanged to val/test.
 
 Usage:
-    uv run python code/02_site_summary.py                     # defaults to sepsis3 cohort
+    uv run python code/02_site_summary.py                     # runs both sepsis3 and rhee
     uv run python code/02_site_summary.py --cohort rhee
     uv run python code/02_site_summary.py --cohort sepsis3 --site MIMIC
 """
@@ -57,9 +57,23 @@ def _load_site_config():
 import argparse as _ap
 _parser = _ap.ArgumentParser(add_help=False)
 _parser.add_argument("--site",   default=None, help="Override SITE_NAME from config")
-_parser.add_argument("--cohort", default="sepsis3", choices=["sepsis3", "rhee"],
-                     help="Which cohort file to read (cohort_<cohort>.parquet)")
-_cli_args, _ = _parser.parse_known_args()
+_parser.add_argument("--cohort", default="both", choices=["sepsis3", "rhee", "both"],
+                     help="Which cohort file to read (cohort_<cohort>.parquet); "
+                          "'both' (default) runs sepsis3 then rhee")
+_cli_args, _passthrough_args = _parser.parse_known_args()
+
+if _cli_args.cohort == "both":
+    import subprocess
+    for _c in ("sepsis3", "rhee"):
+        _cmd = [sys.executable, __file__, "--cohort", _c]
+        if _cli_args.site:
+            _cmd += ["--site", _cli_args.site]
+        _cmd += _passthrough_args
+        print(f"[02_site_summary] $ {' '.join(_cmd)}", flush=True)
+        _result = subprocess.run(_cmd)
+        if _result.returncode != 0:
+            raise SystemExit(_result.returncode)
+    raise SystemExit(0)
 
 _cfg = _load_site_config()
 if _cfg is None:
@@ -68,7 +82,7 @@ if _cfg is None:
         "Copy config/config.example.py to config/config.py and set SITE_NAME, CLIF_DIR, OUTPUT_ROOT."
     )
 SITE_NAME   = _cli_args.site   if _cli_args.site   else getattr(_cfg, "SITE_NAME", "UCMC")
-COHORT_NAME = _cli_args.cohort if _cli_args.cohort else "sepsis3"
+COHORT_NAME = _cli_args.cohort
 OUTPUT_ROOT = getattr(_cfg, "OUTPUT_ROOT", None)
 if OUTPUT_ROOT is None:
     raise SystemExit("ERROR: OUTPUT_ROOT is not set in config/config.py.")
@@ -302,7 +316,7 @@ def _cont_row(variable, col, groups_df, group_n):
 
     row = {"variable": variable, "level": "", "type": "continuous", "smd": smd}
     for g in ("vaso", "no_vaso", "overall"):
-        for k in ("n", "n_missing", "mean", "sd", "median", "q25", "q75", "min", "max", "pct"):
+        for k in ("n", "n_missing", "mean", "sd", "median", "q25", "q75", "min", "max", "pct", "n_pct"):
             row[f"{g}_{k}"] = stats[g].get(k)
     return row
 
@@ -315,7 +329,8 @@ def _bin_row(variable, col, groups_df, group_n):
         n_miss = group_n[g] - n
         pos    = int(arr.sum())
         pct    = _suppress(round(pos / n * 100, ROUND_N) if n > 0 else None, pos)
-        stats[g] = {"n": _n_str(n), "n_missing": n_miss, "pct": pct,
+        n_pct  = f"{_n_str(pos)} ({pct}%)" if pct is not None else None
+        stats[g] = {"n": _n_str(n), "n_missing": n_miss, "pct": pct, "n_pct": n_pct,
                     "_n": n, "_pos": pos}
 
     p1 = stats["vaso"]["_pos"] / max(stats["vaso"]["_n"], 1)
@@ -324,9 +339,10 @@ def _bin_row(variable, col, groups_df, group_n):
 
     row = {"variable": variable, "level": "=1", "type": "binary", "smd": smd}
     for g in ("vaso", "no_vaso", "overall"):
-        row[f"{g}_n"]        = stats[g]["n"]
+        row[f"{g}_n"]         = stats[g]["n"]
         row[f"{g}_n_missing"] = stats[g]["n_missing"]
-        row[f"{g}_pct"]      = stats[g]["pct"]
+        row[f"{g}_pct"]       = stats[g]["pct"]
+        row[f"{g}_n_pct"]     = stats[g]["n_pct"]
         for k in ("mean", "sd", "median", "q25", "q75", "min", "max"):
             row[f"{g}_{k}"] = None
     return row
@@ -343,7 +359,8 @@ def _cat_rows(variable, col, groups_df, group_n):
             n_grp  = group_n[g]
             cnt    = int((df[col].dropna() == level).sum())
             pct    = _suppress(round(cnt / n_grp * 100, ROUND_N) if n_grp > 0 else None, cnt)
-            stats[g] = {"n": _n_str(cnt), "n_missing": None, "pct": pct,
+            n_pct  = f"{_n_str(cnt)} ({pct}%)" if pct is not None else None
+            stats[g] = {"n": _n_str(cnt), "n_missing": None, "pct": pct, "n_pct": n_pct,
                         "_cnt": cnt, "_n": n_grp}
 
         p1  = stats["vaso"]["_cnt"] / max(stats["vaso"]["_n"], 1)
@@ -357,6 +374,7 @@ def _cat_rows(variable, col, groups_df, group_n):
             row[f"{g}_n"]         = stats[g]["n"]
             row[f"{g}_n_missing"] = None
             row[f"{g}_pct"]       = stats[g]["pct"]
+            row[f"{g}_n_pct"]     = stats[g]["n_pct"]
             for k in ("mean", "sd", "median", "q25", "q75", "min", "max"):
                 row[f"{g}_{k}"] = None
         rows.append(row)
@@ -453,8 +471,9 @@ def write_feature_at_initiation_by_group(coh, feat):
     init = _initiation_rows(feat)
 
     group_specs = [
-        ("location_type", "feature_at_initiation_by_icu.csv", _canon_icu_series, False),
-        ("hospital_id",   "feature_at_initiation_by_hospital.csv", None, True),
+        ("location_type", "feature_at_initiation_by_icu.csv",           _canon_icu_series,      False),
+        ("hospital_id",   "feature_at_initiation_by_hospital.csv",       None,                   True),
+        ("hospital_type", "feature_at_initiation_by_hospital_type.csv",  _canon_hospital_type,   False),
     ]
     for group_col, fname, canon_fn, with_hospital_type in group_specs:
         if group_col not in coh.columns:

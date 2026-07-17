@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-03_epi_analysis.py
+04_epi_analysis.py
 
 Epidemiological characterization of vasopressin use in septic shock.
 
@@ -11,7 +11,7 @@ Reads (PHI, local only):
 Writes figures to:
   output/upload_to_box_<SITE>/<cohort>/epi_analysis/
 
-ICC/hazard/effects models → run 04_site_variation_analysis.py separately.
+ICC/hazard/effects models → run 05_site_variation_analysis.py separately.
 
 Analyses:
   1    KM survival curves by max NEE dose bin (0, 0.1, 0.2, 0.3, 0.5, 0.7, 1.0 μg/kg/min)
@@ -25,9 +25,9 @@ Analyses:
   4d   Waiting time: hours above NEE/lactate/MAP thresholds before vasopressin
 
 Usage:
-    uv run python code/03_epi_analysis.py                         # defaults to sepsis3
-    uv run python code/03_epi_analysis.py --cohort rhee
-    uv run python code/03_epi_analysis.py --cohort sepsis3 --site MIMIC
+    uv run python code/04_epi_analysis.py                         # runs both sepsis3 and rhee
+    uv run python code/04_epi_analysis.py --cohort rhee
+    uv run python code/04_epi_analysis.py --cohort sepsis3 --site MIMIC
 """
 
 import sys
@@ -51,9 +51,124 @@ BASE_DIR = Path(__file__).parent.parent
 _ap = argparse.ArgumentParser(add_help=False)
 _ap.add_argument("--site",   default=None,
                  help="Override SITE_NAME from config (e.g. MIMIC, UCMC)")
-_ap.add_argument("--cohort", default="sepsis3", choices=["sepsis3", "rhee"],
-                 help="Which cohort to analyse (default: sepsis3)")
-_args, _ = _ap.parse_known_args()
+_ap.add_argument("--cohort", default="both", choices=["sepsis3", "rhee", "both"],
+                 help="Which cohort to analyse; 'both' (default) runs sepsis3 then rhee")
+_args, _passthrough_args = _ap.parse_known_args()
+
+if _args.cohort == "both":
+    import subprocess
+    for _c in ("sepsis3", "rhee"):
+        _cmd = [sys.executable, __file__, "--cohort", _c]
+        if _args.site:
+            _cmd += ["--site", _args.site]
+        _cmd += _passthrough_args
+        print(f"[04_epi_analysis] $ {' '.join(_cmd)}", flush=True)
+        _result = subprocess.run(_cmd)
+        if _result.returncode != 0:
+            raise SystemExit(_result.returncode)
+
+    # Combined KM: ever-vaso vs never-vaso for both cohorts on one plot
+    print("\n[04_epi_analysis] Combined KM: ever-vaso vs never-vaso, sepsis3 vs rhee...")
+    import importlib.util as _ilu
+    _cfg_path = BASE_DIR / "config" / "config.py"
+    _spec = _ilu.spec_from_file_location("clif_site_config", _cfg_path)
+    _cfg_mod = _ilu.module_from_spec(_spec)
+    _spec.loader.exec_module(_cfg_mod)
+    _site_name = _args.site if _args.site else getattr(_cfg_mod, "SITE_NAME", "UCMC")
+    _out_root  = Path(getattr(_cfg_mod, "OUTPUT_ROOT", "."))
+    _pl_dir    = _out_root / "output" / f"patient_level_data_{_site_name}"
+    _cc_dir    = _out_root / "output" / f"upload_to_box_{_site_name}" / "cohort_comparison"
+    _cc_dir.mkdir(parents=True, exist_ok=True)
+
+    import matplotlib; matplotlib.use("Agg")
+    import matplotlib.pyplot as _plt_km
+    import pandas as _pd_km
+    from lifelines import KaplanMeierFitter as _KMF
+    from lifelines.statistics import logrank_test as _lrt
+
+    _feat_both = _pd_km.read_parquet(_pl_dir / "features.parquet")
+
+    # solid = ever-vaso, dashed = never-vaso; red family = sepsis3, blue family = rhee
+    _KM_STYLE = {
+        ("sepsis3", 1): ("#e15759", "-"),
+        ("sepsis3", 0): ("#f28e2b", "--"),
+        ("rhee",    1): ("#4e79a7", "-"),
+        ("rhee",    0): ("#76b7b2", "--"),
+    }
+    _KM_LABEL = {
+        ("sepsis3", 1): "Sepsis-3 ever-vaso",
+        ("sepsis3", 0): "Sepsis-3 never-vaso",
+        ("rhee",    1): "Rhee ever-vaso",
+        ("rhee",    0): "Rhee never-vaso",
+    }
+
+    _fig_km, _ax_km = _plt_km.subplots(figsize=(10, 6))
+    _lr_data = {}
+
+    for _cn in ("sepsis3", "rhee"):
+        _cfile = _pl_dir / f"cohort_{_cn}.parquet"
+        if not _cfile.exists():
+            print(f"  Skipping {_cn}: {_cfile} not found")
+            continue
+        _coh  = _pd_km.read_parquet(_cfile)
+        _feat = _feat_both[_feat_both["stay_id"].isin(set(_coh["stay_id"]))].copy()
+
+        _pat_km = _feat.groupby("stay_id").agg(
+            ever_vaso=("action_vaso", "max"),
+            death_in_window=("death", "max"),
+        ).reset_index()
+        if "traj_hours" in _coh.columns:
+            _pat_km = _pat_km.merge(_coh[["stay_id", "traj_hours"]], on="stay_id", how="left")
+        else:
+            _th = _feat.groupby("stay_id")["time_hour"].max().rename("traj_hours").reset_index()
+            _pat_km = _pat_km.merge(_th, on="stay_id", how="left")
+        _pat_km["death_in_window"] = _pat_km["death_in_window"].fillna(0).astype(int)
+
+        for _ev in (1, 0):
+            _sub = _pat_km[_pat_km["ever_vaso"] == _ev]
+            if len(_sub) < 5:
+                continue
+            _col, _ls = _KM_STYLE[(_cn, _ev)]
+            _kmf = _KMF()
+            _kmf.fit(_sub["traj_hours"], event_observed=_sub["death_in_window"],
+                     label=f"{_KM_LABEL[(_cn, _ev)]} (n={len(_sub):,})")
+            _kmf.plot_survival_function(_ax_km, ci_show=True, color=_col,
+                                        linestyle=_ls, linewidth=2)
+            _lr_data[(_cn, _ev)] = (_sub["traj_hours"].values,
+                                    _sub["death_in_window"].values)
+
+    _annots = []
+    for _cn in ("sepsis3", "rhee"):
+        if (_cn, 1) in _lr_data and (_cn, 0) in _lr_data:
+            _t1, _e1 = _lr_data[(_cn, 1)]
+            _t0, _e0 = _lr_data[(_cn, 0)]
+            _lr = _lrt(_t1, _t0, event_observed_A=_e1, event_observed_B=_e0)
+            _p  = _lr.p_value
+            _annots.append(f"{_cn.title()} ever vs never: "
+                           + ("p<0.001" if _p < 0.001 else f"p={_p:.3f}"))
+
+    if _annots:
+        _ax_km.text(0.98, 0.02, "\n".join(_annots),
+                    transform=_ax_km.transAxes, ha="right", va="bottom", fontsize=10,
+                    bbox=dict(boxstyle="round,pad=0.3", facecolor="white",
+                              edgecolor="gray", alpha=0.8))
+    _ax_km.set_xlabel("Hours from trajectory start", fontsize=12)
+    _ax_km.set_ylabel("Survival probability", fontsize=12)
+    _ax_km.set_title(
+        f"{_site_name}: KM survival — ever vs never vasopressin\n"
+        "Sepsis-3 (red/orange) vs Rhee (blue/teal)  |  solid = ever-vaso, dashed = never-vaso",
+        fontsize=12,
+    )
+    _ax_km.set_xlim(0)
+    _ax_km.set_ylim(0, 1.02)
+    _ax_km.legend(bbox_to_anchor=(1.02, 1), loc="upper left", fontsize=9)
+    _fig_km.tight_layout()
+    _out_km = _cc_dir / f"{_site_name.lower()}_km_evervaso_both_cohorts.png"
+    _fig_km.savefig(_out_km, dpi=500, bbox_inches="tight")
+    _plt_km.close(_fig_km)
+    print(f"  Saved {_out_km.name}")
+
+    raise SystemExit(0)
 
 
 def _load_site_config():
@@ -71,7 +186,7 @@ _cfg = _load_site_config()
 if _cfg is None:
     raise SystemExit("ERROR: config/config.py not found.")
 SITE_NAME   = _args.site   if _args.site   else getattr(_cfg, "SITE_NAME", "UCMC")
-COHORT_NAME = _args.cohort if _args.cohort else "sepsis3"
+COHORT_NAME = _args.cohort
 OUTPUT_ROOT = Path(getattr(_cfg, "OUTPUT_ROOT", "."))
 
 PATIENT_LEVEL_DIR = OUTPUT_ROOT / "output" / f"patient_level_data_{SITE_NAME}"
@@ -743,6 +858,15 @@ if _comp_avail and len(ever_vaso_ids) > 0:
                         dpi=500, bbox_inches="tight")
             plt.close(fig)
             print("  Saved analysis2D_dose_prevaso")
+
+            # Federated-safe aggregate backing the plot above (per-hour n + mean
+            # NEE-equivalent contribution per drug) — lets the coordinating site
+            # pool this across sites the same n-weighted way it already pools the
+            # KM curves, instead of only ever showing this PNG per-site.
+            _dose_time_df[["rel_hour", "n"] + [f"nee_{_c}" for _c in _comp_avail]].to_csv(
+                OUT_DIR / "dose_contribution_by_hour.csv", index=False
+            )
+            print("  Saved dose_contribution_by_hour.csv")
     else:
         print("  Skipped analysis2D (no pre-vaso hours found)")
 else:
@@ -762,8 +886,8 @@ if _comp_avail:
         if len(_grp) < 20 or not hasattr(_nee_b, "left"):
             continue
         _xmid = (_nee_b.left + _nee_b.right) / 2
-        _rd = {"nee_bin": _nee_b, "x": _xmid}
-        _rp = {"nee_bin": _nee_b, "x": _xmid}
+        _rd = {"nee_bin": _nee_b, "x": _xmid, "n": len(_grp)}
+        _rp = {"nee_bin": _nee_b, "x": _xmid, "n": len(_grp)}
         for _c in _comp_avail:
             _rd[_c] = _grp[_c].mean() * NEE_WEIGHTS.get(_c, 1.0)  # NEE-equivalent
             _rp[_c] = (_grp[_c] > 0).mean()
@@ -796,6 +920,13 @@ if _comp_avail:
                     dpi=500, bbox_inches="tight")
         plt.close(fig)
         print("  Saved analysis2D_dose_by_nee")
+
+        # Federated-safe aggregate backing the plot above (per-bin n + mean
+        # NEE-equivalent contribution per drug) for cross-site pooling.
+        _dose_nee_df[["x", "n"] + _comp_avail].to_csv(
+            OUT_DIR / "dose_contribution_by_nee_bin.csv", index=False
+        )
+        print("  Saved dose_contribution_by_nee_bin.csv")
 
     if len(_prop_nee_df) > 0:
         fig, ax = plt.subplots(figsize=(12, 5))
@@ -2258,516 +2389,3 @@ try:
 except Exception as _e15:
     print(f"  15/15 skipped log_nee_at_init_lm: {_e15}")
 
-
-# =============================================================================
-# Sections 16-17 (Federated MELR + Discrete-Time Hazard) moved to
-# 04_site_variation_analysis.py — run that script for ICC/MOR/GEE outputs.
-# =============================================================================
-_SKIP_S16_S17 = True  # sentinel — actual code below is unreachable
-
-try:
-    assert not _SKIP_S16_S17, "Section 16 moved to 04_site_variation_analysis.py"
-    import json as _json_melr
-    from itertools import combinations as _comb_melr
-
-    print("\n" + "=" * 60)
-    print("SECTION 16: FEDERATED MELR MOMENT STATISTICS")
-    print("=" * 60)
-
-    _ICU_CANON16 = {
-        "medical_icu": "MICU", "micu": "MICU",
-        "cardiac_icu": "CICU", "cicu": "CICU", "coronary_icu": "CICU",
-        "surgical_icu": "SICU", "sicu": "SICU",
-        "mixed_neuro_icu": "Neuro ICU", "neuro_icu": "Neuro ICU",
-        "neuro_sicu": "Neuro ICU",
-        "mixed_cardiothoracic_icu": "CT ICU", "cardiothoracic_icu": "CT ICU",
-        "burn_icu": "Burn ICU",
-        "general_icu": "Mixed/General ICU", "mixed_icu": "Mixed/General ICU",
-        "other": "Other ICU",
-        "medical intensive care unit (micu)": "MICU",
-        "cardiac vascular intensive care unit (cvicu)": "CICU",
-        "coronary care unit (ccu)": "CICU",
-        "surgical intensive care unit (sicu)": "SICU",
-        "trauma sicu (tsicu)": "SICU",
-        "medical/surgical intensive care unit (micu/sicu)": "Mixed/General ICU",
-        "neuro surgical intensive care unit (neuro sicu)": "Neuro ICU",
-        "intensive care unit (icu)": "Mixed/General ICU",
-    }
-    # ICU type dummies — reference category is "Other ICU" (and Burn/CT/Unknown)
-    # Reference = MICU; dummies for all other canonical types + Other
-    _ICU_DUMMIES16 = ["icu_CICU", "icu_SICU", "icu_Neuro", "icu_Mixed", "icu_Other"]
-
-    _COVARIATES_MELR = [
-        "sepsis_onset_sofa", "initial_lactate", "age",
-        "peak_nee_12h", "map_t0",
-    ] + _ICU_DUMMIES16
-
-    # ── Build covariate columns ──────────────────────────────────────────────
-    _m16_nee12 = (
-        features[features["time_hour"] <= 12]
-        .groupby("stay_id")["nee"].max()
-        .reset_index().rename(columns={"nee": "peak_nee_12h"})
-    )
-    _m16_map0 = (
-        features[features["time_hour"] <= 1]
-        .sort_values(["stay_id", "time_hour"])
-        .groupby("stay_id")["mbp"].first()
-        .reset_index().rename(columns={"mbp": "map_t0"})
-    )
-
-    # ICU type from cohort location column
-    _loc16 = next(
-        (c for c in ["location_type", "location_name", "location_category"]
-         if c in cohort.columns and cohort[c].notna().sum() > 0
-         and cohort[c].nunique() > 1),
-        None,
-    )
-    _m16_icu = pat[["stay_id"]].copy()
-    if _loc16:
-        _m16_icu = _m16_icu.merge(cohort[["stay_id", _loc16]], on="stay_id", how="left")
-        _m16_icu["_icu_canon"] = (
-            _m16_icu[_loc16].astype(str).str.lower().str.strip()
-            .map(_ICU_CANON16).fillna("Other ICU")
-        )
-    else:
-        _m16_icu["_icu_canon"] = "Other ICU"
-    # MICU is reference — no dummy for it
-    _m16_icu["icu_CICU"]  = (_m16_icu["_icu_canon"] == "CICU").astype(float)
-    _m16_icu["icu_SICU"]  = (_m16_icu["_icu_canon"] == "SICU").astype(float)
-    _m16_icu["icu_Neuro"] = (_m16_icu["_icu_canon"] == "Neuro ICU").astype(float)
-    _m16_icu["icu_Mixed"] = (_m16_icu["_icu_canon"] == "Mixed/General ICU").astype(float)
-    _m16_icu["icu_Other"] = (
-        ~_m16_icu["_icu_canon"].isin(["MICU","CICU","SICU","Neuro ICU","Mixed/General ICU"])
-    ).astype(float)
-
-    _m16_df = (
-        pat[["stay_id", "ever_vaso"]].copy()
-        .merge(cohort[["stay_id", "sepsis_onset_sofa", "initial_lactate", "age"]],
-               on="stay_id", how="left")
-        .merge(_m16_nee12, on="stay_id", how="left")
-        .merge(_m16_map0,  on="stay_id", how="left")
-        .merge(_m16_icu[["stay_id"] + _ICU_DUMMIES16], on="stay_id", how="left")
-        .dropna(subset=_COVARIATES_MELR + ["ever_vaso"])
-    )
-
-    _n16   = len(_m16_df)
-    _nev16 = int(_m16_df["ever_vaso"].sum())
-    _Y16   = _m16_df["ever_vaso"].values.astype(float)
-    _X16   = _m16_df[_COVARIATES_MELR].values.astype(float)
-    _p16   = _X16.shape[1]
-    _mu16  = _X16.mean(axis=0)
-    _sd16  = _X16.std(axis=0); _sd16[_sd16 == 0] = 1.0
-    _Xc16  = _X16 - _mu16
-
-    _mu3_16 = [float((_Xc16[:, k] ** 3).mean()) for k in range(_p16)]
-    _cov16  = np.cov(_X16.T).tolist()
-
-    _bivar16 = {}
-    for k, l in _comb_melr(range(_p16), 2):
-        _bivar16[f"sq{k}_lin{l}"] = float(((_Xc16[:, k]**2) * _Xc16[:, l]).mean())
-        _bivar16[f"lin{k}_sq{l}"] = float((_Xc16[:, k] * (_Xc16[:, l]**2)).mean())
-
-    _trivar16 = {}
-    for k, l, m in _comb_melr(range(_p16), 3):
-        _trivar16[f"{k}_{l}_{m}"] = float(
-            (_Xc16[:, k] * _Xc16[:, l] * _Xc16[:, m]).mean()
-        )
-
-    _yx_cov16   = [float((_Y16 * _Xc16[:, k]).mean()) for k in range(_p16)]
-    _yx_bivar16 = {}
-    for k, l in _comb_melr(range(_p16), 2):
-        _yx_bivar16[f"{k}_{l}"] = float(
-            (_Y16 * _Xc16[:, k] * _Xc16[:, l]).mean()
-        )
-
-    _melr_pkt = {
-        "site_id":        SITE_NAME,
-        "n":              int(_n16),
-        "n_events":       int(_nev16),
-        "event_prop":     float(_nev16 / _n16),
-        "covariates":     _COVARIATES_MELR,
-        "means":          _mu16.tolist(),
-        "sds":            _sd16.tolist(),
-        "variances":      (_sd16 ** 2).tolist(),
-        "mu3":            _mu3_16,
-        "cov_matrix":     _cov16,
-        "bivar_moments":  _bivar16,
-        "trivar_moments": _trivar16,
-        "yx_cov":         _yx_cov16,
-        "yx_bivar":       _yx_bivar16,
-    }
-
-    _melr_path = OUT_DIR / f"site_packet_melr_{SITE_NAME}.json"
-    with open(_melr_path, "w", encoding="utf-8") as _fout16:
-        _json_melr.dump(_melr_pkt, _fout16, indent=2)
-
-    print(f"  n={_n16:,}  events={_nev16:,}  rate={_nev16 / _n16:.1%}")
-    print(f"  Saved MELR packet -> {_melr_path}")
-
-except Exception as _e16:
-    print(f"  Section 16 failed: {_e16}")
-    import traceback as _tb16; _tb16.print_exc()
-
-
-# =============================================================================
-# Section 17 (Discrete-Time Hazard) moved to 04_site_variation_analysis.py.
-# =============================================================================
-try:
-    assert not _SKIP_S16_S17, "Section 17 moved to 04_site_variation_analysis.py"
-    print("\n" + "=" * 60)
-    print("SECTION 17: DISCRETE-TIME HAZARD MODEL")
-    print("=" * 60)
-
-    _DTH_MAX  = 72
-    _DTH_MCEL = 5
-
-    _ICU_CANON17 = {
-        "medical_icu": "MICU", "micu": "MICU",
-        "cardiac_icu": "CICU", "cicu": "CICU", "coronary_icu": "CICU",
-        "surgical_icu": "SICU", "sicu": "SICU",
-        "mixed_neuro_icu": "Neuro ICU", "neuro_icu": "Neuro ICU",
-        "neuro_sicu": "Neuro ICU",
-        "mixed_cardiothoracic_icu": "CT ICU", "cardiothoracic_icu": "CT ICU",
-        "burn_icu": "Burn ICU",
-        "general_icu": "Mixed/General ICU", "mixed_icu": "Mixed/General ICU",
-        "other": "Other ICU",
-        "medical intensive care unit (micu)": "MICU",
-        "cardiac vascular intensive care unit (cvicu)": "CICU",
-        "coronary care unit (ccu)": "CICU",
-        "surgical intensive care unit (sicu)": "SICU",
-        "trauma sicu (tsicu)": "SICU",
-        "medical/surgical intensive care unit (micu/sicu)": "Mixed/General ICU",
-        "neuro surgical intensive care unit (neuro sicu)": "Neuro ICU",
-        "intensive care unit (icu)": "Mixed/General ICU",
-    }
-    _loc17 = next(
-        (c for c in ["location_type", "location_name", "location_category"]
-         if c in cohort.columns and cohort[c].notna().sum() > 0
-         and cohort[c].nunique() > 1),
-        None,
-    )
-
-    _dth_base = pat[["stay_id", "ever_vaso", "first_vaso_hour"]].copy()
-    if _loc17:
-        _dth_base = _dth_base.merge(
-            cohort[["stay_id", _loc17]], on="stay_id", how="left"
-        )
-        _dth_base["icu_type"] = (
-            _dth_base[_loc17].astype(str).str.lower().str.strip()
-            .map(_ICU_CANON17).fillna("Other ICU")
-        )
-    else:
-        _dth_base["icu_type"] = "Unknown"
-
-    # Vectorised person-period skeleton
-    _dth_base["_fvh_int"] = np.where(
-        (_dth_base["ever_vaso"] == 1) & _dth_base["first_vaso_hour"].notna(),
-        _dth_base["first_vaso_hour"].fillna(0).clip(upper=_DTH_MAX).astype(int),
-        _DTH_MAX - 1,
-    )
-    _dth_base["_nrows"] = _dth_base["_fvh_int"] + 1
-
-    _sid_rep  = np.repeat(_dth_base["stay_id"].values,   _dth_base["_nrows"].values)
-    _icu_rep  = np.repeat(_dth_base["icu_type"].values,  _dth_base["_nrows"].values)
-    _fvh_rep  = np.repeat(_dth_base["_fvh_int"].values,  _dth_base["_nrows"].values)
-    _ev_rep   = np.repeat(_dth_base["ever_vaso"].values, _dth_base["_nrows"].values)
-    _hour_arr = np.concatenate([np.arange(n) for n in _dth_base["_nrows"].values])
-
-    _pp = pd.DataFrame({
-        "stay_id":  _sid_rep,
-        "hour":     _hour_arr.astype(int),
-        "icu_type": _icu_rep,
-        "_ev_flag": _ev_rep.astype(int),
-        "_fvh_int": _fvh_rep.astype(int),
-    })
-    _pp["event"] = (
-        (_pp["_ev_flag"] == 1) & (_pp["hour"] == _pp["_fvh_int"])
-    ).astype(int)
-    _pp = _pp.drop(columns=["_ev_flag", "_fvh_int"])
-
-    # Join features on exact hour then forward-fill within patient groups
-    _feat17 = features[["stay_id", "time_hour", "sofa", "nee"]].rename(
-        columns={"time_hour": "hour"}
-    )
-    _pp = _pp.sort_values(["stay_id", "hour"]).reset_index(drop=True)
-    _pp = _pp.merge(_feat17, on=["stay_id", "hour"], how="left")
-    _pp[["sofa", "nee"]] = (
-        _pp.groupby("stay_id")[["sofa", "nee"]].ffill()
-    )
-    _pp = _pp.dropna(subset=["sofa", "nee"]).copy()
-    print(f"  Person-period rows: {len(_pp):,}   events: {_pp['event'].sum():,}")
-
-    # Drop hours with few events
-    _hr_ev    = _pp.groupby("hour")["event"].sum()
-    _keep_hrs = sorted(_hr_ev[_hr_ev >= _DTH_MCEL].index.tolist())
-    _pp       = _pp[_pp["hour"].isin(_keep_hrs)].copy()
-    print(f"  Hours with >= {_DTH_MCEL} events: {len(_keep_hrs)}")
-
-    # Centre SOFA and NEE (baseline hazard = hazard at mean covariate values)
-    _sofa_mn = float(_pp["sofa"].mean()); _nee_mn = float(_pp["nee"].mean())
-    _pp["sofa_c"] = _pp["sofa"] - _sofa_mn
-    _pp["nee_c"]  = _pp["nee"]  - _nee_mn
-
-    _hr_dum17 = pd.get_dummies(_pp["hour"], prefix="h").astype(np.float64)
-    _ref_h17  = f"h_{_keep_hrs[0]}"
-    if _ref_h17 in _hr_dum17.columns:
-        _hr_dum17 = _hr_dum17.drop(columns=[_ref_h17])
-
-    _Y17      = _pp["event"].values.astype(np.float64)
-    _Xfe17    = np.column_stack([
-        _hr_dum17.values.astype(np.float64),
-        _pp["sofa_c"].values.astype(np.float64).reshape(-1, 1),
-        _pp["nee_c"].values.astype(np.float64).reshape(-1, 1),
-    ]).astype(np.float64)
-    _n_hdum17 = len(_hr_dum17.columns)
-
-    # Sort ICU types with MICU as reference (first); others alphabetically after
-    _all_icu17 = sorted(_pp["icu_type"].dropna().unique())
-    _icu_cats17 = (
-        ["MICU"] + [c for c in _all_icu17 if c != "MICU"]
-        if "MICU" in _all_icu17 else _all_icu17
-    )
-    _Z17  = np.column_stack(
-        [(_pp["icu_type"] == icu).values.astype(np.float64) for icu in _icu_cats17]
-    ).astype(np.float64)
-    _id17 = np.zeros(len(_icu_cats17), dtype=int)
-
-    _dth_coef_rows = []
-    _alpha_rows    = []
-
-    # Logit GLMM
-    try:
-        from statsmodels.genmod.bayes_mixed_glm import BinomialBayesMixedGLM as _BMGLM17
-        _fit17 = _BMGLM17(_Y17, _Xfe17, _Z17, _id17, vcp_p=2, fe_p=2).fit_map()
-        _par17 = _fit17.params
-        _b_sofa17 = float(_par17[_n_hdum17])
-        _b_nee17  = float(_par17[_n_hdum17 + 1])
-        try:
-            _cv17     = _fit17.cov_params()
-            _se_sofa17 = float(np.sqrt(abs(_cv17[_n_hdum17,     _n_hdum17])))
-            _se_nee17  = float(np.sqrt(abs(_cv17[_n_hdum17 + 1, _n_hdum17 + 1])))
-        except Exception:
-            _se_sofa17 = _se_nee17 = np.nan
-
-        _s2u17  = float(np.exp(_fit17.vcp_mean[0])) if len(_fit17.vcp_mean) > 0 else np.nan
-        _icc17  = _s2u17 / (_s2u17 + np.pi**2 / 3) if np.isfinite(_s2u17) else np.nan
-        _mor17  = float(np.exp(np.sqrt(2 * _s2u17) * 0.6745)) if np.isfinite(_s2u17) else np.nan
-
-        print(f"\n  Logit GLMM (ICU type random effect, {len(_icu_cats17)} ICU types):")
-        print(f"    beta_SOFA = {_b_sofa17:+.4f}  SE={_se_sofa17:.4f}  OR={np.exp(_b_sofa17):.3f}")
-        print(f"    beta_NEE  = {_b_nee17:+.4f}  SE={_se_nee17:.4f}   OR={np.exp(_b_nee17):.3f}")
-        print(f"    sigma2_u  = {_s2u17:.4f}   ICC={_icc17:.3f}   MOR={_mor17:.3f}")
-
-        for _cn, _b, _se in [("sofa", _b_sofa17, _se_sofa17),
-                               ("nee",  _b_nee17,  _se_nee17)]:
-            _dth_coef_rows.append({
-                "site": SITE_NAME, "link": "logit", "covariate": _cn,
-                "beta": _b, "se": _se,
-                "or":   float(np.exp(_b)),
-                "ci_lo": float(np.exp(_b - 1.96 * _se)) if np.isfinite(_se) else np.nan,
-                "ci_hi": float(np.exp(_b + 1.96 * _se)) if np.isfinite(_se) else np.nan,
-                "sigma2_u_icu": _s2u17, "icc_icu": _icc17, "mor_icu": _mor17,
-                "n_pp_rows": int(len(_pp)), "n_pp_events": int(_pp["event"].sum()),
-                "sofa_mean_centered_at": _sofa_mn, "nee_mean_centered_at": _nee_mn,
-            })
-
-        _alpha17 = _par17[:_n_hdum17]
-        for _hi, _hcol in enumerate(_hr_dum17.columns):
-            _tv = int(_hcol.replace("h_", ""))
-            _lh = float(_alpha17[_hi])
-            _alpha_rows.append({
-                "hour": _tv, "link": "logit",
-                "logit_hazard": _lh,
-                "hazard": float(1 / (1 + np.exp(-_lh))),
-            })
-
-    except Exception as _e17a:
-        print(f"  WARNING logit GLMM failed: {_e17a}")
-        import traceback as _tb17a; _tb17a.print_exc()
-
-    # Clog-log GLM with fixed ICU dummies
-    try:
-        from statsmodels.genmod.generalized_linear_model import GLM as _GLM17
-        from statsmodels.genmod import families as _fam17
-        _icu_dum17b = pd.get_dummies(_pp["icu_type"], prefix="icu", drop_first=True).astype(np.float64)
-        _Xcl17 = np.column_stack([
-            _hr_dum17.values.astype(np.float64),
-            _pp["sofa_c"].values.astype(np.float64).reshape(-1, 1),
-            _pp["nee_c"].values.astype(np.float64).reshape(-1, 1),
-            _icu_dum17b.values.astype(np.float64),
-        ]).astype(np.float64)
-        _fitcl17 = _GLM17(
-            _Y17, _Xcl17,
-            family=_fam17.Binomial(link=_fam17.links.CLogLog()),
-        ).fit(maxiter=100)
-
-        _bc_sofa = float(_fitcl17.params[_n_hdum17])
-        _bc_nee  = float(_fitcl17.params[_n_hdum17 + 1])
-        _sc_sofa = float(_fitcl17.bse[_n_hdum17])
-        _sc_nee  = float(_fitcl17.bse[_n_hdum17 + 1])
-
-        print(f"\n  Clog-log GLM (fixed ICU effects):")
-        print(f"    beta_SOFA = {_bc_sofa:+.4f}  SE={_sc_sofa:.4f}  HR={np.exp(_bc_sofa):.3f}")
-        print(f"    beta_NEE  = {_bc_nee:+.4f}  SE={_sc_nee:.4f}   HR={np.exp(_bc_nee):.3f}")
-
-        for _cn, _b, _se in [("sofa", _bc_sofa, _sc_sofa), ("nee", _bc_nee, _sc_nee)]:
-            _dth_coef_rows.append({
-                "site": SITE_NAME, "link": "cloglog", "covariate": _cn,
-                "beta": _b, "se": _se,
-                "or":   float(np.exp(_b)),
-                "ci_lo": float(np.exp(_b - 1.96 * _se)),
-                "ci_hi": float(np.exp(_b + 1.96 * _se)),
-                "sigma2_u_icu": np.nan, "icc_icu": np.nan, "mor_icu": np.nan,
-                "n_pp_rows": int(len(_pp)), "n_pp_events": int(_pp["event"].sum()),
-                "sofa_mean_centered_at": _sofa_mn, "nee_mean_centered_at": _nee_mn,
-            })
-
-        _alpha_cl = _fitcl17.params[:_n_hdum17]
-        for _hi, _hcol in enumerate(_hr_dum17.columns):
-            _tv  = int(_hcol.replace("h_", ""))
-            _eta = float(_alpha_cl[_hi])
-            _alpha_rows.append({
-                "hour": _tv, "link": "cloglog",
-                "logit_hazard": _eta,
-                "hazard": float(1 - np.exp(-np.exp(_eta))),
-            })
-
-    except Exception as _e17b:
-        print(f"  WARNING clog-log GLM failed: {_e17b}")
-        import traceback as _tb17b; _tb17b.print_exc()
-
-    # ── Fixed-ICU GLM: save dth_packet for federated pooling ─────────────────
-    # Standard logistic (no random effects); ICU type as fixed dummies.
-    # Sends beta_SOFA, beta_NEE, Var(beta) and ICU log-odds to central node.
-    try:
-        from statsmodels.genmod.generalized_linear_model import GLM as _GLM_fix
-        from statsmodels.genmod import families as _fam_fix
-        import json as _json_dth
-
-        _icu_dum_fix = pd.get_dummies(
-            _pp["icu_type"], prefix="icu", drop_first=False
-        ).astype(np.float64)
-        _icu_ref_fix = f"icu_{_icu_cats17[0]}"
-        if _icu_ref_fix in _icu_dum_fix.columns:
-            _icu_dum_fix = _icu_dum_fix.drop(columns=[_icu_ref_fix])
-
-        _Xfix = np.column_stack([
-            _hr_dum17.values.astype(np.float64),
-            _pp["sofa_c"].values.astype(np.float64).reshape(-1, 1),
-            _pp["nee_c"].values.astype(np.float64).reshape(-1, 1),
-            _icu_dum_fix.values.astype(np.float64),
-        ]).astype(np.float64)
-
-        _fit_fix = _GLM_fix(
-            _Y17, _Xfix,
-            family=_fam_fix.Binomial(link=_fam_fix.links.Logit()),
-        ).fit(maxiter=200)
-
-        _si_fix   = _n_hdum17      # sofa index in param vector
-        _ni_fix   = _n_hdum17 + 1  # nee index
-        _iu_fix   = _n_hdum17 + 2  # ICU dummies start
-
-        _b_sofa_fix = float(_fit_fix.params[_si_fix])
-        _b_nee_fix  = float(_fit_fix.params[_ni_fix])
-        _cov_fix    = _fit_fix.cov_params()
-        _var_sofa_fix = float(_cov_fix[_si_fix, _si_fix])
-        _var_nee_fix  = float(_cov_fix[_ni_fix, _ni_fix])
-
-        # ICU log-odds and sampling variances (relative to reference)
-        _icu_logodds_fix = {
-            _icu_cats17[0]: {
-                "logodds": 0.0, "var": 0.0,
-                "n": int((_pp["icu_type"] == _icu_cats17[0]).sum()),
-            }
-        }
-        for _ji, _icol in enumerate(_icu_dum_fix.columns):
-            _icu_nm = _icol.replace("icu_", "", 1)
-            _pi     = _iu_fix + _ji
-            _icu_logodds_fix[_icu_nm] = {
-                "logodds": float(_fit_fix.params[_pi]),
-                "var":     float(_cov_fix[_pi, _pi]),
-                "n":       int((_pp["icu_type"] == _icu_nm).sum()),
-            }
-
-        # Within-site sigma2_ICU via DL method-of-moments on ICU log-odds
-        # Exclude reference ICU (var=0) from MOM — it would cause 1/0 weight
-        _all_lo17 = np.array([v["logodds"] for v in _icu_logodds_fix.values()])
-        _all_lv17 = np.array([v["var"]     for v in _icu_logodds_fix.values()])
-        _nr_mask  = _all_lv17 > 0   # non-reference ICUs only
-        _lo17  = _all_lo17[_nr_mask]
-        _lv17  = _all_lv17[_nr_mask]
-        _K17   = int(_nr_mask.sum())  # number of non-reference ICUs
-        _s2_icu_fix = _Q_icu_fix = _C_icu_fix = 0.0
-        if _K17 >= 2:
-            _w17  = 1.0 / _lv17
-            _ws17 = _w17.sum()
-            _tb17 = float((_w17 * _lo17).sum() / _ws17)
-            _Q_icu_fix = float((_w17 * (_lo17 - _tb17)**2).sum())
-            _C_icu_fix = float(_ws17 - (_w17**2).sum() / _ws17)
-            if _C_icu_fix > 0:
-                _s2_icu_fix = max(0.0, (_Q_icu_fix - (_K17 - 1)) / _C_icu_fix)
-
-        print(f"\n  Fixed-ICU GLM (logit, ref ICU = {_icu_cats17[0]}):")
-        print(f"    beta_SOFA = {_b_sofa_fix:+.4f}  SE={np.sqrt(_var_sofa_fix):.4f}  OR={np.exp(_b_sofa_fix):.3f}")
-        print(f"    beta_NEE  = {_b_nee_fix:+.4f}  SE={np.sqrt(_var_nee_fix):.4f}  OR={np.exp(_b_nee_fix):.3f}")
-        print(f"    sigma2_ICU (MOM) = {_s2_icu_fix:.4f}  (K={_K17}, Q={_Q_icu_fix:.2f}, C={_C_icu_fix:.2f})")
-
-        _dth_pkt = {
-            "site_id":        SITE_NAME,
-            "link":           "logit",
-            "n_pp_rows":      int(len(_pp)),
-            "n_events":       int(_pp["event"].sum()),
-            "sofa_mean":      float(_sofa_mn),
-            "nee_mean":       float(_nee_mn),
-            "beta_sofa":      _b_sofa_fix,
-            "var_sofa":       _var_sofa_fix,
-            "beta_nee":       _b_nee_fix,
-            "var_nee":        _var_nee_fix,
-            "icu_ref":        _icu_cats17[0],
-            "icu_logodds":    _icu_logodds_fix,
-            "sigma2_icu_mom": float(_s2_icu_fix),
-            "K_icu":          int(_K17),
-            "Q_icu":          float(_Q_icu_fix),
-            "C_icu":          float(_C_icu_fix),
-        }
-        _dth_pkt_path = OUT_DIR / f"dth_packet_{SITE_NAME}.json"
-        with open(_dth_pkt_path, "w", encoding="utf-8") as _fdth:
-            _json_dth.dump(_dth_pkt, _fdth, indent=2)
-        print(f"    Saved {_dth_pkt_path.name}")
-
-    except Exception as _e_fix:
-        print(f"  WARNING fixed-ICU GLM failed: {_e_fix}")
-        import traceback as _tb_fix; _tb_fix.print_exc()
-
-    if _dth_coef_rows:
-        _coef_path = OUT_DIR / f"discrete_hazard_results_{SITE_NAME}.csv"
-        pd.DataFrame(_dth_coef_rows).to_csv(_coef_path, index=False)
-        print(f"\n  Saved {_coef_path.name}")
-
-    if _alpha_rows:
-        _adf = pd.DataFrame(_alpha_rows).sort_values(["link", "hour"])
-        _adf.to_csv(OUT_DIR / f"discrete_hazard_baseline_{SITE_NAME}.csv", index=False)
-
-        fig17, ax17 = plt.subplots(figsize=(12, 4))
-        _clrs17 = {"logit": "#4e79a7", "cloglog": "#e15759"}
-        for _lnk, _grp in _adf.groupby("link"):
-            _g = _grp.sort_values("hour")
-            ax17.step(_g["hour"], _g["hazard"], where="mid",
-                      color=_clrs17.get(_lnk, "grey"), linewidth=2, label=_lnk)
-        ax17.set_xlabel("Hour from trajectory start", fontsize=11)
-        ax17.set_ylabel("Estimated hazard h(t)", fontsize=11)
-        ax17.set_title(
-            f"{SITE_NAME}: Baseline hazard of vasopressin initiation\n"
-            "(discrete-time model, 72 h cap, SOFA/NEE centred at site means)",
-            fontsize=11,
-        )
-        ax17.legend(fontsize=10); ax17.set_xlim(0, _DTH_MAX); ax17.set_ylim(bottom=0)
-        fig17.tight_layout()
-        fig17.savefig(OUT_DIR / f"discrete_hazard_baseline_{SITE_NAME}.png",
-                      dpi=150, bbox_inches="tight")
-        plt.close(fig17)
-        print(f"  Saved discrete_hazard_baseline_{SITE_NAME}.png")
-
-except Exception as _e17:
-    print(f"  Section 17 failed: {_e17}")
-    import traceback as _tb17; _tb17.print_exc()

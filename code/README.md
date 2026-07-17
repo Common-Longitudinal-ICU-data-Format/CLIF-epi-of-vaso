@@ -11,7 +11,7 @@ Two cohorts are identified relative to first norepinephrine (NE) administration 
 | **sepsis3** | CMS qualifying IV abx + blood culture within 24h of each other, both within ±24h of NE start; lactate > 2 mmol/L within ±24h of NE start |
 | **rhee** | Blood culture within ±24h of NE start; first qualifying IV abx within 2 calendar days; ≥4 consecutive qualifying antibiotic days (≤1-day gap) or course ends ≤1 day before discharge/death; lactate ≥ 2 mmol/L within ±24h of NE start |
 
-Each extraction script produces `cohort_sepsis3.parquet`, `cohort_rhee.parquet`, and a shared `features.parquet` (hourly features for the union of both cohorts). Downstream scripts accept `--cohort sepsis3|rhee`.
+Each extraction script produces `cohort_sepsis3.parquet`, `cohort_rhee.parquet`, and a shared `features.parquet` (hourly features for the union of both cohorts). Downstream scripts accept `--cohort sepsis3|rhee|both`; `02_site_summary.py`, `04_epi_analysis.py`, and `05_site_variation_analysis.py` default to `both`, running each cohort in turn.
 
 ---
 
@@ -25,8 +25,7 @@ All scripts run at each participating site.
 | `02_site_summary.py` | Compute federated-safe aggregate statistics; write shareable CSVs to `upload_to_box_<SITE>/<cohort>/` |
 | `03_cohort_comparison_summary.py` | Federated-safe Sepsis-3 vs Rhee cohort-comparison stats; write `upload_to_box_<SITE>/cohort_comparison/cohort_comparison_stats.json` |
 | `04_epi_analysis.py` | Epidemiological characterization; write figures + CSVs to `upload_to_box_<SITE>/<cohort>/epi_analysis/` |
-| `05_site_variation_analysis.py` | Site-specific hospital/ICU variation analysis: GEE logistic, discrete-time hazard (ICC/MOR), MELR moments; write `site_variation_packet_<cohort>_<SITE>.json` |
-| `06_ne_infection_timing_summary.py` | Federated-safe NE-vs-suspected-infection timing stats; write `upload_to_box_<SITE>/timing/timing_stats.json` |
+| `05_site_variation_analysis.py` | Site-specific hospital/ICU variation analysis: fixed-effects intercept comparison, DL mixed-effects pooling (ICC/MOR), patient/ward/hospital/site variance decomposition; write `site_variation_packet_<cohort>_<SITE>.json` |
 
 ---
 
@@ -37,24 +36,17 @@ All scripts run at each participating site.
 uv run python code/01_clif_extract.py
 
 # Federated summary (writes shareable CSVs to output/upload_to_box_<SITE>/<cohort>/)
-uv run python code/02_site_summary.py --cohort sepsis3
-uv run python code/02_site_summary.py --cohort rhee
+uv run python code/02_site_summary.py                  
 
 # Cohort-comparison summary (sepsis3 vs rhee; needs both cohort files)
 uv run python code/03_cohort_comparison_summary.py
 
 # Epidemiological analysis
-uv run python code/04_epi_analysis.py --cohort sepsis3
-uv run python code/04_epi_analysis.py --cohort rhee
+uv run python code/04_epi_analysis.py           
 
-# Site variation analysis (ICC/MOR/GEE + MELR packet)
-uv run python code/05_site_variation_analysis.py --cohort both
-
-# NE-infection timing summary
-uv run python code/06_ne_infection_timing_summary.py
+# Site variation analysis (fixed-effects + DL mixed-effects pooling + variance decomposition)
+uv run python code/05_site_variation_analysis.py
 ```
-
-Or drive all of the above with `run_pipeline.py`.
 
 ---
 
@@ -67,7 +59,6 @@ Or drive all of the above with `run_pipeline.py`.
 | `03_cohort_comparison_summary.py` | `output/upload_to_box_<SITE>/cohort_comparison/cohort_comparison_stats.json` | Share |
 | `04_epi_analysis.py` | `output/upload_to_box_<SITE>/<cohort>/epi_analysis/` | Share |
 | `05_site_variation_analysis.py` | `output/upload_to_box_<SITE>/<cohort>/site_variation_packet_<cohort>_<SITE>.json` | Share |
-| `06_ne_infection_timing_summary.py` | `output/upload_to_box_<SITE>/timing/timing_stats.json` | Share |
 
 ---
 
@@ -109,7 +100,7 @@ cp config/config.example.py config/config.py
 |----------|---------|-------------|
 | `CLIF_DIR` | *(set per site)* | Root directory of CLIF parquet files |
 | `OUTPUT_ROOT` | *(set per site)* | Root for outputs |
-| `SITE_NAME` | `"UCMC"` | Site identifier used in output filenames |
+| `SITE_NAME` | *(set per site)*  | Site identifier used in output filenames |
 | `TRAJECTORY_HOURS` | 120 | Maximum trajectory length (hours) |
 | `MIN_NE_RECORDS` | 2 | Minimum NE administration records required |
 | `LACTATE_THRESHOLD` | 2.0 | Lactate cutoff (mmol/L) — Sepsis-3 requires strictly greater than; Rhee requires greater than or equal to |
@@ -221,6 +212,9 @@ ICC/hazard/effects models → **`05_site_variation_analysis.py`**
 
 | Analysis | Model | Output |
 |----------|-------|--------|
-| GEE logistic (time-varying) | `vaso_on ~ SOFA + age + rcs(NEE, 4) + rcs(time_hour, 4)`, clustering by patient | Coefficients + OR in JSON packet |
-| Discrete-time hazard | Logit GLMM: `h(t) = alpha_t + beta_SOFA + beta_NEE + u_icu`; clog-log GLM | ICC, MOR, baseline hazard plot |
-| MELR moments | 3rd-order moment statistics for federated MELR pooling | JSON packet |
+| Approach 1 — fixed-effects intercept comparison | Shared logistic spec (`vaso_on ~ age + resp/renal/coag/liver/neuro components + rcs(NEE,4) + rcs(time,4)`), refit independently per site | Site-specific intercepts; P(vasopressor) for a reference patient at each site |
+| Approach 2 — time/dose-varying probability | Per-site coefficients, all components but one held at reference values | P(vaso_on) vs. time; P(vaso_on) vs. NEE dose |
+| Mixed-effects pooling | DL random-effects meta-analysis of site intercepts; pooled logistic GLM with site dummies; optional GLMM with site random intercept | τ², ICC, MOR; forest plot |
+| Approach 3 — ward/hospital variance decomposition | Same fixed-effects + DL pooling technique applied within-site across ICU/ward type and hospital_id | 4-level (patient/ward/hospital/site) variance decomposition; JSON packet |
+
+Note: the pooled GEE logistic across directly-accessible sites (coordinating-site step) lives in `08_cross_site_variation_analysis.py`, not here.

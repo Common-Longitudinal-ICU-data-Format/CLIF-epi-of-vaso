@@ -84,8 +84,6 @@ Writes figures and aggregate CSVs to `output/upload_to_box_<SITE>/epi_analysis/`
 
 **UCMC runs first** (with `FEDERATED_ICC_ANCHOR = None` in config). **All other sites** uncomment the pre-filled `FEDERATED_ICC_ANCHOR` block in `config.example.py` before running. See [`config/README.md`](config/README.md) for details.
 
-See `code/run_pipeline.py` to run the full per-site pipeline (01-04) in one command.
-
 ### 6. Share your upload folder
 
 **Share only `output/upload_to_box_<SITE>/`** with the coordinating site. This folder contains no patient-level data.
@@ -103,8 +101,6 @@ output/
   upload_to_box_<SITE>/              # Aggregate results — SHARE THIS FOLDER
     cohort_comparison/                ← 02b_cohort_comparison_summary.py
       cohort_comparison_stats.json
-    timing/                           ← 04b_ne_infection_timing_summary.py (CLIF sites only)
-      timing_stats.json
     <cohort>/                         # sepsis3/ or rhee/
       cohort_filter_counts.csv        ← 02_site_summary.py
       split_counts.csv                ← 02_site_summary.py
@@ -145,14 +141,11 @@ Threshold/rule-optimality outputs (`<cohort>/threshold/`, `global_rules_<cohort>
 │   ├── 02b_cohort_comparison_summary.py  # sepsis3 vs rhee cohort comparison stats (per site)
 │   ├── 03_epi_analysis.py             # Epidemiological characterization + ICC packet (per site)
 │   ├── 04_site_variation_analysis.py  # Patient/ward/hospital variance decomposition (per site)
-│   ├── 04b_ne_infection_timing_summary.py  # NE-vs-infection timing stats (per site, CLIF only)
 │   ├── 05_multisite_epi_plots.py      # Multi-site epi comparison figures (coordinating site)
 │   ├── 06_cross_site_variation_analysis.py  # Pooled GEE + DL meta-analysis (coordinating site)
 │   ├── 07_cross_site_vasopressin_analysis.py  # Cross-site epi comparison tables + plots (coordinating site)
 │   ├── 08_consolidated_report.py      # One HTML report, 4 sections (coordinating site)
-│   ├── 09_ne_infection_timing.py      # NE-vs-infection timing report (coordinating site)
-│   ├── run_pipeline.py                # Orchestrates 01-04/04b for one or more sites
-│   ├── run_coordinating_pipeline.py   # Orchestrates 05-09 at the coordinating site
+│   ├── run_coordinating_pipeline.py   # Orchestrates 07-10 at the coordinating site
 │   └── README.md
 ├── config/                      # Configuration
 │   ├── config.example.py        # Copy to config/config.py and fill in site paths
