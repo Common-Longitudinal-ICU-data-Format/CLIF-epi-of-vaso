@@ -867,6 +867,60 @@ if _comp_avail and len(ever_vaso_ids) > 0:
                 OUT_DIR / "dose_contribution_by_hour.csv", index=False
             )
             print("  Saved dose_contribution_by_hour.csv")
+
+            # ── Pressor count / dose distribution in the FULL pre-vaso window
+            # (NE start -> vaso start; unlike the 24h-window plot above, this
+            # isn't clipped to the last 24h — it's the entire trajectory before
+            # vaso start). "Distinct pressor count" = how many of _comp_avail
+            # (including NE itself) a patient was ever dosed on (>0) at any
+            # hour in that window, not necessarily concurrently.
+            print("Analysis 2D_pressor_summary: pressor count & dose before vaso...")
+            _MIN_CELL = 11  # suppress cells derived from fewer than this many patients/patient-hours
+            _full_pre = _fv[_fv["rel_hour"] < 0]
+            if len(_full_pre) > 0:
+                _n_drugs_per_pt = _full_pre.groupby("stay_id")[_comp_avail].apply(lambda d: (d > 0).any().sum())
+                _n_pt = len(_n_drugs_per_pt)
+                _ok_n = _n_pt >= _MIN_CELL
+                pd.DataFrame([{
+                    "n_ever_vaso": _n_pt,
+                    "mean_n_pressors": float(_n_drugs_per_pt.mean()) if _ok_n else None,
+                    "sd_n_pressors": float(_n_drugs_per_pt.std()) if _ok_n else None,
+                    "median_n_pressors": float(_n_drugs_per_pt.median()) if _ok_n else None,
+                    "q25_n_pressors": float(_n_drugs_per_pt.quantile(0.25)) if _ok_n else None,
+                    "q75_n_pressors": float(_n_drugs_per_pt.quantile(0.75)) if _ok_n else None,
+                }]).to_csv(OUT_DIR / "pressor_count_summary.csv", index=False)
+
+                _count_rows = []
+                for _k in range(1, len(_comp_avail) + 1):
+                    _cnt = int((_n_drugs_per_pt == _k).sum())
+                    _ok_k = _cnt >= _MIN_CELL and _ok_n
+                    _count_rows.append({
+                        "n_pressors": _k, "n_total": _n_pt,
+                        "n_patients": _cnt if _ok_k else None,
+                        "pct": round(_cnt / _n_pt * 100, 1) if _ok_k else None,
+                    })
+                pd.DataFrame(_count_rows).to_csv(OUT_DIR / "pressor_count_distribution.csv", index=False)
+
+                _dose_rows = []
+                for _c in _comp_avail:
+                    if _c == "norepinephrine":
+                        continue
+                    _vals = _full_pre.loc[_full_pre[_c] > 0, _c]
+                    _n_hrs = len(_vals)
+                    _ok_c = _n_hrs >= _MIN_CELL
+                    _dose_rows.append({
+                        "drug": _c, "n_patient_hours": _n_hrs,
+                        "mean": float(_vals.mean()) if _ok_c else None,
+                        "sd": float(_vals.std()) if _ok_c else None,
+                        "median": float(_vals.median()) if _ok_c else None,
+                        "q25": float(_vals.quantile(0.25)) if _ok_c else None,
+                        "q75": float(_vals.quantile(0.75)) if _ok_c else None,
+                    })
+                pd.DataFrame(_dose_rows).to_csv(OUT_DIR / "pressor_dose_distribution.csv", index=False)
+                print("  Saved pressor_count_summary.csv, pressor_count_distribution.csv, "
+                      "pressor_dose_distribution.csv")
+            else:
+                print("  Skipped pressor_count/dose distribution (no pre-vaso hours found)")
     else:
         print("  Skipped analysis2D (no pre-vaso hours found)")
 else:
