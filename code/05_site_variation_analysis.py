@@ -1419,13 +1419,15 @@ def run_for_cohort(cohort_label: str):
         )
 
     # ── Location transition heatmaps ───────────────────────────────────────
+    # Saved to upload_to_box so they are included in the consolidated report
+    # and shared with the coordinating centre.
     print("\n--- Location transition heatmaps ---")
     for site in site_models:
         plot_location_transition_heatmap(
-            cohort_by_site[site], cross_out, cohort_label, site
+            cohort_by_site[site], per_site_out, cohort_label, site
         )
     print("  [pooled] all sites combined:")
-    plot_pooled_location_transition_heatmap(cohort_by_site, cross_out, cohort_label)
+    plot_pooled_location_transition_heatmap(cohort_by_site, per_site_out, cohort_label)
 
     # ── Save variation packets ────────────────────────────────────────────
     # One packet per site, each containing all site models + mixed effects.
