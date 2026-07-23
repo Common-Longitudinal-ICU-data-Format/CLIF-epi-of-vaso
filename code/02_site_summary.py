@@ -139,12 +139,37 @@ _ICU_CANON = {
     "intensive care unit (icu)": "Mixed/General ICU",
 }
 
+# Fallback labels for location_category values when location_type is absent
+# (matches 05_site_variation_analysis.py for consistent labels).
+_LOC_CAT_CANON = {
+    "icu":            "ICU (unspecified)",
+    "ward":           "Ward",
+    "ed":             "ED / Emergency",
+    "emergency":      "ED / Emergency",
+    "or":             "OR / Procedural",
+    "operating_room": "OR / Procedural",
+    "procedure_room": "OR / Procedural",
+    "procedural":     "OR / Procedural",
+    "stepdown":       "Step-down / IMC",
+    "step_down":      "Step-down / IMC",
+    "intermediate":   "Step-down / IMC",
+    "imc":            "Step-down / IMC",
+    "other":          "Other",
+}
+
 
 def _canon_icu_series(raw: pd.Series) -> pd.Series:
-    """Canonicalize raw location_type/location_name strings into ICU-type labels."""
+    """Canonicalize location strings into ICU-type labels.
+
+    ICU subtypes (location_type) → abbreviated names via _ICU_CANON.
+    Broad categories (location_category fallback) → readable labels via
+    _LOC_CAT_CANON.  Genuinely missing → NaN.
+    """
     low = raw.astype(str).str.lower().str.strip()
     is_missing = raw.isna() | low.isin(["none", "nan", ""])
-    canon = low.map(_ICU_CANON).fillna("Other ICU")
+    canon = low.map(_ICU_CANON)
+    unmapped = canon.isna() & ~is_missing
+    canon[unmapped] = low[unmapped].map(_LOC_CAT_CANON).fillna("Other ICU")
     canon[is_missing] = np.nan
     return canon
 
@@ -383,8 +408,13 @@ def _cat_rows(variable, col, groups_df, group_n):
 
 def write_baseline_table1(coh):
     coh = coh.copy()
-    if "location_type" in coh.columns:
-        coh["location_type"] = _canon_icu_series(coh["location_type"])
+    # Derive effective location: location_type when non-null, else location_category fallback
+    if "location_type" in coh.columns or "location_category" in coh.columns:
+        eff = coh["location_type"].copy() if "location_type" in coh.columns else pd.Series(pd.NA, index=coh.index)
+        if "location_category" in coh.columns:
+            is_missing = eff.isna() | eff.astype(str).str.lower().str.strip().isin(["none", "nan", ""])
+            eff[is_missing] = coh.loc[is_missing, "location_category"]
+        coh["location_type"] = _canon_icu_series(eff)
     if "hospital_type" in coh.columns:
         coh["hospital_type"] = _canon_hospital_type(coh["hospital_type"])
 
@@ -470,10 +500,19 @@ def write_feature_at_initiation_by_group(coh, feat):
     label/color hospitals by academic vs community."""
     init = _initiation_rows(feat)
 
+    # Derive effective location: location_type when non-null, else location_category fallback
+    # (ward/step-down patients only have location_category; location_type is NaN for them)
+    eff = coh["location_type"].copy() if "location_type" in coh.columns else pd.Series(pd.NA, index=coh.index)
+    if "location_category" in coh.columns:
+        is_missing = eff.isna() | eff.astype(str).str.lower().str.strip().isin(["none", "nan", ""])
+        eff[is_missing] = coh.loc[is_missing, "location_category"]
+    coh = coh.copy()
+    coh["_effective_location"] = _canon_icu_series(eff)
+
     group_specs = [
-        ("location_type", "feature_at_initiation_by_icu.csv",           _canon_icu_series,      False),
-        ("hospital_id",   "feature_at_initiation_by_hospital.csv",       None,                   True),
-        ("hospital_type", "feature_at_initiation_by_hospital_type.csv",  _canon_hospital_type,   False),
+        ("_effective_location", "feature_at_initiation_by_icu.csv",         None,                   False),
+        ("hospital_id",         "feature_at_initiation_by_hospital.csv",     None,                   True),
+        ("hospital_type",       "feature_at_initiation_by_hospital_type.csv", _canon_hospital_type,  False),
     ]
     for group_col, fname, canon_fn, with_hospital_type in group_specs:
         if group_col not in coh.columns:
@@ -789,10 +828,18 @@ def main():
     write_baseline_table1(coh)
 
     print("[5/7] Feature at initiation")
-    write_feature_at_initiation(feat)
+    # Exclude patients whose vasopressin started before NE: for them the first
+    # 0→1 action_vaso transition on the grid occurs at t=0, which reflects NE-start
+    # physiology rather than true vasopressin-initiation state.
+    _prior_vaso_ids_02 = (
+        set(coh.loc[coh["vaso_before_traj"] == 1, "stay_id"])
+        if "vaso_before_traj" in coh.columns else set()
+    )
+    feat_ne_first = feat[~feat["stay_id"].isin(_prior_vaso_ids_02)].copy() if _prior_vaso_ids_02 else feat
+    write_feature_at_initiation(feat_ne_first)
 
     print("[6/7] Feature at initiation, by ICU type / by hospital")
-    write_feature_at_initiation_by_group(coh, feat)
+    write_feature_at_initiation_by_group(coh, feat_ne_first)
 
     print("[7/7] ROC / threshold analysis")
     write_roc_outputs(feat)

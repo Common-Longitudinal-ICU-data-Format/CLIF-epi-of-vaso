@@ -77,10 +77,39 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import matplotlib.lines as mlines
+import matplotlib.colors as mcolors
 import numpy as np
 import pandas as pd
 
 warnings.filterwarnings("ignore")
+
+# ── Global ICU/hospital-type color map ────────────────────────────────────────
+# Fixed tab10 hex values so the same type string always gets the same color
+# regardless of which site's data is being plotted (avoids sorted-index shifts).
+# tab10: 0=#1f77b4, 1=#ff7f0e, 2=#2ca02c, 3=#d62728, 4=#9467bd,
+#        5=#8c564b, 6=#e377c2, 7=#7f7f7f, 8=#bcbd22, 9=#17becf
+_GROUP_TYPE_COLOR_MAP: dict = {
+    # ICU types
+    "MICU":              "#1f77b4",
+    "CICU":              "#ff7f0e",
+    "SICU":              "#2ca02c",
+    "CT ICU":            "#d62728",
+    "Neuro ICU":         "#9467bd",
+    "Burn ICU":          "#8c564b",
+    "Mixed/General ICU": "#e377c2",
+    "ICU (unspecified)": "#7f7f7f",
+    "Other ICU":         "#bcbd22",
+    "Ward":              "#17becf",
+    "Step-down / IMC":   "#b07aa1",
+    "ED / Emergency":    "#e15759",
+    "OR / Procedural":   "#76b7b2",
+    "Other":             "#aaaaaa",
+    # Hospital types
+    "academic":          "#2c5f8a",
+    "community":         "#e07b39",
+    "Academic":          "#2c5f8a",
+    "Community":         "#e07b39",
+}
 
 # ── Configuration ─────────────────────────────────────────────────────────────
 BASE_DIR = Path(__file__).parent.parent
@@ -121,6 +150,7 @@ _COHORT_LABELS = {"sepsis3": "Sepsis-3 (CMS)", "rhee": "Rhee/CDC ASE"}
 # is a normal/mild-severity default for that organ axis.
 REF_AGE       = 60.0
 REF_NEE       = 0.3    # mcg/kg/min
+REF_TIME      = 5.0    # hours from NE start used as the fixed time in dose-varying plots
 REF_PF        = 300.0  # p/f ratio (mild/no ARDS)
 REF_DEVICE    = "Room Air"
 REF_CREATININE = 0.8   # mg/dL
@@ -174,22 +204,56 @@ _ICU_CANON = {
     "intensive care unit (icu)": "Mixed/General ICU",
 }
 
+# Fallback labels for location_category values (when location_type is absent).
+_LOC_CAT_CANON = {
+    "icu":           "ICU (unspecified)",
+    "ward":          "Ward",
+    "ed":            "ED / Emergency",
+    "emergency":     "ED / Emergency",
+    "or":            "OR / Procedural",
+    "operating_room": "OR / Procedural",
+    "procedure_room": "OR / Procedural",
+    "procedural":    "OR / Procedural",
+    "surgery":       "OR / Procedural",
+    "pacu":          "PACU",
+    "stepdown":      "Step-down / IMC",
+    "step_down":     "Step-down / IMC",
+    "intermediate":  "Step-down / IMC",
+    "imc":           "Step-down / IMC",
+    "other":         "Other",
+}
 
-def _pick_location_col(cohort: pd.DataFrame) -> str | None:
-    """First of location_type/location_name/location_category with >1 non-null value."""
-    return next(
-        (c for c in ["location_type", "location_name", "location_category"]
-         if c in cohort.columns and cohort[c].notna().sum() > 0 and cohort[c].nunique() > 1),
-        None,
-    )
+
+def _effective_location(
+    cohort: pd.DataFrame,
+    type_col: str = "location_type",
+    cat_col: str  = "location_category",
+) -> pd.Series:
+    """Per-row effective location: location_type when non-null/non-blank,
+    else location_category as fallback."""
+    if type_col not in cohort.columns:
+        return cohort.get(cat_col, pd.Series(dtype=object, index=cohort.index))
+    raw = cohort[type_col].copy().astype(object)
+    null_mask = raw.isna() | raw.astype(str).str.lower().str.strip().isin(["none", "nan", ""])
+    if cat_col in cohort.columns:
+        raw[null_mask] = cohort.loc[null_mask, cat_col]
+    return raw
 
 
 def _canon_icu_series(raw: pd.Series) -> pd.Series:
-    """Canonical ICU-type label per row; NaN for missing/unrecorded location
-    (dropped from the ward-level analysis, not lumped into "Other ICU")."""
+    """Canonical location label per row.
+
+    ICU subtypes (from location_type) → abbreviated names via _ICU_CANON.
+    Broad location categories (from location_category fallback) → readable
+    labels via _LOC_CAT_CANON.  Genuinely missing → NaN (dropped from
+    ward-level analysis rather than lumped into "Other").
+    """
     low = raw.astype(str).str.lower().str.strip()
     is_missing = raw.isna() | low.isin(["none", "nan", ""])
-    canon = low.map(_ICU_CANON).fillna("Other ICU")
+    canon = low.map(_ICU_CANON)
+    # For values not in _ICU_CANON, try the broader category map; fall back "Other ICU"
+    unmapped = canon.isna() & ~is_missing
+    canon[unmapped] = low[unmapped].map(_LOC_CAT_CANON).fillna("Other ICU")
     canon[is_missing] = np.nan
     return canon
 
@@ -350,7 +414,7 @@ def fit_site_logistic(ph: pd.DataFrame, cohort_label: str, site: str) -> dict:
         "time_knots":  time_knots.tolist(),
         "coefficients": coef_out,
     }
-    result["ref_patient_p_t0"] = float(predict_p(result, REF_AGE, REF_NEE, 5.0))
+    result["ref_patient_p_t5"] = float(predict_p(result, REF_AGE, REF_NEE, REF_TIME))
     return result
 
 
@@ -396,7 +460,7 @@ def predict_p(
 def plot_approach1(site_models: dict, out_dir: Path, cohort_label: str, pal: dict):
     sites    = list(site_models.keys())
     colors   = [pal.get(s, "#888888") for s in sites]
-    ref_p    = [site_models[s]["ref_patient_p_t0"] for s in sites]
+    ref_p    = [site_models[s]["ref_patient_p_t5"] for s in sites]
     alphas   = [site_models[s]["coefficients"]["intercept"]["beta"] for s in sites]
     alpha_se = [site_models[s]["coefficients"]["intercept"]["se"]   for s in sites]
     ns       = [site_models[s]["n_patients"] for s in sites]
@@ -411,7 +475,7 @@ def plot_approach1(site_models: dict, out_dir: Path, cohort_label: str, pal: dic
     ax.set_yticklabels([f"{s}\n(n={n:,})" for s, n in zip(sites, ns)], fontsize=9)
     ax.set_xlabel(
         f"P(vasopressin | age={REF_AGE}, p/f={REF_PF}, {REF_DEVICE}, "
-        f"NEE={REF_NEE} mcg/kg/min, t=0)", fontsize=9
+        f"NEE={REF_NEE} mcg/kg/min, t={REF_TIME:.0f} h)", fontsize=9
     )
     ax.set_title("Reference-patient P(vasopressin)", fontsize=10, fontweight="bold")
     for bar, p in zip(bars, ref_p):
@@ -428,7 +492,7 @@ def plot_approach1(site_models: dict, out_dir: Path, cohort_label: str, pal: dic
                  f"α={alpha:+.3f}", va="center", fontsize=8, color=col)
     ax2.axvline(0, color="lightgrey", linestyle="--", linewidth=1)
     ax2.set_yticks(np.arange(len(sites))); ax2.set_yticklabels(sites)
-    ax2.set_xlabel("Logit intercept ± 95% CI\n(components/age at means, NEE=0, t=0)", fontsize=9)
+    ax2.set_xlabel(f"Logit intercept ± 95% CI\n(components/age at means, NEE=0, t={REF_TIME:.0f} h)", fontsize=9)
 
     sd_alpha = float(np.std(alphas, ddof=1)) if len(alphas) > 1 else 0.0
     ax2.set_title(
@@ -456,14 +520,14 @@ def plot_approach2_time(site_models: dict, out_dir: Path, cohort_label: str, pal
         return
 
     t_max     = min(max(max(m["time_knots"]) for m in site_models.values()), 120)
-    time_grid = np.linspace(0, t_max, 300)
+    time_grid = np.linspace(5, t_max, 300)
 
     fig, ax = plt.subplots(figsize=(10, 5))
     for s, m in site_models.items():
         p_t = predict_p(m, REF_AGE, REF_NEE, time_grid)
         ax.plot(time_grid, p_t, color=pal.get(s, "#888888"), linewidth=2.5, label=s)
 
-    ax.set_xlabel("Hours from NE start (t = 0)", fontsize=11)
+    ax.set_xlabel("Hours from NE start", fontsize=11)
     ax.set_ylabel("P(vasopressin on | hour)", fontsize=11)
     ax.set_title(
         f"Approach 2A — Time-varying P(vasopressin)\n"
@@ -472,7 +536,7 @@ def plot_approach2_time(site_models: dict, out_dir: Path, cohort_label: str, pal
         fontsize=10, fontweight="bold",
     )
     ax.legend(fontsize=10, framealpha=0.8)
-    ax.set_xlim(0, t_max); ax.set_ylim(0, 1)
+    ax.set_xlim(5, t_max); ax.set_ylim(0, 1)
     fig.tight_layout()
     out_dir.mkdir(parents=True, exist_ok=True)
     fig.savefig(out_dir / f"approach2_time_varying_{cohort_label}.png",
@@ -488,7 +552,7 @@ def plot_approach2_nee(
     out_dir: Path,
     cohort_label: str,
     pal: dict,
-    ref_time: float = 0.0,
+    ref_time: float = REF_TIME,
 ):
     """P(vaso_on) vs. NEE dose for the fixed reference patient (all SOFA
     components held at reference values, matching Approach 2A) — simplified
@@ -659,7 +723,7 @@ def fit_and_plot_mixed_effects(
     ax.axvline(0, color="#cccccc", linestyle="--", linewidth=1)
 
     ax.set_yticks(y_pos); ax.set_yticklabels(sites, fontsize=10)
-    ax.set_xlabel("Logit intercept ± 95% CI  (components/age at means, NEE=0, t=0)", fontsize=10)
+    ax.set_xlabel(f"Logit intercept ± 95% CI  (components/age at means, NEE=0, t={REF_TIME:.0f} h)", fontsize=10)
 
     glmm_str = ""
     if glmm_result:
@@ -765,15 +829,20 @@ def fit_grouped_variance(
 
 
 def fit_ward_level_variance(cohort: pd.DataFrame, ph: pd.DataFrame, cohort_label: str, site: str) -> dict:
-    """ICU/ward-type variance via fit_grouped_variance (dynamic location
-    column pick + ICU-type canonicalization)."""
-    loc_col = _pick_location_col(cohort)
-    if loc_col is None:
+    """ICU/ward-type variance via fit_grouped_variance.
+
+    Builds a per-row effective location column: location_type when non-null,
+    else location_category (fills in 'ed', 'ward', etc. rather than dropping
+    those patients entirely).
+    """
+    cohort = cohort.copy()
+    cohort["_eff_location"] = _effective_location(cohort)
+    if cohort["_eff_location"].isna().all():
         print("  No usable ICU/ward location column found — skipping ward-level variance.")
         return {}
     return fit_grouped_variance(
         cohort, ph, cohort_label, site,
-        group_col=loc_col, min_n=MIN_ICU_N_PATIENTS, label="ward", canon_fn=_canon_icu_series,
+        group_col="_eff_location", min_n=MIN_ICU_N_PATIENTS, label="ward", canon_fn=_canon_icu_series,
     )
 
 
@@ -784,6 +853,19 @@ def fit_hospital_level_variance(cohort: pd.DataFrame, ph: pd.DataFrame, cohort_l
     return fit_grouped_variance(
         cohort, ph, cohort_label, site,
         group_col="hospital_id", min_n=MIN_HOSPITAL_N_PATIENTS, label="hospital",
+    )
+
+
+def fit_hospital_type_variance(cohort: pd.DataFrame, ph: pd.DataFrame, cohort_label: str, site: str) -> dict:
+    """Academic vs. community hospital-type variance via fit_grouped_variance.
+
+    Meaningful only at sites with both hospital types present; sites with a
+    single type (or missing hospital_type) yield <2 groups and are skipped."""
+    if "hospital_type" not in cohort.columns:
+        return {}
+    return fit_grouped_variance(
+        cohort, ph, cohort_label, site,
+        group_col="hospital_type", min_n=MIN_HOSPITAL_N_PATIENTS, label="hospital_type",
     )
 
 
@@ -908,6 +990,255 @@ def plot_group_intercepts(
     print(f"  Saved: {out.name}")
 
 
+# ── Approach 2A/2B broken down by ward/ICU-type or hospital (per site) ────────
+def plot_approach2_time_by_group(
+    group_result: dict,
+    out_dir: Path,
+    cohort_label: str,
+    site: str,
+    label: str,
+) -> None:
+    """P(vaso_on) vs time for the reference patient, one line per ICU-type or hospital."""
+    group_models = group_result.get("group_models", {})
+    if len(group_models) < 2:
+        return
+
+    t_max = min(max(max(m["time_knots"]) for m in group_models.values()), 120)
+    time_grid = np.linspace(5, t_max, 300)
+
+    keys = sorted(group_models.keys())
+    cmap = plt.cm.tab10
+    color_map = {
+        k: _GROUP_TYPE_COLOR_MAP.get(k, cmap(i / max(len(keys) - 1, 1)))
+        for i, k in enumerate(keys)
+    }
+
+    fig, ax = plt.subplots(figsize=(10, 5))
+    for grp in keys:
+        m = group_models[grp]
+        p_t = predict_p(m, REF_AGE, REF_NEE, time_grid)
+        ax.plot(time_grid, p_t, color=color_map[grp], linewidth=2.0,
+                label=f"{grp}  (n={m['n_patients']:,})")
+
+    ax.set_xlabel("Hours from NE start", fontsize=11)
+    ax.set_ylabel("P(vasopressin on | hour)", fontsize=11)
+    ax.set_title(
+        f"Approach 2A — Time-varying P(vasopressin) by {label}\n"
+        f"Ref patient: age={REF_AGE}, p/f={REF_PF}, {REF_DEVICE}, NEE={REF_NEE} mcg/kg/min  "
+        f"|  {site}  [{_COHORT_LABELS.get(cohort_label, cohort_label)}]",
+        fontsize=10, fontweight="bold",
+    )
+    ax.legend(fontsize=9, framealpha=0.8, loc="upper left",
+              bbox_to_anchor=(1.01, 1), borderaxespad=0)
+    ax.set_xlim(5, t_max)
+    ax.set_ylim(0, 1)
+    fig.tight_layout()
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out = out_dir / f"approach2_time_by_{label}_{cohort_label}_{site}.png"
+    fig.savefig(out, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  Saved: {out.name}")
+
+
+def plot_approach2_nee_by_group(
+    group_result: dict,
+    site_ph: "pd.DataFrame",
+    out_dir: Path,
+    cohort_label: str,
+    site: str,
+    label: str,
+    ref_time: float = REF_TIME,
+) -> None:
+    """P(vaso_on) vs NEE dose for the reference patient, one line per ICU-type or hospital."""
+    group_models = group_result.get("group_models", {})
+    if len(group_models) < 2:
+        return
+
+    all_nee = site_ph["nee"].dropna().values if site_ph is not None else np.array([])
+    finite  = all_nee[np.isfinite(all_nee)]
+    nee_max = float(np.percentile(finite, 95)) if len(finite) else 2.0
+    nee_grid = np.linspace(0.0, min(nee_max, 2.0), 300)
+
+    keys = sorted(group_models.keys())
+    cmap = plt.cm.tab10
+    color_map = {
+        k: _GROUP_TYPE_COLOR_MAP.get(k, cmap(i / max(len(keys) - 1, 1)))
+        for i, k in enumerate(keys)
+    }
+
+    fig, ax = plt.subplots(figsize=(10, 5))
+    for grp in keys:
+        m = group_models[grp]
+        p_nee = predict_p(m, REF_AGE, nee_grid, ref_time)
+        ax.plot(nee_grid, p_nee, color=color_map[grp], linewidth=2.0,
+                label=f"{grp}  (n={m['n_patients']:,})")
+
+    ax.set_xlabel("NEE dose (mcg/kg/min)", fontsize=11)
+    ax.set_ylabel("P(vasopressin on)", fontsize=11)
+    ax.set_title(
+        f"Approach 2B — P(vasopressin) vs NEE by {label}\n"
+        f"Ref patient: age={REF_AGE}, p/f={REF_PF}, {REF_DEVICE}, t={ref_time:.0f} h  "
+        f"|  {site}  [{_COHORT_LABELS.get(cohort_label, cohort_label)}]",
+        fontsize=10, fontweight="bold",
+    )
+    ax.legend(fontsize=9, framealpha=0.8, loc="upper left",
+              bbox_to_anchor=(1.01, 1), borderaxespad=0)
+    ax.set_xlim(0, nee_grid[-1])
+    ax.set_ylim(0, 1)
+    fig.tight_layout()
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out = out_dir / f"approach2_nee_by_{label}_{cohort_label}_{site}.png"
+    fig.savefig(out, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  Saved: {out.name}")
+
+
+# ── Location transition heatmap ───────────────────────────────────────────────
+def _draw_transition_heatmap(
+    counts: "pd.DataFrame",
+    title: str,
+    out_path: Path,
+) -> None:
+    """Transition matrix heatmap: rows = start location, columns = end location.
+
+    Color = count / row_total (row-normalised fraction, 0–1).
+    Blank (white) cells have zero actual transitions.
+    Cell text = count on top, row_total in parentheses below.
+    """
+    # Square matrix over the union of all location labels
+    all_locs = sorted(set(counts.index) | set(counts.columns))
+    counts = counts.reindex(index=all_locs, columns=all_locs, fill_value=0)
+
+    # Same order for rows AND columns so the diagonal = "stayed in same location"
+    freq = counts.sum(axis=1) + counts.sum(axis=0)
+    order = freq.sort_values(ascending=False).index.tolist()
+    counts = counts.loc[order, order]
+
+    N = int(counts.values.sum())
+    if N == 0:
+        return
+
+    row_sums = counts.sum(axis=1).values.astype(float)   # shape (nrows,)
+
+    # fraction[i,j] = count[i,j] / row_sum[i]  (0 = nobody, 1 = everyone in row went here)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        frac = np.where(
+            row_sums[:, None] > 0,
+            counts.values / row_sums[:, None],
+            np.nan,
+        )
+    # White out cells with zero count (frac could be 0 from division or NaN from row_sum=0)
+    frac = np.where(counts.values > 0, frac, np.nan)
+
+    nrows, ncols = counts.shape
+    cell_px = 0.9
+    fig, ax = plt.subplots(figsize=(max(4, ncols * cell_px + 2.0),
+                                    max(3, nrows * cell_px + 1.5)))
+    cmap = plt.get_cmap("Blues").copy()
+    cmap.set_bad("white")
+    im = ax.imshow(frac, cmap=cmap, vmin=0.0, vmax=1.0, aspect="auto")
+
+    for i in range(nrows):
+        for j in range(ncols):
+            cnt = int(counts.values[i, j])
+            if cnt == 0:
+                ax.text(j, i, "—", ha="center", va="center",
+                        fontsize=12, color="#cccccc")
+            else:
+                row_total = int(row_sums[i])
+                pct = frac[i, j] * 100
+                text_color = "white" if frac[i, j] > 0.55 else "black"
+                ax.text(
+                    j, i,
+                    f"{cnt:,}\n({pct:.0f}%)",
+                    ha="center", va="center", fontsize=12, color=text_color,
+                )
+
+    ax.set_xticks(range(ncols))
+    ax.set_xticklabels(counts.columns.tolist(), rotation=40, ha="right", fontsize=6)
+    ax.set_yticks(range(nrows))
+    ax.set_yticklabels(counts.index.tolist(), fontsize=12)
+    ax.set_xlabel("Location at trajectory end  (death / ICU discharge / 120 h)", fontsize=7)
+    ax.set_ylabel("Location at NE start  (t = 0)", fontsize=7)
+
+    cbar = fig.colorbar(im, ax=ax, shrink=0.65, pad=0.02)
+    cbar.set_label("Fraction of row patients\n(0 = none, 1 = all)", fontsize=6)
+    cbar.ax.tick_params(labelsize=5)
+
+    ax.set_title(title, fontsize=7, fontweight="bold")
+
+    fig.tight_layout()
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_path, dpi=500, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  Saved: {out_path.name}")
+
+
+def _cohort_to_transition_counts(cohort: "pd.DataFrame") -> "pd.DataFrame | None":
+    """Build a (loc_start × loc_end) count matrix for one cohort dataframe."""
+    if ("location_category_end" not in cohort.columns
+            and "location_type_end" not in cohort.columns):
+        return None
+    df = cohort.copy()
+    df["loc_start"] = _canon_icu_series(
+        _effective_location(df, "location_type", "location_category")
+    )
+    df["loc_end"] = _canon_icu_series(
+        _effective_location(df, "location_type_end", "location_category_end")
+    ).fillna("Unknown / Missing")
+    df = df.dropna(subset=["loc_start"])  # keep rows with unknown end-location
+    if df.empty:
+        return None
+    return df.groupby(["loc_start", "loc_end"]).size().unstack(fill_value=0)
+
+
+def plot_location_transition_heatmap(
+    cohort: "pd.DataFrame", out_dir: Path, cohort_label: str, site: str
+) -> None:
+    counts = _cohort_to_transition_counts(cohort)
+    if counts is None:
+        print(f"  [{site}] End-location columns absent or no data — skipping heatmap.")
+        return
+    N = int(counts.values.sum())
+    _draw_transition_heatmap(
+        counts,
+        title=(
+            f"Location transition — {site}  [{_COHORT_LABELS.get(cohort_label, cohort_label)}]  "
+            f"N = {N:,} patients\n"
+            f"Cell: count (% of row)   |   Color: fraction of row patients ending here"
+        ),
+        out_path=out_dir / f"location_transition_{cohort_label}_{site}.png",
+    )
+
+
+def plot_pooled_location_transition_heatmap(
+    cohort_by_site: dict, out_dir: Path, cohort_label: str
+) -> None:
+    """Pool all sites' transition counts and draw one combined heatmap."""
+    pooled: "pd.DataFrame | None" = None
+    for site, cohort in cohort_by_site.items():
+        c = _cohort_to_transition_counts(cohort)
+        if c is None:
+            continue
+        if pooled is None:
+            pooled = c
+        else:
+            pooled = pooled.add(c, fill_value=0).fillna(0)
+    if pooled is None or pooled.values.sum() == 0:
+        print(f"  No transition data found across any site for {cohort_label} — skipping pooled heatmap.")
+        return
+    N = int(pooled.values.sum())
+    _draw_transition_heatmap(
+        pooled,
+        title=(
+            f"Location transition — ALL SITES POOLED  [{_COHORT_LABELS.get(cohort_label, cohort_label)}]  "
+            f"N = {N:,} patients\n"
+            f"Cell: count (% of row)   |   Color: fraction of row patients ending here"
+        ),
+        out_path=out_dir / f"location_transition_{cohort_label}_pooled.png",
+    )
+
+
 # ── Interpretable coefficient / group-intercept tables ───────────────────────
 def export_coefficient_table(model: dict) -> pd.DataFrame:
     """One row per fitted-model term: beta, SE, OR, 95% CI, p-value."""
@@ -990,7 +1321,7 @@ def run_for_cohort(cohort_label: str):
             m = site_models[site]
             print(f"    n={m['n_patients']:,}  vaso_on={m['n_vaso_on']:,}  "
                   f"α={m['coefficients']['intercept']['beta']:+.4f}  "
-                  f"P_ref={m['ref_patient_p_t0']:.1%}")
+                  f"P_ref={m['ref_patient_p_t5']:.1%}")
         except Exception as _e:
             import traceback; traceback.print_exc()
             print(f"    WARNING: model fit failed for {site}: {_e}")
@@ -1029,20 +1360,25 @@ def run_for_cohort(cohort_label: str):
         print("  Skipping: only 1 site available.")
 
     # ── Approach 3: ward/ICU-type + hospital variance + 4-level decomposition ──
+    # Ward/hospital fitting only needs this site's own data — always run it.
+    # The 4-level decomposition also needs cross-site tau2 (dl_tau2 from mixed
+    # effects); if that's unavailable (single-site run), we store ward/hospital
+    # results in the packet so the coordinating script can backfill it later.
     print("\n--- Approach 3: Ward/ICU-type + hospital variance + 4-level decomposition ---")
-    ward_results:     dict = {}
-    hospital_results: dict = {}
-    variance_decomp:  dict = {}
-    if me_result.get("dl_tau2") is not None:
-        for site in site_models:
-            print(f"\n  [{site}] ward/ICU type:")
-            ward_results[site] = fit_ward_level_variance(
-                cohort_by_site[site], ph_by_site[site], cohort_label, site
-            )
-            print(f"  [{site}] hospital:")
-            hospital_results[site] = fit_hospital_level_variance(
-                cohort_by_site[site], ph_by_site[site], cohort_label, site
-            )
+    ward_results:          dict = {}
+    hospital_results:      dict = {}
+    hospital_type_results: dict = {}
+    variance_decomp:       dict = {}
+    for site in site_models:
+        print(f"\n  [{site}] ward/ICU type:")
+        ward_results[site] = fit_ward_level_variance(
+            cohort_by_site[site], ph_by_site[site], cohort_label, site
+        )
+        print(f"  [{site}] hospital:")
+        hospital_results[site] = fit_hospital_level_variance(
+            cohort_by_site[site], ph_by_site[site], cohort_label, site
+        )
+        if me_result.get("dl_tau2") is not None:
             decomp = compute_variance_decomposition(
                 ward_results[site], hospital_results[site], me_result
             )
@@ -1053,10 +1389,43 @@ def run_for_cohort(cohort_label: str):
                       f"{decomp['pct_site']:.1f}% were attributed to ward/ICU type, hospital, and "
                       f"CLIF site respectively.")
                 plot_variance_decomposition(decomp, cross_out, cohort_label, site)
-            plot_group_intercepts(ward_results[site], cross_out, cohort_label, site, "ward")
-            plot_group_intercepts(hospital_results[site], cross_out, cohort_label, site, "hospital")
-    else:
-        print("  Skipping: need >=2 sites pooled for site-level τ² (mixed effects).")
+        else:
+            print(f"  [{site}] variance decomposition deferred — no cross-site τ² available "
+                  f"(single-site run); coordinating script will backfill from cross-site analysis.")
+        plot_group_intercepts(ward_results[site], cross_out, cohort_label, site, "ward")
+        plot_group_intercepts(hospital_results[site], cross_out, cohort_label, site, "hospital")
+        # Approach 2A/2B broken down by ward/ICU-type and hospital
+        plot_approach2_time_by_group(
+            ward_results[site], cross_out, cohort_label, site, "ward"
+        )
+        plot_approach2_nee_by_group(
+            ward_results[site], ph_by_site[site], cross_out, cohort_label, site, "ward"
+        )
+        plot_approach2_time_by_group(
+            hospital_results[site], cross_out, cohort_label, site, "hospital"
+        )
+        plot_approach2_nee_by_group(
+            hospital_results[site], ph_by_site[site], cross_out, cohort_label, site, "hospital"
+        )
+        print(f"  [{site}] hospital type (academic vs. community):")
+        hospital_type_results[site] = fit_hospital_type_variance(
+            cohort_by_site[site], ph_by_site[site], cohort_label, site
+        )
+        plot_approach2_time_by_group(
+            hospital_type_results[site], cross_out, cohort_label, site, "hospital_type"
+        )
+        plot_approach2_nee_by_group(
+            hospital_type_results[site], ph_by_site[site], cross_out, cohort_label, site, "hospital_type"
+        )
+
+    # ── Location transition heatmaps ───────────────────────────────────────
+    print("\n--- Location transition heatmaps ---")
+    for site in site_models:
+        plot_location_transition_heatmap(
+            cohort_by_site[site], cross_out, cohort_label, site
+        )
+    print("  [pooled] all sites combined:")
+    plot_pooled_location_transition_heatmap(cohort_by_site, cross_out, cohort_label)
 
     # ── Save variation packets ────────────────────────────────────────────
     # One packet per site, each containing all site models + mixed effects.
@@ -1067,9 +1436,10 @@ def run_for_cohort(cohort_label: str):
         "per_site_models":  site_models,          # all sites
         "per_site_model":   site_models.get(SITE_NAME, {}),  # back-compat
         "mixed_effects":    me_result,
-        "ward_level":             ward_results,      # per site: group_models + tau2/icc/mor (ICU type)
-        "hospital_level":         hospital_results,   # per site: group_models + tau2/icc/mor (hospital_id)
-        "variance_decomposition": variance_decomp,   # per site: patient/ward/hospital/site % of total variance
+        "ward_level":             ward_results,           # per site: group_models + tau2/icc/mor (ICU type)
+        "hospital_level":         hospital_results,       # per site: group_models + tau2/icc/mor (hospital_id)
+        "hospital_type_level":    hospital_type_results,  # per site: academic vs. community
+        "variance_decomposition": variance_decomp,        # per site: patient/ward/hospital/site % of total variance
     }
 
     # Write into each site's upload directory so the report can find it

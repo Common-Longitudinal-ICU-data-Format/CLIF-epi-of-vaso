@@ -282,15 +282,37 @@ pat = pat.merge(first_vaso, on="stay_id", how="left")
 _cohort_cols = ["stay_id", "hospital_death", "traj_hours",
                 "age", "gender", "race", "weight",
                 "sepsis_onset_sofa", "initial_lactate", "first_norepi_time"]
-if "trajectory_start" in cohort.columns:
-    _cohort_cols.append("trajectory_start")
+for _c in ["trajectory_start", "vaso_before_traj", "first_vaso_time", "infection_dttm",
+           "icu_los_days", "hospital_los_days", "traj_end_reason"]:
+    if _c in cohort.columns:
+        _cohort_cols.append(_c)
 pat = pat.merge(cohort[_cohort_cols], on="stay_id")
 pat["gender_female"] = (pat["gender"] == "F").astype(float)
 
+# Identify patients who received vasopressin before NE start
+prior_vaso_ids = (
+    set(pat.loc[pat["vaso_before_traj"] == 1, "stay_id"])
+    if "vaso_before_traj" in pat.columns else set()
+)
+print(f"  {len(prior_vaso_ids):,} patients with vasopressin before NE start (prior-vaso group)")
+
+# For prior-vaso patients, first_vaso_hour=0 is structurally misleading — vasopressin
+# was running before NE start, but the hourly grid begins at t=0.  Clear it and the
+# initiation-state features so analyses that use first_vaso_hour work cleanly.
+if prior_vaso_ids:
+    _pv = pat["stay_id"].isin(prior_vaso_ids)
+    pat.loc[_pv, "first_vaso_hour"] = np.nan
+    for _c in ["nee_at_init", "ne_at_init", "mbp_at_init", "sofa_at_init",
+               "lac_at_init", "creatinine_at_init", "bun_at_init",
+               "fluids_at_init", "ventil_at_init", "rrt_at_init", "steroid_at_init"]:
+        if _c in pat.columns:
+            pat.loc[_pv, _c] = np.nan
+
 # Pre-vaso max NEE:
-#   ever-vaso  → max NEE in hours strictly before first_vaso_hour
-#   never-vaso → max NEE over full trajectory (no vaso to exclude)
-pre_vaso_nee = features.merge(
+#   ever-vaso (NE-first)  → max NEE in hours strictly before first_vaso_hour
+#   never-vaso            → max NEE over full trajectory
+#   prior-vaso patients are excluded — no valid pre-vaso epoch on the grid
+pre_vaso_nee = features[~features["stay_id"].isin(prior_vaso_ids)].merge(
     pat[["stay_id", "first_vaso_hour"]], on="stay_id", how="left"
 )
 pre_vaso_nee = pre_vaso_nee[
@@ -392,6 +414,287 @@ def mean_ci(df, col, group_col="rel_hour"):
 
 
 # =============================================================================
+# Analysis 0.5: Who receives vasopressin before NE start?
+# =============================================================================
+print("\nAnalysis 0.5: Prior-vasopressin group characterization...")
+
+# ── Assign vasopressin timing group ──────────────────────────────────────────
+if "vaso_before_traj" in pat.columns:
+    pat["vaso_group"] = np.where(
+        pat["vaso_before_traj"] == 1, "vaso_first",
+        np.where(pat["ever_vaso"] == 1, "ne_first_then_vaso", "never_vaso"),
+    )
+else:
+    pat["vaso_group"] = np.where(pat["ever_vaso"] == 1, "ne_first_then_vaso", "never_vaso")
+
+_n_vf  = (pat["vaso_group"] == "vaso_first").sum()
+_n_nfv = (pat["vaso_group"] == "ne_first_then_vaso").sum()
+_n_nv  = (pat["vaso_group"] == "never_vaso").sum()
+print(f"  vaso_first={_n_vf}  ne_first_then_vaso={_n_nfv}  never_vaso={_n_nv}")
+
+# ── Comparison table ──────────────────────────────────────────────────────────
+_tbl_vars_cont = {
+    "age":               "Age (years)",
+    "weight":            "Weight (kg)",
+    "sepsis_onset_sofa": "SOFA at NE start",
+    "initial_lactate":   "Lactate at NE start (mmol/L)",
+    "traj_hours":        "Trajectory hours",
+    "icu_los_days":      "ICU LOS (days)",
+    "hospital_los_days": "Hospital LOS (days)",
+}
+_tbl_vars_bin = {
+    "hospital_death": "Hospital mortality",
+}
+
+_grp_specs_05 = [
+    ("vaso_first",       f"Vaso first (n={_n_vf})"),
+    ("ne_first_then_vaso", f"NE first → vaso (n={_n_nfv})"),
+    ("never_vaso",       f"Never vaso (n={_n_nv})"),
+]
+_grp_dfs_05 = {lbl: pat[pat["vaso_group"] == grp] for grp, lbl in _grp_specs_05}
+
+_tbl_rows_05 = []
+for var, label in _tbl_vars_cont.items():
+    row = {"Variable": label}
+    for lbl, gdf in _grp_dfs_05.items():
+        col = gdf[var].dropna() if var in gdf.columns else pd.Series(dtype=float)
+        if len(col) >= 2:
+            row[lbl] = f"{col.median():.1f} [{col.quantile(0.25):.1f}–{col.quantile(0.75):.1f}]"
+        else:
+            row[lbl] = "—"
+    _tbl_rows_05.append(row)
+
+for var, label in _tbl_vars_bin.items():
+    row = {"Variable": label}
+    for lbl, gdf in _grp_dfs_05.items():
+        col = gdf[var].dropna() if var in gdf.columns else pd.Series(dtype=float)
+        if len(col) > 0:
+            row[lbl] = f"{col.mean():.1%} ({int(col.sum())}/{len(gdf)})"
+        else:
+            row[lbl] = "—"
+    _tbl_rows_05.append(row)
+
+if "traj_end_reason" in pat.columns:
+    for _reason in ["death", "discharge", "hour_cap"]:
+        row = {"Variable": f"  Trajectory end: {_reason}"}
+        for lbl, gdf in _grp_dfs_05.items():
+            _col = gdf["traj_end_reason"].dropna() if "traj_end_reason" in gdf.columns else pd.Series()
+            _n = int((_col == _reason).sum())
+            _pct = _n / len(gdf) if len(gdf) > 0 else 0
+            row[lbl] = f"{_pct:.1%} ({_n})"
+        _tbl_rows_05.append(row)
+
+_compare_df_05 = pd.DataFrame(_tbl_rows_05)
+_compare_df_05.to_csv(OUT_DIR / f"{SITE_LOWER}_analysis05_vaso_group_table.csv", index=False)
+
+# ── Timing plot: drug starts relative to infection onset ──────────────────────
+_has_timing = "infection_dttm" in pat.columns and "first_norepi_time" in pat.columns
+if _has_timing:
+    from scipy.stats import gaussian_kde as _kde
+
+    _inf_dt = pd.to_datetime(pat["infection_dttm"], utc=True, errors="coerce").dt.tz_localize(None)
+    _ne_dt  = pd.to_datetime(pat["first_norepi_time"], utc=True, errors="coerce").dt.tz_localize(None)
+    pat["_h_ne_inf"]   = (_ne_dt - _inf_dt).dt.total_seconds() / 3600
+
+    # NE-first-then-vaso: approximate vaso start from grid hour
+    _nfv_mask = pat["vaso_group"] == "ne_first_then_vaso"
+    pat["_h_vaso_inf"] = np.nan
+    pat.loc[_nfv_mask, "_h_vaso_inf"] = (
+        pat.loc[_nfv_mask, "_h_ne_inf"] + pat.loc[_nfv_mask, "first_vaso_hour"]
+    )
+
+    # Vaso-first: use saved first_vaso_time timestamp
+    if "first_vaso_time" in pat.columns:
+        _fvt = pd.to_datetime(pat["first_vaso_time"], utc=True, errors="coerce").dt.tz_localize(None)
+        _vf_mask = pat["vaso_group"] == "vaso_first"
+        pat.loc[_vf_mask, "_h_vaso_inf"] = (
+            _fvt.loc[_vf_mask] - _inf_dt.loc[_vf_mask]
+        ).dt.total_seconds() / 3600
+
+    _XLIM   = (-72, 168)
+    _BINS   = np.arange(_XLIM[0], _XLIM[1] + 4, 4)
+    _X_KDE  = np.linspace(_XLIM[0], _XLIM[1], 400)
+    _C_NE   = "#4e79a7"
+    _C_VASO = "#f28e2b"
+
+    fig05, axes05 = plt.subplots(1, 2, figsize=(14, 5))
+
+    for ax05, grp_code, title05 in [
+        (axes05[0], "ne_first_then_vaso", "NE-first → vasopressin"),
+        (axes05[1], "vaso_first",         "Vasopressin-first → NE"),
+    ]:
+        _sub = pat[pat["vaso_group"] == grp_code]
+        _ne_t   = _sub["_h_ne_inf"].dropna()
+        _ne_t   = _ne_t[_ne_t.between(_XLIM[0], _XLIM[1])]
+        _vaso_t = _sub["_h_vaso_inf"].dropna()
+        _vaso_t = _vaso_t[_vaso_t.between(_XLIM[0], _XLIM[1])]
+
+        if len(_ne_t) > 0:
+            ax05.hist(_ne_t, bins=_BINS, alpha=0.45, color=_C_NE, density=True,
+                      label=f"First NE (n={len(_ne_t)})")
+        if len(_vaso_t) > 0:
+            ax05.hist(_vaso_t, bins=_BINS, alpha=0.45, color=_C_VASO, density=True,
+                      label=f"First vasopressin (n={len(_vaso_t)})")
+        if len(_ne_t) > 5:
+            ax05.plot(_X_KDE, _kde(_ne_t)(_X_KDE), color=_C_NE, linewidth=2)
+        if len(_vaso_t) > 5:
+            ax05.plot(_X_KDE, _kde(_vaso_t)(_X_KDE), color=_C_VASO, linewidth=2)
+
+        ax05.axvline(0, color="black", linewidth=1.5, linestyle="--", label="Infection onset")
+        ax05.set_xlabel("Hours relative to infection onset", fontsize=11)
+        ax05.set_ylabel("Density", fontsize=11)
+        ax05.set_title(f"{SITE_NAME}: {title05}\n(n={len(_sub):,})", fontsize=11)
+        ax05.set_xlim(_XLIM)
+        ax05.legend(fontsize=9)
+
+    fig05.suptitle(
+        "Timing of first NE and first vasopressin relative to infection onset",
+        fontsize=12,
+    )
+    fig05.tight_layout()
+    _timing_png = OUT_DIR / f"{SITE_LOWER}_analysis05_ne_vaso_timing_infection.png"
+    fig05.savefig(_timing_png, dpi=300, bbox_inches="tight")
+    plt.close(fig05)
+    print("  Saved timing plot")
+
+    # ── Prior-vaso swimlane: per-patient NE vs vaso timing (PHI, local only) ──
+    import io as _io
+    import base64 as _b64
+    _vf = pat[pat["vaso_group"] == "vaso_first"].copy()
+    _vf = _vf.dropna(subset=["_h_vaso_inf", "_h_ne_inf"])
+    _sw_b64 = None
+    if len(_vf) > 0:
+        _vf = _vf.sort_values(["_h_vaso_inf", "_h_ne_inf"],
+                               ascending=[True, True]).reset_index(drop=True)
+        _n_vf_sw = len(_vf)
+        _ne_t_sw   = _vf["_h_ne_inf"].values
+        _vaso_t_sw = _vf["_h_vaso_inf"].values
+
+        _fig_h_sw = max(8, min(22, _n_vf_sw * 0.016))
+        _fig_sw, _ax_sw = plt.subplots(figsize=(13, _fig_h_sw))
+
+        for _i in range(_n_vf_sw):
+            _vt, _nt = _vaso_t_sw[_i], _ne_t_sw[_i]
+            _lc = "#d62728" if _vt < _nt else "#2ca02c"
+            _ax_sw.plot([_vt, _nt], [_i, _i],
+                        color=_lc, linewidth=0.55, alpha=0.6, zorder=2)
+
+        _ax_sw.scatter(_ne_t_sw, np.arange(_n_vf_sw),
+                       marker="o", s=5, color="#2ca02c", zorder=4, alpha=0.75,
+                       label="First NE dose")
+        _ax_sw.scatter(_vaso_t_sw, np.arange(_n_vf_sw),
+                       marker="*", s=16, color="#d62728", zorder=5, alpha=0.80,
+                       label="First vasopressin dose")
+
+        _ax_sw.axvline(0, color="black", linestyle="--", linewidth=1.5,
+                       alpha=0.8, label="Infection onset (x = 0)")
+        _ax_sw.set_yticks([])
+        _ax_sw.set_xlabel("Hours relative to suspected infection onset (x = 0)", fontsize=11)
+        _ax_sw.set_ylabel(
+            f"Individual patients  (n={_n_vf_sw:,}, sorted by vasopressin start time)",
+            fontsize=10,
+        )
+        _ax_sw.set_title(
+            f"{SITE_NAME}: Prior-vasopressin group — NE and vasopressin timing relative to infection\n"
+            f"(vaso_before_traj = 1; vasopressin in 24 h before NE start)  [{COHORT_NAME}]",
+            fontsize=11,
+        )
+        _ax_sw.set_xlim(
+            min(-72, float(_vaso_t_sw.min()) - 5),
+            max(72, float(_ne_t_sw.max()) + 5),
+        )
+        _ax_sw.legend(fontsize=10, loc="upper right")
+        _fig_sw.tight_layout()
+
+        # Encode directly from memory — avoids any file I/O round-trip
+        _sw_buf = _io.BytesIO()
+        _fig_sw.savefig(_sw_buf, dpi=150, bbox_inches="tight", format="png")
+        _sw_buf.seek(0)
+        _sw_b64 = _b64.b64encode(_sw_buf.read()).decode()
+
+        # Also save PNG to disk for reference
+        _sw_path = OUT_DIR / f"{SITE_LOWER}_prior_vaso_swimlane_{COHORT_NAME}.png"
+        with open(_sw_path, "wb") as _fh:
+            _sw_buf.seek(0)
+            _fh.write(_sw_buf.read())
+        plt.close(_fig_sw)
+        print(f"  Saved swimlane: {_n_vf_sw:,} patients → {_sw_path.name}")
+
+    # ── HTML report (embeds both the population timing plot and the swimlane) ──
+    with open(_timing_png, "rb") as _fh:
+        _img_b64 = _b64.b64encode(_fh.read()).decode()
+
+    _sw_section = ""
+    if _sw_b64 is not None:
+        _sw_section = (
+            "<h2>Per-patient swimlane: prior-vaso group (PHI — local only)</h2>"
+            "<p>Each row is one patient, sorted by vasopressin start time. "
+            "Green circle = first NE dose; red star = first vasopressin dose; "
+            "red line = vasopressin came before NE; green line = NE came before vasopressin.</p>"
+            f'<img src="data:image/png;base64,{_sw_b64}" '
+            'style="max-width:100%;border:1px solid #ddd">'
+        )
+
+    _tbl_html = _compare_df_05.to_html(index=False, border=0, classes="tbl")
+    _html_05 = f"""<!DOCTYPE html>
+<html><head><meta charset="utf-8">
+<title>{SITE_NAME} — Vasopressin vs NE Timing ({COHORT_NAME})</title>
+<style>
+  body{{font-family:Arial,sans-serif;margin:2em;max-width:1400px}}
+  h1{{color:#333}}h2{{color:#555;margin-top:2em}}
+  .tbl{{border-collapse:collapse;width:100%;margin-bottom:1.5em}}
+  .tbl th,.tbl td{{border:1px solid #ccc;padding:8px 14px;text-align:left}}
+  .tbl th{{background:#4e79a7;color:#fff}}
+  .tbl tr:nth-child(even){{background:#f5f5f5}}
+  p.meta{{color:#777;font-size:.9em}}
+</style></head><body>
+<h1>{SITE_NAME} — Who Receives Vasopressin Before NE?</h1>
+<p class="meta">Cohort: {COHORT_NAME} &nbsp;|&nbsp;
+  Vaso-first: {_n_vf} &nbsp;|&nbsp;
+  NE-first → vaso: {_n_nfv} &nbsp;|&nbsp;
+  Never-vaso: {_n_nv}</p>
+<h2>Group comparison (median [IQR] or % (n/N))</h2>
+{_tbl_html}
+<h2>Population-level timing of drug starts relative to infection onset (x = 0)</h2>
+<img src="data:image/png;base64,{_img_b64}" style="max-width:100%;border:1px solid #ddd">
+{_sw_section}
+</body></html>"""
+
+    _html_path_05 = OUT_DIR / f"{SITE_LOWER}_analysis05_prior_vaso.html"
+    _html_path_05.write_text(_html_05, encoding="utf-8")
+    print(f"  Saved {_html_path_05.name}")
+
+    # ── Aggregate timing histogram for multisite pooled plot ─────────────────
+    _TIMING_BINS = np.arange(-72, 170, 2)   # 2-hour bins covering −72 to +168 h
+    _timing_rows = []
+    for _grp_codes, _grp_label in [
+        (["ne_first_then_vaso", "never_vaso"], "no_prior_vaso"),
+        (["vaso_first"],                        "prior_vaso"),
+    ]:
+        _sub_g = pat[pat["vaso_group"].isin(_grp_codes)]
+        _n_total_g = len(_sub_g)
+        for _evt_col, _evt_label in [("_h_ne_inf", "ne_start"), ("_h_vaso_inf", "vaso_start")]:
+            _vals_g = _sub_g[_evt_col].dropna()
+            _vals_g = _vals_g[_vals_g.between(-72, 168)]
+            _counts_g, _edges_g = np.histogram(_vals_g, bins=_TIMING_BINS)
+            for _i, _cnt in enumerate(_counts_g):
+                _timing_rows.append({
+                    "group":          _grp_label,
+                    "event":          _evt_label,
+                    "bin_left_hour":  float(_edges_g[_i]),
+                    "bin_right_hour": float(_edges_g[_i + 1]),
+                    "count":          int(_cnt),
+                    "n_patients":     _n_total_g,
+                })
+    pd.DataFrame(_timing_rows).to_csv(OUT_DIR / "timing_infection_hist.csv", index=False)
+    print("  Saved timing_infection_hist.csv")
+else:
+    print("  Timing plot skipped — infection_dttm not available in cohort parquet")
+    print("  Re-run 01_clif_extract.py to generate updated cohort files with infection_dttm.")
+
+print("  Saved analysis0.5")
+
+# =============================================================================
 # Analysis 0: Cumulative incidence of vasopressin initiation by pre-vaso NEE bin
 # =============================================================================
 print("\nAnalysis 0: Time-to-vasopressin initiation by pre-vaso NEE bin...")
@@ -399,8 +702,10 @@ print("\nAnalysis 0: Time-to-vasopressin initiation by pre-vaso NEE bin...")
 # Event time  = first_vaso_hour for initiators
 # Censor time = traj_hours for never-vaso patients
 # Binning     = pre_vaso_max_nee (max NEE before vaso started, or full traj for never-vaso)
-km0 = pat[["stay_id", "ever_vaso", "first_vaso_hour", "traj_hours",
-           "pre_vaso_nee_group"]].copy()
+# Prior-vaso patients are excluded: their first_vaso_hour is NaN and pre_vaso_nee_group undefined
+km0 = pat[~pat["stay_id"].isin(prior_vaso_ids)][
+    ["stay_id", "ever_vaso", "first_vaso_hour", "traj_hours", "pre_vaso_nee_group"]
+].copy()
 km0["event_time"] = np.where(
     km0["ever_vaso"] == 1,
     km0["first_vaso_hour"],
@@ -850,7 +1155,7 @@ if _comp_avail and len(ever_vaso_ids) > 0:
             ax.legend(title="Drug", bbox_to_anchor=(1.02, 1), loc="upper left", fontsize=9)
             ax.set_title(
                 f"{SITE_NAME}: Mean NEE-equivalent contribution per drug in 24h before vasopressin initiation\n"
-                f"(ever-vaso patients, n={len(ever_vaso_ids):,}; stacked; weights: NE×1, EPI×1, PE×0.1, DA×0.01)",
+                f"(ever-vaso patients, n={len(ever_vaso_ids):,}; stacked; weights: NE×1, EPI×1, PE×0.1, DA×0.01, ANG×10)",
                 fontsize=12,
             )
             fig.tight_layout()
@@ -989,7 +1294,7 @@ if _comp_avail:
         ax.legend(title="Drug", bbox_to_anchor=(1.02, 1), loc="upper left", fontsize=9)
         ax.set_title(
             f"{SITE_NAME}: Mean NEE-equivalent contribution per drug by NEE dose bin\n"
-            f"(all patient-hours; stacked; weights: NE×1, EPI×1, PE×0.1, DA×0.01)",
+            f"(all patient-hours; stacked; weights: NE×1, EPI×1, PE×0.1, DA×0.01, ANG×10)",
             fontsize=12,
         )
         fig.tight_layout()
@@ -1246,7 +1551,7 @@ print("  Saved analysis3_TOD")
 # =============================================================================
 print("Analysis 4a: Time-to-vaso histogram...")
 
-vaso_timing = pat[pat["ever_vaso"] == 1]["first_vaso_hour"].dropna()
+vaso_timing = pat[~pat["stay_id"].isin(prior_vaso_ids) & (pat["ever_vaso"] == 1)]["first_vaso_hour"].dropna()
 med_h = vaso_timing.median()
 p75_h = vaso_timing.quantile(0.75)
 
@@ -2124,8 +2429,12 @@ pd.DataFrame(_rows).to_csv(AGG_DIR / "tod_init_features_lowess.csv", index=False
 print("  8/12 tod_init_features_lowess.csv")
 
 # ── 9. time_to_vaso_hist.csv ─────────────────────────────────────────────────
-_vt = pat[pat["ever_vaso"] == 1]["first_vaso_hour"].dropna()
-_hist_bins = np.arange(0, 122, 2)
+# Excludes prior-vaso patients: their vaso started before NE (before t=0 on the grid)
+_pat_ne_first = pat[~pat["stay_id"].isin(prior_vaso_ids)]
+_vt = _pat_ne_first[_pat_ne_first["ever_vaso"] == 1]["first_vaso_hour"].dropna()
+_n_total_cohort = len(_pat_ne_first)
+_n_never_vaso   = int((_pat_ne_first["ever_vaso"] == 0).sum())
+_hist_bins = np.arange(0, 122, 1)  # 1-hour bins
 _counts, _edges = np.histogram(_vt, bins=_hist_bins)
 pd.DataFrame(dict(
     bin_left_hour=_edges[:-1],
@@ -2133,6 +2442,8 @@ pd.DataFrame(dict(
     count=_counts,
     median_hours=_vt.median(),
     p75_hours=_vt.quantile(0.75),
+    n_total_cohort=_n_total_cohort,
+    n_never_vaso=_n_never_vaso,
 )).to_csv(AGG_DIR / "time_to_vaso_hist.csv", index=False)
 print("  9/12 time_to_vaso_hist.csv")
 
@@ -2229,7 +2540,7 @@ _DRUG_DEFS_13 = [
     ("phenylephrine",  "PHENYL"),
     ("dopamine",       "DOPA"),
     ("epinephrine",    "EPI"),
-    ("angiotensin",    "ANGII"),
+    ("angiotensin ii", "ANGII"),
 ]
 _avail_drugs_13 = [(col, name) for col, name in _DRUG_DEFS_13 if col in features.columns]
 if _avail_drugs_13:

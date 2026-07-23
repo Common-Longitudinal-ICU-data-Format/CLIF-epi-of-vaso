@@ -451,6 +451,45 @@ def get_location_at_t0(clif_dir: Path, cohort: pd.DataFrame) -> pd.DataFrame:
     return result
 
 
+def get_location_at_end(clif_dir: Path, cohort: pd.DataFrame) -> pd.DataFrame:
+    """ADT location at trajectory_end per patient (death / ICU discharge / 120-h cap).
+
+    Returns stay_id + location_category_end + location_type_end (and
+    hospital_id_end / hospital_type_end when present in the ADT).
+    """
+    adt = pd.read_parquet(clif_dir / "clif_adt.parquet")
+    adt["in_dttm"]  = to_naive_utc(adt["in_dttm"])
+    adt["out_dttm"] = to_naive_utc(adt["out_dttm"].fillna(pd.Timestamp("2100-01-01")))
+
+    t_end = (cohort[["stay_id", "trajectory_end"]]
+             .rename(columns={"stay_id": "hospitalization_id"})
+             .copy())
+    t_end["t_end"] = to_naive_utc(pd.to_datetime(t_end["trajectory_end"], utc=True))
+
+    loc_cols = ["hospitalization_id", "in_dttm", "out_dttm", "location_category"]
+    loc_cols += [c for c in _LOC_T0_OPTIONAL_COLS if c in adt.columns]
+
+    merged = t_end.merge(adt[loc_cols], on="hospitalization_id", how="left")
+    # Take the last ADT record the patient entered on or before trajectory_end.
+    # A strict t_end < out_dttm check silently drops patients whose ADT out_dttm
+    # equals their death/discharge time exactly (which is the common CLIF pattern).
+    active = merged[merged["in_dttm"] <= merged["t_end"]]
+    active = (active.sort_values("in_dttm")
+                    .groupby("hospitalization_id")
+                    .last()
+                    .reset_index())
+
+    src_cols = ["location_category"] + [c for c in _LOC_T0_OPTIONAL_COLS if c in active.columns]
+    keep = ["hospitalization_id"] + src_cols
+    result = active[[c for c in keep if c in active.columns]].rename(
+        columns={c: f"{c}_end" for c in src_cols}
+    ).rename(columns={"hospitalization_id": "stay_id"})
+    for c in ["location_category_end", "location_type_end"]:
+        if c not in result.columns:
+            result[c] = np.nan
+    return result
+
+
 # ---------------------------------------------------------------------------
 # Phase A-5: Mortality, demographics, trajectory helpers
 # ---------------------------------------------------------------------------
@@ -491,7 +530,9 @@ def get_demographics(clif_dir: Path, stay_ids: set) -> pd.DataFrame:
 
 
 def get_vaso_pretraj(clif_dir: Path, cohort: pd.DataFrame) -> pd.DataFrame:
-    """1 if vasopressin was administered in the 24 h before trajectory_start, else 0."""
+    """vaso_before_traj: 1 if vasopressin given in 24 h before trajectory_start, else 0.
+    first_vaso_time: first vasopressin admin timestamp for vaso-before-traj patients (NaT otherwise).
+    """
     meds = pd.read_parquet(clif_dir / "clif_medication_admin_continuous.parquet")
     vaso = meds[meds["med_category"] == "vasopressin"][
         ["hospitalization_id", "admin_dttm"]
@@ -505,13 +546,20 @@ def get_vaso_pretraj(clif_dir: Path, cohort: pd.DataFrame) -> pd.DataFrame:
 
     in_window = (
         (vaso["admin_dttm"] >= vaso["traj_start"] - pd.Timedelta(hours=24)) &
-        (vaso["admin_dttm"] <  vaso["traj_start"] + pd.Timedelta(hours=1))
+        (vaso["admin_dttm"] <  vaso["traj_start"])
     )
     pretraj_ids = set(vaso.loc[in_window, "stay_id"])
-    return pd.DataFrame({
+    first_vaso_time = (
+        vaso.loc[in_window]
+        .groupby("stay_id")["admin_dttm"].min()
+        .rename("first_vaso_time")
+        .reset_index()
+    )
+    result = pd.DataFrame({
         "stay_id": cohort["stay_id"],
         "vaso_before_traj": cohort["stay_id"].isin(pretraj_ids).astype(int),
     })
+    return result.merge(first_vaso_time, on="stay_id", how="left")
 
 
 def get_weight_at_onset(clif_dir: Path, cohort: pd.DataFrame) -> pd.DataFrame:
@@ -635,7 +683,7 @@ def _assemble_cohort_df(
     )
 
     for col in ["icu_intime", "icu_outtime", "first_norepi_time", "deathtime",
-                "admission_dttm", "discharge_dttm"]:
+                "admission_dttm", "discharge_dttm", "infection_dttm"]:
         if col in cohort.columns:
             cohort[col] = tz_coerce(cohort[col], TIMEZONE)
 
@@ -742,6 +790,10 @@ def build_cohort(clif_dir: Path, co: ClifOrchestrator) -> tuple:
     icu = get_icu_times(clif_dir)
 
     print("\nStep 5: Assembling cohort DataFrames with trajectory bounds...")
+    sepsis3_df = sepsis3_df.copy()
+    sepsis3_df["infection_dttm"] = sepsis3_df["presumed_infection_dttm"]
+    rhee_df = rhee_df.copy()
+    rhee_df["infection_dttm"] = rhee_df["blood_culture_dttm"]
     cohort_s3   = _assemble_cohort_df(sepsis3_df, ne_union, icu, mortality)
     cohort_rhee = _assemble_cohort_df(rhee_df,   ne_union, icu, mortality)
 
@@ -817,14 +869,14 @@ def build_cohort(clif_dir: Path, co: ClifOrchestrator) -> tuple:
     for cohort in [cohort_s3, cohort_rhee]:
         cohort["vaso_before_traj"] = cohort["vaso_before_traj"].fillna(0).astype(int)
 
-    print("\nStep 9: Excluding patients with vasopressin before trajectory start...")
+    print("\nStep 9: Vasopressin before trajectory start (logging only, exclusion disabled)...")
     for fl, cohort in [(filter_s3, cohort_s3), (filter_rhee, cohort_rhee)]:
         n_excl = int((cohort["vaso_before_traj"] == 1).sum())
-        fl.append({"step": "Vasopressin in 24 h before trajectory start (excluded)",
+        fl.append({"step": "NOTE: Vasopressin in 24 h before trajectory start (retained — prior-vaso group)",
                    "n_hospitalizations": n_excl})
 
-    cohort_s3   = cohort_s3[cohort_s3["vaso_before_traj"] == 0].copy()
-    cohort_rhee = cohort_rhee[cohort_rhee["vaso_before_traj"] == 0].copy()
+    # cohort_s3   = cohort_s3[cohort_s3["vaso_before_traj"] == 0].copy()
+    # cohort_rhee = cohort_rhee[cohort_rhee["vaso_before_traj"] == 0].copy()
 
     print("\nStep 10: Location at t=0 (ADT row active at NE start)...")
     union_for_loc = (pd.concat([
@@ -857,6 +909,18 @@ def build_cohort(clif_dir: Path, co: ClifOrchestrator) -> tuple:
     filter_s3.append({"step": "Final Sepsis-3 cohort", "n_hospitalizations": len(cohort_s3)})
     filter_rhee.append({"step": "Final Rhee cohort",    "n_hospitalizations": len(cohort_rhee)})
     print(f"  Sepsis-3 final: {len(cohort_s3):,} | Rhee final: {len(cohort_rhee):,}")
+
+    print("\nStep 11b: Location at trajectory end (death / ICU discharge / 120-h cap)...")
+    union_for_loc_end = (pd.concat([
+        cohort_s3[["stay_id", "trajectory_end"]],
+        cohort_rhee[["stay_id", "trajectory_end"]],
+    ]).drop_duplicates(subset=["stay_id"]))
+    loc_end = get_location_at_end(clif_dir, union_for_loc_end)
+    cohort_s3   = cohort_s3.merge(loc_end, on="stay_id", how="left")
+    cohort_rhee = cohort_rhee.merge(loc_end, on="stay_id", how="left")
+    for lbl, c in [("Sepsis-3", cohort_s3), ("Rhee", cohort_rhee)]:
+        n_end = int(c["location_category_end"].notna().sum())
+        print(f"  {lbl}: end location resolved for {n_end:,} / {len(c):,} patients")
 
     return cohort_s3, cohort_rhee, filter_s3, filter_rhee
 
@@ -1538,8 +1602,10 @@ _COHORT_COLS = [
     "traj_hours", "death_hour", "first_norepi_time", "trajectory_start",
     "age", "gender", "race", "weight",
     "sepsis_onset_sofa", "initial_lactate", "cci_score",
-    "vaso_before_traj", "location_category", "location_type",
+    "vaso_before_traj", "first_vaso_time", "infection_dttm",
+    "location_category", "location_type",
     "hospital_id", "hospital_type",
+    "location_category_end", "location_type_end",
     "icu_los_days", "hospital_los_days", "traj_end_reason",
 ]
 

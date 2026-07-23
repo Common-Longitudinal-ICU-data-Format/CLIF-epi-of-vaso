@@ -215,12 +215,22 @@ def hour0_features(features_df):
     return features_df[features_df["time_hour"] == 0]
 
 
-def compute_vaso_flags(features_df):
+def _prior_vaso_ids_from(cohort_df):
+    """Return set of stay_ids with vasopressin before NE start, if the column exists."""
+    if cohort_df is not None and "vaso_before_traj" in cohort_df.columns:
+        return set(cohort_df.loc[cohort_df["vaso_before_traj"] == 1, "stay_id"])
+    return set()
+
+
+def compute_vaso_flags(features_df, exclude_ids=None):
     if features_df is None or len(features_df) == 0:
         return pd.DataFrame(columns=["stay_id", "ever_vaso", "vaso_init_hour"])
-    ever = (features_df.groupby("stay_id")["action_vaso"].max()
+    _feat = features_df
+    if exclude_ids:
+        _feat = features_df[~features_df["stay_id"].isin(exclude_ids)]
+    ever = (_feat.groupby("stay_id")["action_vaso"].max()
             .rename("ever_vaso").reset_index())
-    first_hr = (features_df[features_df["action_vaso"] == 1]
+    first_hr = (_feat[_feat["action_vaso"] == 1]
                 .groupby("stay_id")["time_hour"].min()
                 .rename("vaso_init_hour").reset_index())
     return ever.merge(first_hr, on="stay_id", how="left")
@@ -232,7 +242,7 @@ def build_baseline_with_vaso(cohort_df, features_df):
     hr0 = hour0_features(features_df)
     extra_cols = [c for c in hr0.columns if c not in ("stay_id", "time_hour")]
     base = cohort_df.merge(hr0[["stay_id"] + extra_cols], on="stay_id", how="left")
-    flags = compute_vaso_flags(features_df)
+    flags = compute_vaso_flags(features_df)  # ever_vaso includes prior-vaso patients intentionally
     base = base.merge(flags[["stay_id", "ever_vaso"]], on="stay_id", how="left")
     base["ever_vaso"] = base["ever_vaso"].fillna(0).astype(int)
     base["_male"] = (base["gender"] == "M").astype(int) if "gender" in base.columns else np.nan
@@ -254,7 +264,10 @@ def add_pressor_count(df):
 def build_vaso_init_df(cohort_df, features_df):
     if cohort_df is None or len(cohort_df) == 0 or features_df is None:
         return None
-    flags = compute_vaso_flags(features_df)
+    # Exclude prior-vaso patients: their vaso started before NE, so vaso_init_hour=0
+    # reflects NE-start physiology rather than the true vasopressin-initiation state.
+    _excl = _prior_vaso_ids_from(cohort_df)
+    flags = compute_vaso_flags(features_df, exclude_ids=_excl)
     ever = flags[flags["ever_vaso"] == 1].dropna(subset=["vaso_init_hour"])
     ever_ids = set(cohort_df["stay_id"]) & set(ever["stay_id"])
     if not ever_ids:
@@ -269,7 +282,8 @@ def build_vaso_init_df(cohort_df, features_df):
 def build_vaso_init_prehour_df(cohort_df, features_df):
     if cohort_df is None or len(cohort_df) == 0 or features_df is None:
         return None
-    flags = compute_vaso_flags(features_df)
+    _excl = _prior_vaso_ids_from(cohort_df)
+    flags = compute_vaso_flags(features_df, exclude_ids=_excl)
     ever = flags[flags["ever_vaso"] == 1].dropna(subset=["vaso_init_hour"]).copy()
     ever["prehour"] = ever["vaso_init_hour"] - 1
     ever = ever[ever["prehour"] >= 0]
