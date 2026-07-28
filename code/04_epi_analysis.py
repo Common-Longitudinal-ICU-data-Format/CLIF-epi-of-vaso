@@ -1247,12 +1247,371 @@ if _comp_avail and len(ever_vaso_ids) > 0:
                 pd.DataFrame(_dose_rows).to_csv(OUT_DIR / "pressor_dose_distribution.csv", index=False)
                 print("  Saved pressor_count_summary.csv, pressor_count_distribution.csv, "
                       "pressor_combo_breakdown.csv, pressor_dose_distribution.csv")
+
+                # ── Mortality: other pressor before vaso vs direct (NE only) ─────────
+                if "hospital_death" in pat.columns:
+                    _mort_df = (
+                        _drug_used_per_pt.reset_index()
+                        .merge(pat[["stay_id", "hospital_death"]], on="stay_id", how="left")
+                    )
+                    _non_ne = [c for c in _comp_avail if c != "norepinephrine"]
+                    _used_other = _mort_df[_non_ne].any(axis=1) if _non_ne else pd.Series(False, index=_mort_df.index)
+                    _mort_rows = []
+                    for _gl, _mask in [
+                        ("other_pressor_before_vaso", _used_other),
+                        ("direct_to_vaso",            ~_used_other),
+                    ]:
+                        _sub = _mort_df.loc[_mask, "hospital_death"]
+                        _n, _nd = len(_sub), int(_sub.sum())
+                        _ok = _n >= _MIN_CELL
+                        _mort_rows.append({
+                            "group": _gl, "drug": None,
+                            "n_patients": _n  if _ok else None,
+                            "n_deaths":   _nd if _ok else None,
+                            "mortality_pct": round(_nd / _n * 100, 1) if (_ok and _n > 0) else None,
+                        })
+                    for _c in _non_ne:
+                        _sub = _mort_df.loc[_mort_df[_c], "hospital_death"]
+                        _n, _nd = len(_sub), int(_sub.sum())
+                        _ok = _n >= _MIN_CELL
+                        _mort_rows.append({
+                            "group": "drug_specific", "drug": _c,
+                            "n_patients": _n  if _ok else None,
+                            "n_deaths":   _nd if _ok else None,
+                            "mortality_pct": round(_nd / _n * 100, 1) if (_ok and _n > 0) else None,
+                        })
+                    pd.DataFrame(_mort_rows).to_csv(OUT_DIR / "pressor_mortality_comparison.csv", index=False)
+                    print("  Saved pressor_mortality_comparison.csv")
+
+                # ── Pressor enrichment by hospital type ─────────────────────
+                _non_ne_enrich = [c for c in _comp_avail if c != "norepinephrine"]
+                _ht_src = (
+                    pat[["stay_id", "hospital_type"]] if "hospital_type" in pat.columns
+                    else cohort[["stay_id", "hospital_type"]] if "hospital_type" in cohort.columns
+                    else None
+                )
+                if _ht_src is not None:
+                    _enrich_ht = (
+                        _drug_used_per_pt.reset_index()
+                        .merge(_ht_src, on="stay_id", how="left")
+                    )
+                    _enrich_ht["_other"] = (
+                        _enrich_ht[_non_ne_enrich].any(axis=1) if _non_ne_enrich
+                        else pd.Series(False, index=_enrich_ht.index)
+                    )
+                    _enrich_ht_rows = []
+                    for _ht, _g in _enrich_ht.groupby("hospital_type", dropna=True):
+                        _n, _no = len(_g), int(_g["_other"].sum())
+                        _ok = _n >= _MIN_CELL
+                        _enrich_ht_rows.append({
+                            "hospital_type": _ht,
+                            "n_ever_vaso": _n if _ok else None,
+                            "n_other_pressor": _no if _ok else None,
+                            "pct_other_pressor": round(_no / _n * 100, 1) if (_ok and _n > 0) else None,
+                        })
+                    pd.DataFrame(_enrich_ht_rows).to_csv(
+                        OUT_DIR / "pressor_enrichment_by_hospital_type.csv", index=False
+                    )
+                    print("  Saved pressor_enrichment_by_hospital_type.csv")
+
+                # ── Pressor enrichment by ICU type ───────────────────────────
+                _loc_col_e = next(
+                    (c for c in ["location_type", "location_category"]
+                     if c in pat.columns or c in cohort.columns), None
+                )
+                if _loc_col_e:
+                    _loc_src_e = (
+                        pat[["stay_id", _loc_col_e]] if _loc_col_e in pat.columns
+                        else cohort[["stay_id", _loc_col_e]]
+                    )
+                    _enrich_icu = (
+                        _drug_used_per_pt.reset_index()
+                        .merge(_loc_src_e, on="stay_id", how="left")
+                    )
+                    _enrich_icu["_other"] = (
+                        _enrich_icu[_non_ne_enrich].any(axis=1) if _non_ne_enrich
+                        else pd.Series(False, index=_enrich_icu.index)
+                    )
+                    _enrich_icu_rows = []
+                    for _icu, _g in _enrich_icu.groupby(_loc_col_e, dropna=True):
+                        _n, _no = len(_g), int(_g["_other"].sum())
+                        _ok = _n >= _MIN_CELL
+                        _enrich_icu_rows.append({
+                            "icu_type": str(_icu),
+                            "n_ever_vaso": _n if _ok else None,
+                            "n_other_pressor": _no if _ok else None,
+                            "pct_other_pressor": round(_no / _n * 100, 1) if (_ok and _n > 0) else None,
+                        })
+                    pd.DataFrame(_enrich_icu_rows).to_csv(
+                        OUT_DIR / "pressor_enrichment_by_icu_type.csv", index=False
+                    )
+                    print("  Saved pressor_enrichment_by_icu_type.csv")
+
+                # ── Mortality × pressor strategy × stratum cross-tab ─────────
+                if "hospital_death" in pat.columns:
+                    _mort_src = pat[["stay_id", "hospital_death"]]
+                    _enrich_mort_rows = []
+                    _strat_pairs = [
+                        (True,  "other_pressor_before_vaso"),
+                        (False, "direct_to_vaso"),
+                    ]
+
+                    if _ht_src is not None:
+                        _eht_m = (
+                            _drug_used_per_pt.reset_index()
+                            .merge(_ht_src, on="stay_id", how="left")
+                            .merge(_mort_src, on="stay_id", how="left")
+                        )
+                        _eht_m["_other"] = (
+                            _eht_m[_non_ne_enrich].any(axis=1) if _non_ne_enrich
+                            else pd.Series(False, index=_eht_m.index)
+                        )
+                        for _ht_v, _gp in _eht_m.groupby("hospital_type", dropna=True):
+                            for _is_oth, _strat_lbl in _strat_pairs:
+                                _gs = _gp[_gp["_other"] == _is_oth]
+                                _n, _nd = len(_gs), int(_gs["hospital_death"].sum())
+                                _ok = _n >= _MIN_CELL
+                                _enrich_mort_rows.append({
+                                    "stratum_type": "hospital_type",
+                                    "stratum": str(_ht_v),
+                                    "pressor_strategy": _strat_lbl,
+                                    "n_ever_vaso": _n if _ok else None,
+                                    "n_deaths": _nd if _ok else None,
+                                    "mortality_pct": round(_nd / _n * 100, 1) if (_ok and _n > 0) else None,
+                                })
+
+                    if _loc_col_e:
+                        _eicu_m = (
+                            _drug_used_per_pt.reset_index()
+                            .merge(_loc_src_e, on="stay_id", how="left")
+                            .merge(_mort_src, on="stay_id", how="left")
+                        )
+                        _eicu_m["_other"] = (
+                            _eicu_m[_non_ne_enrich].any(axis=1) if _non_ne_enrich
+                            else pd.Series(False, index=_eicu_m.index)
+                        )
+                        for _icu_v, _gp in _eicu_m.groupby(_loc_col_e, dropna=True):
+                            for _is_oth, _strat_lbl in _strat_pairs:
+                                _gs = _gp[_gp["_other"] == _is_oth]
+                                _n, _nd = len(_gs), int(_gs["hospital_death"].sum())
+                                _ok = _n >= _MIN_CELL
+                                _enrich_mort_rows.append({
+                                    "stratum_type": "icu_type",
+                                    "stratum": str(_icu_v),
+                                    "pressor_strategy": _strat_lbl,
+                                    "n_ever_vaso": _n if _ok else None,
+                                    "n_deaths": _nd if _ok else None,
+                                    "mortality_pct": round(_nd / _n * 100, 1) if (_ok and _n > 0) else None,
+                                })
+
+                    if _enrich_mort_rows:
+                        pd.DataFrame(_enrich_mort_rows).to_csv(
+                            OUT_DIR / "pressor_enrichment_mortality.csv", index=False
+                        )
+                        print("  Saved pressor_enrichment_mortality.csv")
+
+                # ── Adjusted logistic regression + propensity score matching ──
+                # Tests whether "other pressor before vaso" is independently
+                # associated with mortality after adjusting for severity
+                # (severity-at-initiation confounders).
+                try:
+                    import statsmodels.api as _sm_psm
+
+                    # ── Build shared analytic dataset ───────────────────────
+                    _adf_reset = _drug_used_per_pt.reset_index()
+                    _adf = _adf_reset[["stay_id"]].copy()
+                    _adf["other_pressor"] = (
+                        _adf_reset[_non_ne_enrich].any(axis=1).astype(int)
+                        if _non_ne_enrich else 0
+                    )
+                    _adf_cont = [c for c in ["sofa_at_init", "ne_at_init",
+                                             "mbp_at_init", "lac_at_init", "age"]
+                                 if c in pat.columns]
+                    _adf = _adf.merge(
+                        pat[["stay_id", "hospital_death"] + _adf_cont],
+                        on="stay_id", how="left",
+                    )
+                    if _ht_src is not None:
+                        _adf = _adf.merge(_ht_src, on="stay_id", how="left")
+                    if _loc_col_e:
+                        _adf = _adf.merge(_loc_src_e, on="stay_id", how="left")
+
+                    # Dummy-encode categorical confounders
+                    _cat_dummy_cols: list = []
+                    for _cat_c, _pfx in [("hospital_type", "ht"), (_loc_col_e, "icu")]:
+                        if _cat_c and _cat_c in _adf.columns:
+                            _dums = pd.get_dummies(
+                                _adf[_cat_c], prefix=_pfx, drop_first=True, dtype=float
+                            )
+                            _adf = pd.concat([_adf, _dums], axis=1)
+                            _cat_dummy_cols += list(_dums.columns)
+
+                    _all_cov = _adf_cont + _cat_dummy_cols
+                    _adf_clean = _adf.dropna(
+                        subset=["other_pressor", "hospital_death"] + _adf_cont
+                    ).reset_index(drop=True)
+                    _ok_var = _adf_clean["other_pressor"].nunique() == 2
+                    _ok_n   = len(_adf_clean) >= 2 * _MIN_CELL
+
+                    # ── Adjusted logistic regression ────────────────────────
+                    if _ok_var and _ok_n:
+                        _X_lr = _sm_psm.add_constant(
+                            _adf_clean[["other_pressor"] + _all_cov]
+                            .astype(float).fillna(0)
+                        )
+                        _mod_lr = _sm_psm.Logit(
+                            _adf_clean["hospital_death"].astype(float), _X_lr
+                        ).fit(disp=False, maxiter=200)
+                        _c_lr  = _mod_lr.params["other_pressor"]
+                        _se_lr = _mod_lr.bse["other_pressor"]
+                        _pv_lr = float(_mod_lr.pvalues["other_pressor"])
+                        pd.DataFrame([{
+                            "n_obs":       int(_mod_lr.nobs),
+                            "or_est":      round(float(np.exp(_c_lr)), 3),
+                            "or_lo":       round(float(np.exp(_c_lr - 1.96 * _se_lr)), 3),
+                            "or_hi":       round(float(np.exp(_c_lr + 1.96 * _se_lr)), 3),
+                            "pval":        round(_pv_lr, 4),
+                            "covariates":  "; ".join(_all_cov),
+                        }]).to_csv(
+                            OUT_DIR / "pressor_strategy_mortality_logreg.csv", index=False
+                        )
+                        print("  Saved pressor_strategy_mortality_logreg.csv")
+                    else:
+                        print("  Skipped pressor_strategy logreg (insufficient data)")
+
+                    # ── Propensity score matching ───────────────────────────
+                    if _ok_var and _ok_n:
+                        # PS model uses continuous severity only (not hospital_type)
+                        _ps_cov = [c for c in _adf_cont
+                                   if _adf_clean[c].notna().mean() > 0.8]
+                        _ps_X_cols = _ps_cov + [
+                            c for c in _cat_dummy_cols if c.startswith("icu_")
+                        ]
+                        _ps_df = _adf_clean.dropna(subset=_ps_X_cols).copy()
+
+                        _X_ps = _sm_psm.add_constant(
+                            _ps_df[_ps_X_cols].astype(float)
+                        )
+                        _ps_mod = _sm_psm.Logit(
+                            _ps_df["other_pressor"].astype(int), _X_ps
+                        ).fit(disp=False, maxiter=200)
+                        _ps_df["_ps"] = _ps_mod.predict(_X_ps).clip(0.01, 0.99)
+                        _ps_df["_lps"] = np.log(
+                            _ps_df["_ps"] / (1 - _ps_df["_ps"])
+                        )
+
+                        _caliper = 0.2 * float(_ps_df["_lps"].std())
+                        _trt = _ps_df[_ps_df["other_pressor"] == 1].reset_index(drop=True)
+                        _ctl = _ps_df[_ps_df["other_pressor"] == 0].reset_index(drop=True)
+                        _lps_c = _ctl["_lps"].values.copy()
+                        _used_c = np.zeros(len(_ctl), dtype=bool)
+                        _m_ti, _m_ci = [], []
+                        for _ti, _lt in enumerate(_trt["_lps"].values):
+                            _d = np.abs(_lps_c - _lt)
+                            _d[_used_c] = np.inf
+                            _ci_best = int(np.argmin(_d))
+                            if _d[_ci_best] <= _caliper:
+                                _m_ti.append(_ti)
+                                _m_ci.append(_ci_best)
+                                _used_c[_ci_best] = True
+
+                        _n_pairs = len(_m_ti)
+                        if _n_pairs >= _MIN_CELL:
+                            _mt = _trt.iloc[_m_ti]
+                            _mc = _ctl.iloc[_m_ci]
+
+                            # Outcomes in matched sample
+                            pd.DataFrame([
+                                {"group": "other_pressor_before_vaso",
+                                 "n_matched": _n_pairs,
+                                 "n_deaths": int(_mt["hospital_death"].sum()),
+                                 "mortality_pct": round(
+                                     _mt["hospital_death"].mean() * 100, 1)},
+                                {"group": "direct_to_vaso",
+                                 "n_matched": _n_pairs,
+                                 "n_deaths": int(_mc["hospital_death"].sum()),
+                                 "mortality_pct": round(
+                                     _mc["hospital_death"].mean() * 100, 1)},
+                            ]).to_csv(
+                                OUT_DIR / "pressor_strategy_psm_outcomes.csv", index=False
+                            )
+
+                            # Covariate balance before/after matching
+                            _bal_rows = []
+                            _t_all = _ps_df[_ps_df["other_pressor"] == 1]
+                            _c_all = _ps_df[_ps_df["other_pressor"] == 0]
+                            for _bc in _ps_cov:
+                                _sp_b = np.sqrt(
+                                    (_t_all[_bc].var() + _c_all[_bc].var()) / 2
+                                )
+                                _smd_b = (
+                                    abs(_t_all[_bc].mean() - _c_all[_bc].mean()) / _sp_b
+                                    if _sp_b > 0 else None
+                                )
+                                _sp_a = np.sqrt(
+                                    (_mt[_bc].var() + _mc[_bc].var()) / 2
+                                )
+                                _smd_a = (
+                                    abs(_mt[_bc].mean() - _mc[_bc].mean()) / _sp_a
+                                    if _sp_a > 0 else None
+                                )
+                                _bal_rows.append({
+                                    "covariate": _bc,
+                                    "mean_other_pressor_before": round(
+                                        _t_all[_bc].mean(), 3),
+                                    "mean_direct_before": round(
+                                        _c_all[_bc].mean(), 3),
+                                    "smd_before": round(_smd_b, 3)
+                                        if _smd_b is not None else None,
+                                    "mean_other_pressor_after": round(
+                                        _mt[_bc].mean(), 3),
+                                    "mean_direct_after": round(
+                                        _mc[_bc].mean(), 3),
+                                    "smd_after": round(_smd_a, 3)
+                                        if _smd_a is not None else None,
+                                })
+                            pd.DataFrame(_bal_rows).to_csv(
+                                OUT_DIR / "pressor_strategy_psm_balance.csv",
+                                index=False,
+                            )
+                            print(f"  Saved pressor_strategy_psm_outcomes.csv + "
+                                  f"psm_balance.csv ({_n_pairs} matched pairs)")
+                        else:
+                            print(f"  PSM: {_n_pairs} pairs within caliper — skipping")
+
+                except Exception as _e_psm_lr:
+                    print(f"  pressor_strategy logreg/PSM failed: {_e_psm_lr}")
             else:
                 print("  Skipped pressor_count/dose distribution (no pre-vaso hours found)")
     else:
         print("  Skipped analysis2D (no pre-vaso hours found)")
 else:
     print("  Skipped analysis2D (NEE component columns not in features)")
+
+# ── Mortality by hospital type (all patients) ──────────────────────────────
+print("Mortality by hospital type...")
+_SUPPRESS_K = 11
+_ht_src_mort = (
+    pat[["stay_id", "hospital_type"]] if "hospital_type" in pat.columns
+    else cohort[["stay_id", "hospital_type"]] if "hospital_type" in cohort.columns
+    else None
+)
+if _ht_src_mort is not None and "hospital_death" in pat.columns:
+    _pat_ht = pat[["stay_id", "hospital_death"]].merge(_ht_src_mort, on="stay_id", how="left")
+    _mort_ht_rows = []
+    for _ht, _g in _pat_ht.groupby("hospital_type", dropna=True):
+        _n, _nd = len(_g), int(_g["hospital_death"].sum())
+        _ok = _n >= _SUPPRESS_K
+        _mort_ht_rows.append({
+            "hospital_type": _ht,
+            "n_patients": _n if _ok else None,
+            "n_deaths": _nd if _ok else None,
+            "mortality_pct": round(_nd / _n * 100, 1) if (_ok and _n > 0) else None,
+        })
+    pd.DataFrame(_mort_ht_rows).to_csv(OUT_DIR / "mortality_by_hospital_type.csv", index=False)
+    print("  Saved mortality_by_hospital_type.csv")
+else:
+    print("  Skipped mortality_by_hospital_type (hospital_type or hospital_death not in cohort)")
 
 # ── 2D_dose_by_nee / 2D_prop_by_nee: drug mix by NEE dose bin (all hours) ────
 print("Analysis 2D by NEE dose bin: dose contribution and proportion per bin...")
