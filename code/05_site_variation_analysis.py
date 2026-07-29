@@ -1098,6 +1098,7 @@ def _draw_transition_heatmap(
     counts: "pd.DataFrame",
     title: str,
     out_path: Path,
+    loc_order: "list | None" = None,
 ) -> None:
     """Transition matrix heatmap: rows = start location, columns = end location.
 
@@ -1105,13 +1106,19 @@ def _draw_transition_heatmap(
     Blank (white) cells have zero actual transitions.
     Cell text = count on top, row_total in parentheses below.
     """
-    # Square matrix over the union of all location labels
-    all_locs = sorted(set(counts.index) | set(counts.columns))
+    # Square matrix over the canonical location universe
+    if loc_order is not None:
+        all_locs = loc_order
+    else:
+        all_locs = sorted(set(counts.index) | set(counts.columns))
     counts = counts.reindex(index=all_locs, columns=all_locs, fill_value=0)
 
     # Same order for rows AND columns so the diagonal = "stayed in same location"
-    freq = counts.sum(axis=1) + counts.sum(axis=0)
-    order = freq.sort_values(ascending=False).index.tolist()
+    if loc_order is not None:
+        order = loc_order
+    else:
+        freq = counts.sum(axis=1) + counts.sum(axis=0)
+        order = freq.sort_values(ascending=False).index.tolist()
     counts = counts.loc[order, order]
 
     N = int(counts.values.sum())
@@ -1134,7 +1141,7 @@ def _draw_transition_heatmap(
     cell_px = 0.9
     fig, ax = plt.subplots(figsize=(max(4, ncols * cell_px + 2.0),
                                     max(3, nrows * cell_px + 1.5)))
-    cmap = plt.get_cmap("Blues").copy()
+    cmap = plt.get_cmap("Greys").copy()
     cmap.set_bad("white")
     im = ax.imshow(frac, cmap=cmap, vmin=0.0, vmax=1.0, aspect="auto")
 
@@ -1155,7 +1162,7 @@ def _draw_transition_heatmap(
                 )
 
     ax.set_xticks(range(ncols))
-    ax.set_xticklabels(counts.columns.tolist(), rotation=40, ha="right", fontsize=6)
+    ax.set_xticklabels(counts.columns.tolist(), rotation=40, ha="right", fontsize=12)
     ax.set_yticks(range(nrows))
     ax.set_yticklabels(counts.index.tolist(), fontsize=12)
     ax.set_xlabel("Location at trajectory end  (death / ICU discharge / 120 h)", fontsize=7)
@@ -1239,6 +1246,309 @@ def plot_pooled_location_transition_heatmap(
     )
 
 
+# ── Outcome-annotated location transition heatmaps ───────────────────────────
+_MIN_CELL_HM = 11
+
+
+def _compute_cell_outcomes(
+    cohort: "pd.DataFrame",
+    features: "pd.DataFrame | None",
+) -> "pd.DataFrame | None":
+    """Build patient-level outcome table for outcome heatmaps.
+
+    Returns DataFrame with: loc_start, loc_end, _ever_vaso, hospital_death,
+    _time_to_vaso_h, _ne_at_init, _nee_at_init.  Returns None when
+    end-location columns are absent from the cohort.
+    """
+    if ("location_category_end" not in cohort.columns
+            and "location_type_end" not in cohort.columns):
+        return None
+    df = cohort.copy()
+    df["loc_start"] = _canon_icu_series(
+        _effective_location(df, "location_type", "location_category")
+    )
+    df["loc_end"] = _canon_icu_series(
+        _effective_location(df, "location_type_end", "location_category_end")
+    ).fillna("Unknown / Missing")
+    df = df.dropna(subset=["loc_start"])
+    if df.empty:
+        return None
+
+    # ever_vaso and first_vaso_hour come from features (action_vaso column).
+    # The cohort's first_vaso_time is only populated for the prior-vaso group
+    # (vaso_before_traj == 1) and cannot be used here.
+    df["_ever_vaso"] = 0
+    df["_time_to_vaso_h"] = np.nan
+    df["_ne_at_init"] = np.nan
+    df["_nee_at_init"] = np.nan
+
+    if features is not None and "action_vaso" in features.columns:
+        _vaso_f = features[(features["action_vaso"] == 1) & (features["time_hour"] >= 0)]
+        if not _vaso_f.empty:
+            _first_vhr = (
+                _vaso_f.groupby("stay_id")["time_hour"]
+                .min()
+                .reset_index()
+                .rename(columns={"time_hour": "_first_vhr"})
+            )
+            df = df.merge(_first_vhr, on="stay_id", how="left")
+            df["_ever_vaso"] = df["_first_vhr"].notna().astype(int)
+            df["_time_to_vaso_h"] = df["_first_vhr"].astype(float)
+            df.drop(columns=["_first_vhr"], inplace=True)
+
+            if "norepinephrine" in features.columns and "nee" in features.columns:
+                _vt = df[df["_ever_vaso"] == 1][["stay_id", "_time_to_vaso_h"]].dropna()
+                if not _vt.empty:
+                    _vt = _vt.copy()
+                    _vt["_init_hr"] = _vt["_time_to_vaso_h"].astype(int)
+                    _feat = features[["stay_id", "time_hour", "norepinephrine", "nee"]].copy()
+                    _feat = _feat.merge(_vt[["stay_id", "_init_hr"]], on="stay_id", how="inner")
+                    _feat = _feat[_feat["time_hour"] == _feat["_init_hr"]]
+                    _feat = _feat.groupby("stay_id")[["norepinephrine", "nee"]].first().reset_index()
+                    _feat.rename(columns={"norepinephrine": "_ne_f", "nee": "_nee_f"}, inplace=True)
+                    df = df.merge(_feat[["stay_id", "_ne_f", "_nee_f"]], on="stay_id", how="left")
+                    df["_ne_at_init"] = df["_ne_f"]
+                    df["_nee_at_init"] = df["_nee_f"]
+                    df.drop(columns=["_ne_f", "_nee_f"], inplace=True)
+
+    need = ["loc_start", "loc_end", "_ever_vaso", "hospital_death",
+            "_time_to_vaso_h", "_ne_at_init", "_nee_at_init"]
+    for c in need:
+        if c not in df.columns:
+            df[c] = np.nan
+    return df[need].copy()
+
+
+def _draw_outcome_heatmap(
+    value_mat: "pd.DataFrame",
+    counts_mat: "pd.DataFrame",
+    title: str,
+    cmap_name: str,
+    cbar_label: str,
+    out_path: Path,
+    vmin=None,
+    vmax=None,
+    vcenter=None,
+    q25_mat: "pd.DataFrame | None" = None,
+    q75_mat: "pd.DataFrame | None" = None,
+    pct: bool = False,
+    min_cell: int = _MIN_CELL_HM,
+    loc_order: "list | None" = None,
+) -> None:
+    """Single outcome heatmap over the (loc_start × loc_end) grid."""
+    # When loc_order is supplied it IS the canonical universe; use it for reindex
+    # so that locations with no outcome data still appear as empty rows/columns.
+    if loc_order is not None:
+        all_locs = loc_order
+    else:
+        all_locs = sorted(set(value_mat.index) | set(value_mat.columns))
+    value_mat = value_mat.reindex(index=all_locs, columns=all_locs)
+    counts_mat = counts_mat.reindex(index=all_locs, columns=all_locs, fill_value=0)
+
+    order = loc_order if loc_order is not None else (
+        (counts_mat.sum(axis=1) + counts_mat.sum(axis=0))
+        .sort_values(ascending=False).index.tolist()
+    )
+    value_mat = value_mat.loc[order, order]
+    counts_mat = counts_mat.loc[order, order]
+    if q25_mat is not None:
+        q25_mat = q25_mat.reindex(index=all_locs, columns=all_locs).loc[order, order]
+        q75_mat = q75_mat.reindex(index=all_locs, columns=all_locs).loc[order, order]
+
+    vals = value_mat.values.astype(float).copy()
+    cnts = counts_mat.values.astype(int)
+    vals[cnts == 0] = np.nan
+
+    valid_vals = vals[(~np.isnan(vals)) & (cnts >= min_cell)]
+    if len(valid_vals) == 0:
+        print(f"  Skipping {out_path.name} — no cells with n≥{min_cell}")
+        return
+    _vmin = float(vmin) if vmin is not None else float(np.nanmin(valid_vals))
+    _vmax = float(vmax) if vmax is not None else float(np.nanmax(valid_vals))
+    if _vmin == _vmax:
+        _vmax = _vmin + 1e-6
+
+    nrows, ncols = vals.shape
+    cell_px = 0.9
+    fig, ax = plt.subplots(figsize=(max(4, ncols * cell_px + 2.0),
+                                    max(3, nrows * cell_px + 1.5)))
+    cmap = plt.get_cmap(cmap_name).copy()
+    cmap.set_bad("white")
+
+    disp = vals.copy()
+    disp[cnts < min_cell] = np.nan
+
+    _norm = None
+    if vcenter is not None:
+        from matplotlib.colors import TwoSlopeNorm
+        _vc = float(np.clip(vcenter, _vmin + 1e-6, _vmax - 1e-6))
+        _norm = TwoSlopeNorm(vmin=_vmin, vcenter=_vc, vmax=_vmax)
+        im = ax.imshow(disp, cmap=cmap, norm=_norm, aspect="auto")
+    else:
+        im = ax.imshow(disp, cmap=cmap, vmin=_vmin, vmax=_vmax, aspect="auto")
+
+    for i in range(nrows):
+        for j in range(ncols):
+            cnt = int(cnts[i, j])
+            v = float(vals[i, j]) if not np.isnan(vals[i, j]) else np.nan
+            if cnt == 0:
+                ax.text(j, i, "—", ha="center", va="center", fontsize=12, color="#cccccc")
+            elif cnt < min_cell:
+                ax.text(j, i, f"n={cnt}", ha="center", va="center", fontsize=7, color="#aaaaaa")
+            elif np.isnan(v):
+                ax.text(j, i, f"n={cnt}", ha="center", va="center", fontsize=7, color="#aaaaaa")
+            else:
+                if _norm is not None:
+                    nv = float(_norm(v))
+                    tc = "white" if (nv < 0.3 or nv > 0.7) else "black"
+                else:
+                    nv = (v - _vmin) / (_vmax - _vmin)
+                    tc = "white" if nv > 0.6 else "black"
+                if pct:
+                    cell_text = f"{v * 100:.0f}%\n(n={cnt})"
+                elif q25_mat is not None:
+                    _q25v = float(q25_mat.values[i, j])
+                    _q75v = float(q75_mat.values[i, j])
+                    iqr_str = (f"({_q25v:.1f}–{_q75v:.1f})"
+                               if (not np.isnan(_q25v) and not np.isnan(_q75v)) else "")
+                    cell_text = f"{v:.1f}\n{iqr_str}\nn={cnt}"
+                else:
+                    cell_text = f"{v:.2f}\n(n={cnt})"
+                ax.text(j, i, cell_text, ha="center", va="center", fontsize=8, color=tc)
+
+    ax.set_xticks(range(ncols))
+    ax.set_xticklabels(value_mat.columns.tolist(), rotation=40, ha="right", fontsize=12)
+    ax.set_yticks(range(nrows))
+    ax.set_yticklabels(value_mat.index.tolist(), fontsize=12)
+    ax.set_xlabel("Location at trajectory end  (death / ICU discharge / 120 h)", fontsize=7)
+    ax.set_ylabel("Location at NE start  (t = 0)", fontsize=7)
+
+    cbar = fig.colorbar(im, ax=ax, shrink=0.65, pad=0.02)
+    cbar.set_label(cbar_label, fontsize=6)
+    cbar.ax.tick_params(labelsize=5)
+
+    ax.set_title(title, fontsize=7, fontweight="bold")
+    fig.tight_layout()
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_path, dpi=500, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  Saved: {out_path.name}")
+
+
+def plot_location_transition_outcome_heatmaps(
+    cohort: "pd.DataFrame",
+    features: "pd.DataFrame | None",
+    out_dir: Path,
+    cohort_label: str,
+    site: str,
+) -> None:
+    """Generate 5 outcome-annotated transition heatmaps for one site."""
+    cell_df = _compute_cell_outcomes(cohort, features)
+    if cell_df is None or cell_df.empty:
+        print(f"  [{site}] Outcome heatmaps skipped — no location/outcome data.")
+        return
+
+    counts = cell_df.groupby(["loc_start", "loc_end"]).size().unstack(fill_value=0)
+    cohort_lbl = _COHORT_LABELS.get(cohort_label, cohort_label)
+
+    # Canonical location order shared by all 6 heatmaps so rows/columns align
+    _all_locs = sorted(set(counts.index) | set(counts.columns))
+    _counts_sq = counts.reindex(index=_all_locs, columns=_all_locs, fill_value=0)
+    _freq = _counts_sq.sum(axis=1) + _counts_sq.sum(axis=0)
+    loc_order = _freq.sort_values(ascending=False).index.tolist()
+
+    # Regenerate the count heatmap with this ordering so it matches the outcome heatmaps
+    N = int(counts.values.sum())
+    _draw_transition_heatmap(
+        counts,
+        title=(
+            f"Location transition — {site}  [{cohort_lbl}]  N = {N:,} patients\n"
+            f"Cell: count (% of row)   |   Color: fraction of row patients ending here"
+        ),
+        out_path=out_dir / f"location_transition_{cohort_label}_{site}.png",
+        loc_order=loc_order,
+    )
+
+    # 1. Vasopressin use rate
+    n_vaso = cell_df.groupby(["loc_start", "loc_end"])["_ever_vaso"].sum().unstack(fill_value=0)
+    vaso_rate = (n_vaso.astype(float) / counts.replace(0, np.nan)).clip(0.0, 1.0)
+    _draw_outcome_heatmap(
+        vaso_rate, counts,
+        title=(f"Vasopressin use rate — {site}  [{cohort_lbl}]\n"
+               f"Cell: % ever-vaso (n total)  |  Color: fraction receiving vasopressin"),
+        cmap_name="Greens", cbar_label="Fraction ever receiving vasopressin",
+        out_path=out_dir / f"transition_outcome_vaso_rate_{cohort_label}_{site}.png",
+        vmin=0.0, vmax=1.0, pct=True, loc_order=loc_order,
+    )
+
+    # 2. In-hospital mortality rate (coolwarm centred at median mortality)
+    if cell_df["hospital_death"].notna().any():
+        n_deaths = (
+            cell_df.groupby(["loc_start", "loc_end"])["hospital_death"]
+            .sum().unstack(fill_value=0)
+        )
+        mort_rate = (n_deaths.astype(float) / counts.replace(0, np.nan)).clip(0.0, 1.0)
+        _valid_m = mort_rate.values[(counts.values >= _MIN_CELL_HM) & ~np.isnan(mort_rate.values)]
+        _mort_vcenter = float(np.nanmedian(_valid_m)) if len(_valid_m) > 0 else 0.5
+        _draw_outcome_heatmap(
+            mort_rate, counts,
+            title=(f"In-hospital mortality — {site}  [{cohort_lbl}]\n"
+                   f"Cell: % died (n total)  |  Color: coolwarm centred at median"),
+            cmap_name="coolwarm", cbar_label="In-hospital mortality fraction",
+            out_path=out_dir / f"transition_outcome_mortality_{cohort_label}_{site}.png",
+            vmin=0.0, vmax=1.0, vcenter=_mort_vcenter, pct=True, loc_order=loc_order,
+        )
+
+    # Metrics 3-5 use only ever-vaso patients; n_vaso_mat drives suppression
+    vaso_df = cell_df[cell_df["_ever_vaso"] == 1].copy()
+    n_vaso_mat = vaso_df.groupby(["loc_start", "loc_end"]).size().unstack(fill_value=0)
+
+    def _med_iqr(col):
+        if col not in vaso_df.columns or vaso_df[col].notna().sum() < _MIN_CELL_HM:
+            return None, None, None
+        grp = vaso_df.groupby(["loc_start", "loc_end"])[col]
+        med = grp.median().unstack(fill_value=np.nan)
+        q25 = grp.quantile(0.25).unstack(fill_value=np.nan)
+        q75 = grp.quantile(0.75).unstack(fill_value=np.nan)
+        return med, q25, q75
+
+    # 3. Time to vasopressin (hours from NE start)
+    med, q25, q75 = _med_iqr("_time_to_vaso_h")
+    if med is not None:
+        _draw_outcome_heatmap(
+            med, n_vaso_mat,
+            title=(f"Median time to vasopressin — {site}  [{cohort_lbl}]\n"
+                   f"Cell: median h (IQR)  n = ever-vaso patients  |  Color: median hours"),
+            cmap_name="Blues", cbar_label="Median h from NE start to vasopressin initiation",
+            out_path=out_dir / f"transition_outcome_time_to_vaso_{cohort_label}_{site}.png",
+            vmin=0.0, q25_mat=q25, q75_mat=q75, loc_order=loc_order,
+        )
+
+    # 4. NE dose at vasopressin initiation
+    med, q25, q75 = _med_iqr("_ne_at_init")
+    if med is not None:
+        _draw_outcome_heatmap(
+            med, n_vaso_mat,
+            title=(f"Median NE dose at vasopressin initiation — {site}  [{cohort_lbl}]\n"
+                   f"Cell: median μg/kg/min (IQR)  n = ever-vaso patients  |  Color: median dose"),
+            cmap_name="Purples", cbar_label="Median NE dose at vaso initiation (μg/kg/min)",
+            out_path=out_dir / f"transition_outcome_ne_dose_{cohort_label}_{site}.png",
+            vmin=0.0, q25_mat=q25, q75_mat=q75, loc_order=loc_order,
+        )
+
+    # 5. NEE-equivalent dose at vasopressin initiation
+    med, q25, q75 = _med_iqr("_nee_at_init")
+    if med is not None:
+        _draw_outcome_heatmap(
+            med, n_vaso_mat,
+            title=(f"Median NEE at vasopressin initiation — {site}  [{cohort_lbl}]\n"
+                   f"Cell: median μg/kg/min (IQR)  n = ever-vaso patients  |  Color: median dose"),
+            cmap_name="Oranges", cbar_label="Median NEE-equivalent dose at vaso initiation (μg/kg/min)",
+            out_path=out_dir / f"transition_outcome_nee_dose_{cohort_label}_{site}.png",
+            vmin=0.0, q25_mat=q25, q75_mat=q75, loc_order=loc_order,
+        )
+
+
 # ── Interpretable coefficient / group-intercept tables ───────────────────────
 def export_coefficient_table(model: dict) -> pd.DataFrame:
     """One row per fitted-model term: beta, SE, OR, 95% CI, p-value."""
@@ -1299,9 +1609,10 @@ def run_for_cohort(cohort_label: str):
     print(f"  Available sites: {all_sites}")
 
     # ── Fit per-site models for all sites with data ────────────────────────
-    site_models:   dict = {}
-    ph_by_site:    dict = {}
+    site_models:    dict = {}
+    ph_by_site:     dict = {}
     cohort_by_site: dict = {}
+    features_by_site: dict = {}
 
     for site in all_sites:
         site_coh_p  = OUTPUT_ROOT / "output" / f"patient_level_data_{site}" / f"cohort_{cohort_label}.parquet"
@@ -1314,6 +1625,7 @@ def run_for_cohort(cohort_label: str):
             site_features = pd.read_parquet(site_feat_p)
             site_ids      = set(site_cohort["stay_id"])
             site_features = site_features[site_features["stay_id"].isin(site_ids)].copy()
+            features_by_site[site] = site_features
             ph = _prep_person_hours(site_cohort, site_features)
             site_models[site] = fit_site_logistic(ph, cohort_label, site)
             ph_by_site[site]  = ph
@@ -1428,6 +1740,16 @@ def run_for_cohort(cohort_label: str):
         )
     print("  [pooled] all sites combined:")
     plot_pooled_location_transition_heatmap(cohort_by_site, per_site_out, cohort_label)
+
+    print("\n--- Location transition outcome heatmaps ---")
+    for site in site_models:
+        plot_location_transition_outcome_heatmaps(
+            cohort_by_site[site],
+            features_by_site.get(site),
+            per_site_out,
+            cohort_label,
+            site,
+        )
 
     # ── Save variation packets ────────────────────────────────────────────
     # One packet per site, each containing all site models + mixed effects.
