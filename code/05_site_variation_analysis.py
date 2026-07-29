@@ -943,6 +943,213 @@ def plot_variance_decomposition(decomp: dict, out_dir: Path, cohort_label: str, 
     print(f"  Saved: {out.name}")
 
 
+# ── Covariate-level variance decomposition (Nakagawa & Schielzeth 2013) ───────
+
+# Maps group label -> function: col_name -> bool (True = belongs to this group)
+_COVAR_GROUPS: dict = {
+    "Age":             lambda c: c == "age_c",
+    "P/F ratio":       lambda c: c == "p_f_ratio_c",
+    "Creatinine":      lambda c: c == "creatinine_c",
+    "Platelets":       lambda c: c == "platelet_c",
+    "Bilirubin":       lambda c: c == "bilirubin_c",
+    "GCS":             lambda c: c == "gcs_c",
+    "RRT":             lambda c: c == "rrt",
+    "Device category": lambda c: c.startswith("device_"),
+    "NEE dose":        lambda c: c.startswith("rcs_nee_"),
+    "Time on NE":      lambda c: c.startswith("rcs_time_"),
+}
+
+_COVAR_COLORS: dict = {
+    "Age":             "#a6cee3",
+    "P/F ratio":       "#1f78b4",
+    "Creatinine":      "#b2df8a",
+    "Platelets":       "#33a02c",
+    "Bilirubin":       "#fb9a99",
+    "GCS":             "#e31a1c",
+    "RRT":             "#fdbf6f",
+    "Device category": "#ff7f00",
+    "NEE dose":        "#cab2d6",
+    "Time on NE":      "#6a3d9a",
+    "Ward / ICU type": "#f28e2b",
+    "Hospital":        "#e15759",
+    "Site":            "#59a14f",
+    "Unexplained":     "#cccccc",
+}
+
+
+def compute_covariate_variance_explained(
+    ph_by_site: dict,
+    site_models: dict,
+    variance_decomp: dict,
+) -> dict:
+    """Variance of each covariate's linear predictor contribution, per site.
+
+    For predictor group g:  σ²_g = Var(β_g ᵀ X_g) over all patient-hours.
+
+    Total latent variance = Σ σ²_g + σ²_ward + σ²_hosp + σ²_site + π²/3
+    R²_marginal    = Σ σ²_g  / σ²_total
+    R²_conditional = (Σ σ²_g + σ²_random) / σ²_total
+
+    Reference: Nakagawa & Schielzeth (2013) Methods Ecol Evol 4:133-142.
+    """
+    pi2_3 = float(np.pi ** 2 / 3)
+    results: dict = {}
+
+    for site in site_models:
+        if site not in ph_by_site:
+            continue
+        model = site_models[site]
+        ph = ph_by_site[site].copy()
+        ph = (ph[["stay_id", "time_hour", "vaso_on", "nee", "rrt",
+                   "device_category"] + _CONT_COLS].dropna().copy())
+        if ph.empty:
+            continue
+
+        try:
+            X, col_names, _, _, _, _, _ = _build_design_matrix(
+                ph,
+                nee_knots=np.array(model["nee_knots"]),
+                time_knots=np.array(model["time_knots"]),
+                means=model["means"],
+                sds=model["sds"],
+                device_categories=model["device_categories"],
+            )
+        except Exception as exc:
+            print(f"  [{site}] covariate variance skipped — {exc}")
+            continue
+
+        beta_vec = np.array([model["coefficients"][c]["beta"] for c in col_names])
+
+        group_sigma2: dict = {}
+        for grp, match_fn in _COVAR_GROUPS.items():
+            idxs = [i for i, c in enumerate(col_names) if match_fn(c)]
+            lp = X[:, idxs] @ beta_vec[idxs] if idxs else np.zeros(len(ph))
+            group_sigma2[grp] = float(np.var(lp))
+
+        sigma2_fixed = float(sum(group_sigma2.values()))
+        decomp_s = variance_decomp.get(site, {})
+        sigma2_ward = float(decomp_s.get("ward_variance", 0.0))
+        sigma2_hosp = float(decomp_s.get("hospital_variance", 0.0))
+        sigma2_site = float(decomp_s.get("site_variance", 0.0))
+        sigma2_rand = sigma2_ward + sigma2_hosp + sigma2_site
+        sigma2_total = sigma2_fixed + sigma2_rand + pi2_3
+
+        def _pct(v: float) -> float:
+            return v / sigma2_total * 100 if sigma2_total > 0 else 0.0
+
+        results[site] = {
+            "n_patients":    model["n_patients"],
+            "group_sigma2":  group_sigma2,
+            "sigma2_fixed":  sigma2_fixed,
+            "sigma2_ward":   sigma2_ward,
+            "sigma2_hosp":   sigma2_hosp,
+            "sigma2_site":   sigma2_site,
+            "sigma2_resid":  pi2_3,
+            "sigma2_total":  sigma2_total,
+            "r2_marginal":   sigma2_fixed / sigma2_total if sigma2_total > 0 else float("nan"),
+            "r2_conditional": (sigma2_fixed + sigma2_rand) / sigma2_total if sigma2_total > 0 else float("nan"),
+            "pct_groups":    {g: _pct(v) for g, v in group_sigma2.items()},
+            "pct_ward":      _pct(sigma2_ward),
+            "pct_hosp":      _pct(sigma2_hosp),
+            "pct_site":      _pct(sigma2_site),
+            "pct_resid":     _pct(pi2_3),
+        }
+        print(f"  [{site}] R²_marginal={results[site]['r2_marginal']:.3f}  "
+              f"R²_conditional={results[site]['r2_conditional']:.3f}")
+
+    return results
+
+
+def plot_covariate_variance_breakdown(
+    covar_result: dict,
+    out_dir: Path,
+    cohort_label: str,
+    site: str,
+) -> None:
+    """Stacked horizontal bar: each covariate group + random levels + residual."""
+    if not covar_result or site not in covar_result:
+        return
+    res = covar_result[site]
+
+    # Covariates ordered descending by % contribution
+    grp_items = sorted(res["pct_groups"].items(), key=lambda x: -x[1])
+    labels = ([g for g, _ in grp_items]
+              + ["Ward / ICU type", "Hospital", "Site", "Unexplained"])
+    pcts   = ([p for _, p in grp_items]
+              + [res["pct_ward"], res["pct_hosp"], res["pct_site"], res["pct_resid"]])
+    colors = [_COVAR_COLORS.get(lbl, "#aaaaaa") for lbl in labels]
+
+    fig, ax = plt.subplots(figsize=(11, 3.2))
+    left = 0.0
+    for label, pct, col in zip(labels, pcts, colors):
+        if pct < 0.05:
+            left += pct
+            continue
+        ax.barh(0, pct, left=left, color=col, edgecolor="white", height=0.55,
+                label=f"{label}  {pct:.1f}%")
+        if pct >= 5:
+            ax.text(left + pct / 2, 0, f"{pct:.0f}%",
+                    ha="center", va="center", fontsize=8, color="white", fontweight="bold")
+        left += pct
+
+    ax.set_xlim(0, 100)
+    ax.set_yticks([])
+    ax.set_xlabel("% of total latent-scale variance", fontsize=10)
+    ax.legend(loc="upper center", bbox_to_anchor=(0.5, -0.28),
+              ncol=4, fontsize=8, frameon=False)
+    r2m = res["r2_marginal"]
+    r2c = res["r2_conditional"]
+    ax.set_title(
+        f"Covariate variance explained — {site}  "
+        f"[{_COHORT_LABELS.get(cohort_label, cohort_label)}]\n"
+        f"R²_marginal = {r2m:.3f}  (fixed effects only)  |  "
+        f"R²_conditional = {r2c:.3f}  (fixed + random effects)",
+        fontsize=9, fontweight="bold",
+    )
+    for spine in ax.spines.values():
+        spine.set_visible(False)
+    fig.tight_layout()
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out = out_dir / f"covariate_variance_{cohort_label}_{site}.png"
+    fig.savefig(out, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  Saved: {out.name}")
+
+
+def export_covariate_variance_csv(
+    covar_result: dict,
+    out_dir: Path,
+    cohort_label: str,
+    site: str,
+) -> None:
+    if not covar_result or site not in covar_result:
+        return
+    res = covar_result[site]
+    rows = [
+        {"component": g, "type": "covariate",
+         "sigma2": round(s2, 6), "pct_total": round(res["pct_groups"][g], 3)}
+        for g, s2 in res["group_sigma2"].items()
+    ] + [
+        {"component": "Ward / ICU type", "type": "random_effect",
+         "sigma2": round(res["sigma2_ward"], 6), "pct_total": round(res["pct_ward"], 3)},
+        {"component": "Hospital", "type": "random_effect",
+         "sigma2": round(res["sigma2_hosp"], 6), "pct_total": round(res["pct_hosp"], 3)},
+        {"component": "Site", "type": "random_effect",
+         "sigma2": round(res["sigma2_site"], 6), "pct_total": round(res["pct_site"], 3)},
+        {"component": "Unexplained (residual)", "type": "residual",
+         "sigma2": round(res["sigma2_resid"], 6), "pct_total": round(res["pct_resid"], 3)},
+    ]
+    df_out = pd.DataFrame(rows)
+    df_out["r2_marginal"] = round(res["r2_marginal"], 4)
+    df_out["r2_conditional"] = round(res["r2_conditional"], 4)
+    df_out["site"] = site
+    df_out["cohort"] = cohort_label
+    out = out_dir / f"covariate_variance_{cohort_label}_{site}.csv"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    df_out.to_csv(out, index=False)
+    print(f"  Saved: {out.name}")
+
+
 def plot_group_intercepts(
     group_result: dict, out_dir: Path, cohort_label: str, site: str, label: str
 ) -> None:
@@ -1730,6 +1937,16 @@ def run_for_cohort(cohort_label: str):
             hospital_type_results[site], ph_by_site[site], cross_out, cohort_label, site, "hospital_type"
         )
 
+    # ── Covariate variance explained (Nakagawa & Schielzeth R²) ──────────────
+    print("\n--- Covariate variance explained (Nakagawa & Schielzeth R²) ---")
+    covar_variance: dict = compute_covariate_variance_explained(
+        ph_by_site, site_models, variance_decomp
+    )
+    for site in site_models:
+        _cv_out = OUTPUT_ROOT / "output" / f"upload_to_box_{site}" / cohort_label
+        plot_covariate_variance_breakdown(covar_variance, _cv_out, cohort_label, site)
+        export_covariate_variance_csv(covar_variance, _cv_out, cohort_label, site)
+
     # ── Location transition heatmaps ───────────────────────────────────────
     # Saved to upload_to_box so they are included in the consolidated report
     # and shared with the coordinating centre.
@@ -1764,6 +1981,7 @@ def run_for_cohort(cohort_label: str):
         "hospital_level":         hospital_results,       # per site: group_models + tau2/icc/mor (hospital_id)
         "hospital_type_level":    hospital_type_results,  # per site: academic vs. community
         "variance_decomposition": variance_decomp,        # per site: patient/ward/hospital/site % of total variance
+        "covariate_variance":     covar_variance,         # per site: R² + σ² per covariate group
     }
 
     # Write into each site's upload directory so the report can find it
