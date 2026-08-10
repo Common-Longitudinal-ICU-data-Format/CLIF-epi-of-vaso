@@ -3,23 +3,37 @@
 """
 CLIF 2.1.0 cohort identification and hourly feature extraction.
 
-Two cohorts are identified, both anchored at t=0 = first NE administration:
+Three cohorts are identified, all anchored at t=0 = first NE administration:
 
   Sepsis-3 (CMS): CMS qualifying IV abx + blood culture within 24 h of each other
                   + lactate > 2 mmol/L, all within ±24 h of NE start.
+                  Filter cascade shows each sub-step (culture in window → abx in
+                  window → paired within 24h → elevated lactate).
 
-  Rhee/CDC ASE:   Blood culture within ±24 h of NE start
+  Rhee/CDC ASE (hand-coded):
+                  Blood culture within ±24 h of NE start
                   + first qualifying IV abx within 2 calendar days of culture
                   + ≥4 consecutive qualifying antibiotic days (≤1-day gap allowed),
                     or antibiotic course running until ≤1 day before discharge/death
                   + lactate >= 2 mmol/L within ±24 h of NE start.
 
+  Rhee/CDC ASE (clifpy):
+                  clifpy.utils.ase.compute_ase output (blood culture + QAD +
+                  organ dysfunction; RIT applied), then post-filtered to keep only
+                  episodes where blood_culture_dttm is within ±24 h of NE start
+                  so that t=0 anchoring is consistent with the other definitions.
+                  Organ-dysfunction criterion breakdown stored as NOTE: rows in the
+                  filter CSV (vasopressor / IMV / AKI / thrombocytopenia /
+                  hyperbilirubinemia / lactate; non-exclusive per patient).
+
 Outputs (OUTPUT_ROOT/output/patient_level_data_<SITE_NAME>/ — PHI, local only):
   cohort_sepsis3.parquet        — Sepsis-3 cohort demographics and outcomes
   cohort_rhee.parquet           — Rhee/CDC ASE cohort demographics and outcomes
-  features.parquet              — hourly features for union of both cohorts
+  cohort_rhee_clifpy.parquet    — Rhee/CDC ASE (clifpy) cohort
+  features.parquet              — hourly features for union of all three cohorts
   cohort_filter_counts_sepsis3.csv
   cohort_filter_counts_rhee.csv
+  cohort_filter_counts_rhee_clifpy.csv
 """
 
 import sys
@@ -38,8 +52,9 @@ try:
     from clifpy import ClifOrchestrator
     from clifpy.utils.sofa import REQUIRED_SOFA_CATEGORIES_BY_TABLE, DEVICE_RANK_DICT
     from clifpy.utils.comorbidity import calculate_cci
+    from clifpy.utils.ase import compute_ase
 except ModuleNotFoundError:
-    print("Install clifpy: pip install clifpy")
+    print("Install clifpy: pip install clifpy>=0.5.0")
     sys.exit(1)
 
 warnings.filterwarnings("ignore")
@@ -177,14 +192,20 @@ def identify_sepsis3_cohort(
     clif_dir: Path,
     ne_df: pd.DataFrame,
     window_hours: int = 24,
-) -> pd.DataFrame:
+) -> tuple:
     """Sepsis-3 (CMS) criteria within ±window_hours of NE start (t=0):
-      1. CMS qualifying IV abx + blood culture within 24 h of each other
-      2. Both events within ±window_hours of NE start
-      3. Lactate > LACTATE_THRESHOLD within ±window_hours of NE start
+      1. Blood culture within ±window_hours of NE start
+      2. CMS qualifying IV abx within ±window_hours of NE start
+      3. Abx + culture within 24 h of each other (presumed infection)
+      4. Lactate > LACTATE_THRESHOLD within ±window_hours of NE start
 
-    Returns: hospitalization_id, presumed_infection_dttm, initial_lactate
+    Returns: (result_df, step_counts)
+      result_df — hospitalization_id, presumed_infection_dttm, initial_lactate
+      step_counts — list of {"step": ..., "n_hospitalizations": ...} dicts for the
+        filter cascade, including exclusion rows for each sub-step.
     """
+    n_ne = len(ne_df)
+
     abx = get_abx_records(clif_dir)
     blood_cx = get_blood_cultures(clif_dir)
 
@@ -207,6 +228,12 @@ def identify_sepsis3_cohort(
         (cx_win["collect_dttm"] <= cx_win["win_end"])
     ]
 
+    # Sub-step counts for the cascade
+    n_cx     = cx_win["hospitalization_id"].nunique()
+    ids_cx   = set(cx_win["hospitalization_id"])
+    ids_abx  = set(abx_win["hospitalization_id"])
+    n_abx_cx = len(ids_cx & ids_abx)   # patients with BOTH in window
+
     # Pair abx + culture within 24 h of each other
     paired = abx_win[["hospitalization_id", "admin_dttm"]].merge(
         cx_win[["hospitalization_id", "collect_dttm"]], on="hospitalization_id"
@@ -220,10 +247,53 @@ def identify_sepsis3_cohort(
     infection = (paired.groupby("hospitalization_id")
                        .agg(presumed_infection_dttm=("infection_anchor", "min"))
                        .reset_index())
+    n_paired = len(infection)
+
+    def _build_steps(n_lactate: int) -> list:
+        return [
+            {
+                "step": "Blood culture not within ±24 h of NE start (excluded)",
+                "n_hospitalizations": n_ne - n_cx,
+            },
+            {
+                "step": "Blood culture within ±24 h of NE start",
+                "n_hospitalizations": n_cx,
+            },
+            {
+                "step": "IV abx not within ±24 h of NE start (excluded)",
+                "n_hospitalizations": n_cx - n_abx_cx,
+            },
+            {
+                "step": "IV abx AND blood culture both within ±24 h of NE start",
+                "n_hospitalizations": n_abx_cx,
+            },
+            {
+                "step": "Abx + culture not within 24 h of each other (excluded)",
+                "n_hospitalizations": n_abx_cx - n_paired,
+            },
+            {
+                "step": "Presumed infection: abx + culture within 24 h of each other",
+                "n_hospitalizations": n_paired,
+            },
+            {
+                "step": (
+                    f"Lactate ≤{LACTATE_THRESHOLD} or missing"
+                    " within ±24 h of NE start (excluded)"
+                ),
+                "n_hospitalizations": n_paired - n_lactate,
+            },
+            {
+                "step": (
+                    "Sepsis-3 (CMS): presumed infection + lactate"
+                    f" >{LACTATE_THRESHOLD} mmol/L within ±24 h of NE start"
+                ),
+                "n_hospitalizations": n_lactate,
+            },
+        ]
 
     if infection.empty:
         infection["initial_lactate"] = np.nan
-        return infection
+        return infection, _build_steps(0)
 
     # Lactate check
     labs = pd.read_parquet(clif_dir / "clif_labs.parquet")
@@ -252,11 +322,11 @@ def identify_sepsis3_cohort(
     elevated_ids = set(lac_win.loc[lac_win["lab_value_numeric"] > LACTATE_THRESHOLD, "hospitalization_id"])
     infection = infection[infection["hospitalization_id"].isin(elevated_ids)].copy()
     infection = infection.merge(initial_lac, on="hospitalization_id", how="left")
-    return infection
+    return infection, _build_steps(len(infection))
 
 
 # ---------------------------------------------------------------------------
-# Phase A-3b: Rhee/CDC ASE cohort
+# Phase A-3b: Rhee/CDC ASE cohort — hand-coded ("rhee")
 # ---------------------------------------------------------------------------
 def identify_rhee_cohort(
     clif_dir: Path,
@@ -372,6 +442,132 @@ def identify_rhee_cohort(
     return result[["hospitalization_id", "collect_dttm"]].rename(
         columns={"collect_dttm": "blood_culture_dttm"}
     )
+
+
+# ---------------------------------------------------------------------------
+# Phase A-3c: Rhee/CDC ASE cohort — clifpy compute_ase ("rhee_clifpy")
+# ---------------------------------------------------------------------------
+
+# Organ-dysfunction dttm columns returned by clifpy and their display labels.
+# These columns are non-null when the corresponding OD criterion is met for
+# the episode.  Checked at runtime so the function degrades gracefully if a
+# future clifpy version renames them.
+_CLIFPY_OD_COLS: list[tuple[str, str]] = [
+    ("vasopressor_dttm",        "Vasopressor initiation"),
+    ("imv_dttm",                "Invasive mechanical ventilation (IMV)"),
+    ("aki_dttm",                "Acute kidney injury (AKI)"),
+    ("thrombocytopenia_dttm",   "Thrombocytopenia"),
+    ("hyperbilirubinemia_dttm", "Hyperbilirubinemia"),
+    ("lactate_dttm",            "Lactate ≥2 mmol/L"),
+]
+
+
+def identify_rhee_clifpy_cohort(
+    clif_dir: Path,
+    ne_df: pd.DataFrame,
+    window_hours: int = 24,
+) -> tuple:
+    """Rhee/CDC ASE cohort via clifpy.utils.ase.compute_ase.
+
+    Blood culture must fall within ±window_hours of NE start so that t=0
+    anchoring is consistent with the Sepsis-3 and hand-coded Rhee definitions.
+
+    Lactate >= 2 mmol/L counts as one of several organ-dysfunction criteria
+    (vasopressor, IMV, AKI, thrombocytopenia, hyperbilirubinemia, lactate);
+    patients without high lactate can qualify via other criteria.  14-day
+    repeat-infection timeframe de-duplication applied.
+
+    Returns: (result_df, step_counts)
+      result_df — hospitalization_id, blood_culture_dttm
+      step_counts — list of {"step": ..., "n_hospitalizations": ...} dicts for
+        the filter cascade:
+          • Exclusion row for patients whose ASE episode falls outside ±24 h of NE
+          • Retention row for the in-window cohort
+          • NOTE: rows (one per OD criterion) showing how many patients had each
+            criterion met (non-exclusive; a patient can trigger multiple criteria)
+    """
+    hosp_ids = ne_df["hospitalization_id"].tolist()
+    ase_df = compute_ase(
+        hospitalization_ids=hosp_ids,
+        data_directory=str(clif_dir),
+        filetype="parquet",
+        timezone=TIMEZONE,
+        apply_rit=True,
+        include_lactate=True,
+        verbose=True,
+    )
+
+    # Identify which OD dttm columns are actually present in this version of clifpy
+    od_cols_present = [(c, lbl) for c, lbl in _CLIFPY_OD_COLS if c in ase_df.columns]
+    if od_cols_present:
+        print(f"  Rhee-clifpy: found {len(od_cols_present)} OD dttm columns: "
+              f"{[c for c, _ in od_cols_present]}")
+    else:
+        print("  Rhee-clifpy: no OD dttm columns found in compute_ase output — "
+              "OD criterion breakdown will be omitted.")
+
+    keep_cols = (["hospitalization_id", "blood_culture_dttm"]
+                 + [c for c, _ in od_cols_present])
+    sepsis_rows = ase_df[ase_df["sepsis"] == 1][keep_cols].copy()
+    n_all_ase = sepsis_rows["hospitalization_id"].nunique()
+
+    # Apply ±window_hours filter: blood culture within ±window_hours of NE start
+    # (t=0 = first_norepi_time, consistent with Sepsis-3 and hand-coded Rhee)
+    ne = ne_df[["hospitalization_id", "first_norepi_time"]].copy()
+    ne["t0"]        = to_naive_utc(pd.to_datetime(ne["first_norepi_time"], utc=True))
+    ne["win_start"] = ne["t0"] - pd.Timedelta(hours=window_hours)
+    ne["win_end"]   = ne["t0"] + pd.Timedelta(hours=window_hours)
+
+    sepsis_rows["blood_culture_dttm"] = to_naive_utc(
+        pd.to_datetime(sepsis_rows["blood_culture_dttm"], utc=True)
+    )
+    sepsis_win = sepsis_rows.merge(
+        ne[["hospitalization_id", "win_start", "win_end"]], on="hospitalization_id"
+    )
+    sepsis_win = sepsis_win[
+        (sepsis_win["blood_culture_dttm"] >= sepsis_win["win_start"]) &
+        (sepsis_win["blood_culture_dttm"] <= sepsis_win["win_end"])
+    ].drop(columns=["win_start", "win_end"])
+
+    # One row per patient: earliest qualifying episode in window
+    final = (sepsis_win
+             .sort_values("blood_culture_dttm")
+             .groupby("hospitalization_id")
+             .first()
+             .reset_index())
+    n_in_window = len(final)
+
+    # Build step counts for filter cascade
+    step_counts: list[dict] = [
+        {
+            "step": (
+                "Rhee/CDC ASE (clifpy): blood culture + QAD"
+                " + organ dysfunction (RIT applied)"
+            ),
+            "n_hospitalizations": n_all_ase,
+        },
+        {
+            "step": "Blood culture not within ±24 h of NE start (excluded)",
+            "n_hospitalizations": n_all_ase - n_in_window,
+        },
+        {
+            "step": (
+                "Rhee/CDC ASE (clifpy) with blood culture within ±24 h of NE start"
+            ),
+            "n_hospitalizations": n_in_window,
+        },
+    ]
+
+    # NOTE: rows — OD criterion breakdown on the per-patient post-dedup set.
+    # A patient can satisfy multiple criteria; these counts are non-exclusive.
+    for col, label in od_cols_present:
+        n_od = int(final[col].notna().sum())
+        step_counts.append({
+            "step": f"NOTE: OD criterion — {label}",
+            "n_hospitalizations": n_od,
+        })
+
+    return final[["hospitalization_id", "blood_culture_dttm"]].copy(), step_counts
 
 
 # ---------------------------------------------------------------------------
@@ -739,24 +935,26 @@ def _assemble_cohort_df(
 # Phase A: Full cohort assembly
 # ---------------------------------------------------------------------------
 def build_cohort(clif_dir: Path, co: ClifOrchestrator) -> tuple:
-    """Identify Sepsis-3 and Rhee/CDC ASE cohorts with t=0 at NE start.
+    """Identify Sepsis-3, Rhee (hand-coded), and Rhee-clifpy cohorts with t=0 at NE start.
 
-    Returns: (cohort_sepsis3, cohort_rhee, filter_log_sepsis3, filter_log_rhee)
-    Each cohort DataFrame has the same schema as the old cohort.parquet.
+    Returns:
+        (cohort_s3, cohort_rhee, cohort_rhee_clifpy,
+         filter_s3, filter_rhee, filter_rhee_clifpy)
     """
-    filter_s3   = []
-    filter_rhee = []
+    filter_s3          = []
+    filter_rhee        = []
+    filter_rhee_clifpy = []
 
     print("\nStep 0: Total hospitalizations in CLIF site...")
     hosp_all = pd.read_parquet(clif_dir / "clif_hospitalization.parquet")[["hospitalization_id"]]
     n_total = len(hosp_all)
-    filter_s3.append({"step": "Total hospitalizations in CLIF site", "n_hospitalizations": n_total})
-    filter_rhee.append({"step": "Total hospitalizations in CLIF site", "n_hospitalizations": n_total})
+    for fl in [filter_s3, filter_rhee, filter_rhee_clifpy]:
+        fl.append({"step": "Total hospitalizations in CLIF site", "n_hospitalizations": n_total})
     print(f"  {n_total:,} total hospitalizations")
 
     print(f"\nStep 1: All NE starts (≥{MIN_NE_RECORDS} records, t=0 anchor)...")
     ne_df = get_all_ne_starts(clif_dir)
-    for fl in [filter_s3, filter_rhee]:
+    for fl in [filter_s3, filter_rhee, filter_rhee_clifpy]:
         fl.append({"step": f"NE started (>={MIN_NE_RECORDS} records)", "n_hospitalizations": len(ne_df)})
     print(f"  {len(ne_df):,} patients with NE")
 
@@ -764,27 +962,39 @@ def build_cohort(clif_dir: Path, co: ClifOrchestrator) -> tuple:
     mortality = get_mortality(clif_dir)
 
     print("\nStep 3a: Sepsis-3 (CMS) criteria within ±24 h of NE start...")
-    print("         [abx + blood culture within 24 h + lactate > 2 mmol/L]")
-    sepsis3_df = identify_sepsis3_cohort(clif_dir, ne_df, window_hours=24)
-    filter_s3.append({
-        "step": "Sepsis-3 (CMS): abx + culture within 24 h + lactate > 2 (within ±24 h of NE start)",
-        "n_hospitalizations": len(sepsis3_df),
-    })
-    print(f"  {len(sepsis3_df):,} meet Sepsis-3 (CMS) criteria")
+    print("         [abx + blood culture within 24 h of each other + lactate > 2 mmol/L]")
+    sepsis3_df, s3_steps = identify_sepsis3_cohort(clif_dir, ne_df, window_hours=24)
+    filter_s3.extend(s3_steps)
+    n_s3_final = s3_steps[-1]["n_hospitalizations"]   # last step = Sepsis-3 retained count
+    print(f"  Sub-steps (Sepsis-3):")
+    for _s in s3_steps:
+        print(f"    {_s['step']}: {_s['n_hospitalizations']:,}")
+    print(f"  {n_s3_final:,} meet Sepsis-3 (CMS) criteria")
 
-    print("\nStep 3b: Rhee/CDC ASE criteria within ±24 h of NE start...")
+    print("\nStep 3b: Rhee/CDC ASE criteria (hand-coded, blood culture + QAD within ±24 h of NE start)...")
     print("         [blood culture + ≥4 consecutive antibiotic days + lactate >= 2 mmol/L]")
-    rhee_df = identify_rhee_cohort(clif_dir, ne_df, mortality, window_hours=24)
+    rhee_df = identify_rhee_cohort(clif_dir, ne_df, mortality)
     filter_rhee.append({
         "step": "Rhee/CDC ASE: blood culture + ≥4 consecutive abx days (within ±24 h of NE start)",
         "n_hospitalizations": len(rhee_df),
     })
-    print(f"  {len(rhee_df):,} meet Rhee/CDC ASE criteria")
+    print(f"  {len(rhee_df):,} meet Rhee/CDC ASE blood-culture + abx criteria")
+
+    print("\nStep 3c: Rhee/CDC ASE criteria (via clifpy compute_ase, ±24 h window)...")
+    print("         [blood culture + QAD + organ dysfunction incl. lactate >= 2; RIT applied]")
+    print("         [blood culture restricted to ±24 h of NE start — t=0 anchoring]")
+    rhee_clifpy_df, clifpy_steps = identify_rhee_clifpy_cohort(clif_dir, ne_df, window_hours=24)
+    filter_rhee_clifpy.extend(clifpy_steps)
+    print(f"  Sub-steps (Rhee-clifpy):")
+    for _s in clifpy_steps:
+        print(f"    {_s['step']}: {_s['n_hospitalizations']:,}")
+    print(f"  {len(rhee_clifpy_df):,} meet Rhee/CDC ASE criteria (clifpy, ±24 h window)")
 
     union_ids = (set(sepsis3_df["hospitalization_id"]) |
-                 set(rhee_df["hospitalization_id"]))
+                 set(rhee_df["hospitalization_id"]) |
+                 set(rhee_clifpy_df["hospitalization_id"]))
     ne_union = ne_df[ne_df["hospitalization_id"].isin(union_ids)].copy()
-    print(f"\n  Union: {len(ne_union):,} unique patients in either cohort")
+    print(f"\n  Union: {len(ne_union):,} unique patients in any cohort")
 
     print("\nStep 4: ICU times...")
     icu = get_icu_times(clif_dir)
@@ -794,135 +1004,170 @@ def build_cohort(clif_dir: Path, co: ClifOrchestrator) -> tuple:
     sepsis3_df["infection_dttm"] = sepsis3_df["presumed_infection_dttm"]
     rhee_df = rhee_df.copy()
     rhee_df["infection_dttm"] = rhee_df["blood_culture_dttm"]
-    cohort_s3   = _assemble_cohort_df(sepsis3_df, ne_union, icu, mortality)
-    cohort_rhee = _assemble_cohort_df(rhee_df,   ne_union, icu, mortality)
+    rhee_clifpy_df = rhee_clifpy_df.copy()
+    rhee_clifpy_df["infection_dttm"] = rhee_clifpy_df["blood_culture_dttm"]
+    cohort_s3          = _assemble_cohort_df(sepsis3_df,    ne_union, icu, mortality)
+    cohort_rhee        = _assemble_cohort_df(rhee_df,       ne_union, icu, mortality)
+    cohort_rhee_clifpy = _assemble_cohort_df(rhee_clifpy_df, ne_union, icu, mortality)
 
     print("\nStep 6: SOFA at NE start (union cohort via clifpy)...")
     sofa_df = compute_sofa_at_ne_start(ne_union, co)
     sofa_map = sofa_df.set_index("hospitalization_id")["sepsis_onset_sofa"]
-    cohort_s3["sepsis_onset_sofa"]   = cohort_s3["stay_id"].map(sofa_map)
-    cohort_rhee["sepsis_onset_sofa"] = cohort_rhee["stay_id"].map(sofa_map)
+    cohort_s3["sepsis_onset_sofa"]          = cohort_s3["stay_id"].map(sofa_map)
+    cohort_rhee["sepsis_onset_sofa"]        = cohort_rhee["stay_id"].map(sofa_map)
+    cohort_rhee_clifpy["sepsis_onset_sofa"] = cohort_rhee_clifpy["stay_id"].map(sofa_map)
 
     print("\nStep 7: Initial lactate within ±24 h of NE start...")
-    # Sepsis-3 initial_lactate already computed in identify_sepsis3_cohort
+    # Sepsis-3: initial_lactate already embedded in identify_sepsis3_cohort output
     lac_s3_map = sepsis3_df.set_index("hospitalization_id")["initial_lactate"]
     cohort_s3["initial_lactate"] = cohort_s3["stay_id"].map(lac_s3_map)
 
-    # Rhee: first lactate within ±24 h of NE start; must be >= LACTATE_THRESHOLD
+    # Shared lactate computation for Rhee and Rhee-clifpy
     labs = pd.read_parquet(clif_dir / "clif_labs.parquet")
     lac_df = labs[labs["lab_category"] == "lactate"][
         ["hospitalization_id", "lab_result_dttm", "lab_value_numeric"]
     ].copy()
     lac_df["lab_result_dttm"] = to_naive_utc(lac_df["lab_result_dttm"])
-    rhee_ids = set(cohort_rhee["stay_id"])
-    ne_win = ne_union[ne_union["hospitalization_id"].isin(rhee_ids)].copy()
-    ne_win["t0"] = to_naive_utc(pd.to_datetime(ne_win["first_norepi_time"], utc=True))
-    ne_win["win_start"] = ne_win["t0"] - pd.Timedelta(hours=24)
-    ne_win["win_end"]   = ne_win["t0"] + pd.Timedelta(hours=24)
-    lac_rhee = lac_df.merge(
-        ne_win[["hospitalization_id", "win_start", "win_end"]], on="hospitalization_id"
-    )
-    lac_rhee = lac_rhee[
-        (lac_rhee["lab_result_dttm"] >= lac_rhee["win_start"]) &
-        (lac_rhee["lab_result_dttm"] <= lac_rhee["win_end"]) &
-        lac_rhee["lab_value_numeric"].notna()
-    ]
-    rhee_lac = (lac_rhee.sort_values("lab_result_dttm")
+
+    def _compute_first_lactate(cohort_df: pd.DataFrame) -> pd.DataFrame:
+        ids = set(cohort_df["stay_id"])
+        ne_w = ne_union[ne_union["hospitalization_id"].isin(ids)].copy()
+        ne_w["t0"]        = to_naive_utc(pd.to_datetime(ne_w["first_norepi_time"], utc=True))
+        ne_w["win_start"] = ne_w["t0"] - pd.Timedelta(hours=24)
+        ne_w["win_end"]   = ne_w["t0"] + pd.Timedelta(hours=24)
+        lac_win = lac_df.merge(ne_w[["hospitalization_id", "win_start", "win_end"]], on="hospitalization_id")
+        lac_win = lac_win[
+            (lac_win["lab_result_dttm"] >= lac_win["win_start"]) &
+            (lac_win["lab_result_dttm"] <= lac_win["win_end"]) &
+            lac_win["lab_value_numeric"].notna()
+        ]
+        return (lac_win.sort_values("lab_result_dttm")
                 .groupby("hospitalization_id")["lab_value_numeric"]
                 .first()
                 .reset_index()
                 .rename(columns={"lab_value_numeric": "initial_lactate",
                                  "hospitalization_id": "stay_id"}))
-    cohort_rhee = cohort_rhee.merge(rhee_lac, on="stay_id", how="left")
 
-    n_before_lac = len(cohort_rhee)
+    # Rhee (hand-coded): apply lactate >= LACTATE_THRESHOLD filter
+    rhee_lac = _compute_first_lactate(cohort_rhee)
+    cohort_rhee = cohort_rhee.merge(rhee_lac, on="stay_id", how="left")
+    n_before = len(cohort_rhee)
     cohort_rhee = cohort_rhee[cohort_rhee["initial_lactate"] >= LACTATE_THRESHOLD].copy()
+    n_excl_lac = n_before - len(cohort_rhee)
     filter_rhee.append({
         "step": f"Lactate < {LACTATE_THRESHOLD} or missing (within ±24 h of NE start) (excluded)",
-        "n_hospitalizations": n_before_lac - len(cohort_rhee),
+        "n_hospitalizations": n_excl_lac,
     })
-    print(f"  {len(cohort_rhee):,} meet Rhee/CDC ASE + lactate >= {LACTATE_THRESHOLD} criteria")
+    print(f"  Rhee: {len(cohort_rhee):,} after lactate >= {LACTATE_THRESHOLD} filter "
+          f"({n_excl_lac:,} excluded)")
+
+    # Rhee-clifpy: lactate for reporting only, no filter (compute_ase handles internally)
+    clifpy_lac = _compute_first_lactate(cohort_rhee_clifpy)
+    cohort_rhee_clifpy = cohort_rhee_clifpy.merge(clifpy_lac, on="stay_id", how="left")
+    print(f"  Rhee-clifpy: {len(cohort_rhee_clifpy):,} (lactate criterion applied by compute_ase)")
 
     print("\nStep 8: Demographics, weight, vasopressin pre-trajectory, location, CCI...")
-    all_stay_ids = set(cohort_s3["stay_id"]) | set(cohort_rhee["stay_id"])
+    all_stay_ids = (set(cohort_s3["stay_id"]) |
+                    set(cohort_rhee["stay_id"]) |
+                    set(cohort_rhee_clifpy["stay_id"]))
     union_for_shared = (pd.concat([
         cohort_s3[["stay_id", "trajectory_start", "trajectory_end"]],
         cohort_rhee[["stay_id", "trajectory_start", "trajectory_end"]],
+        cohort_rhee_clifpy[["stay_id", "trajectory_start", "trajectory_end"]],
     ]).drop_duplicates(subset=["stay_id"]))
 
-    demo = get_demographics(clif_dir, all_stay_ids)
+    demo     = get_demographics(clif_dir, all_stay_ids)
     weight_df = get_weight_at_onset(clif_dir, union_for_shared)
-    vaso_pre = get_vaso_pretraj(clif_dir, union_for_shared)
-    cci_df = get_cci(clif_dir, all_stay_ids)
+    vaso_pre  = get_vaso_pretraj(clif_dir, union_for_shared)
+    cci_df    = get_cci(clif_dir, all_stay_ids)
 
-    for cohort in [cohort_s3, cohort_rhee]:
-        cohort.merge(demo, on="stay_id", how="left")  # don't reassign yet; done below
-    cohort_s3   = cohort_s3.merge(demo, on="stay_id", how="left")
-    cohort_s3   = cohort_s3.merge(weight_df, on="stay_id", how="left")
-    cohort_s3   = cohort_s3.merge(vaso_pre, on="stay_id", how="left")
-    cohort_s3   = cohort_s3.merge(cci_df, on="stay_id", how="left")
-    cohort_rhee = cohort_rhee.merge(demo, on="stay_id", how="left")
-    cohort_rhee = cohort_rhee.merge(weight_df, on="stay_id", how="left")
-    cohort_rhee = cohort_rhee.merge(vaso_pre, on="stay_id", how="left")
-    cohort_rhee = cohort_rhee.merge(cci_df, on="stay_id", how="left")
+    cohort_s3          = cohort_s3.merge(demo,      on="stay_id", how="left")
+    cohort_s3          = cohort_s3.merge(weight_df, on="stay_id", how="left")
+    cohort_s3          = cohort_s3.merge(vaso_pre,  on="stay_id", how="left")
+    cohort_s3          = cohort_s3.merge(cci_df,    on="stay_id", how="left")
+    cohort_rhee        = cohort_rhee.merge(demo,      on="stay_id", how="left")
+    cohort_rhee        = cohort_rhee.merge(weight_df, on="stay_id", how="left")
+    cohort_rhee        = cohort_rhee.merge(vaso_pre,  on="stay_id", how="left")
+    cohort_rhee        = cohort_rhee.merge(cci_df,    on="stay_id", how="left")
+    cohort_rhee_clifpy = cohort_rhee_clifpy.merge(demo,      on="stay_id", how="left")
+    cohort_rhee_clifpy = cohort_rhee_clifpy.merge(weight_df, on="stay_id", how="left")
+    cohort_rhee_clifpy = cohort_rhee_clifpy.merge(vaso_pre,  on="stay_id", how="left")
+    cohort_rhee_clifpy = cohort_rhee_clifpy.merge(cci_df,    on="stay_id", how="left")
 
-    for cohort in [cohort_s3, cohort_rhee]:
-        cohort["vaso_before_traj"] = cohort["vaso_before_traj"].fillna(0).astype(int)
+    for _c in [cohort_s3, cohort_rhee, cohort_rhee_clifpy]:
+        _c["vaso_before_traj"] = _c["vaso_before_traj"].fillna(0).astype(int)
 
     print("\nStep 9: Vasopressin before trajectory start (logging only, exclusion disabled)...")
-    for fl, cohort in [(filter_s3, cohort_s3), (filter_rhee, cohort_rhee)]:
-        n_excl = int((cohort["vaso_before_traj"] == 1).sum())
+    for fl, cohort in [(filter_s3, cohort_s3),
+                       (filter_rhee, cohort_rhee),
+                       (filter_rhee_clifpy, cohort_rhee_clifpy)]:
+        n_vaso = int((cohort["vaso_before_traj"] == 1).sum())
         fl.append({"step": "NOTE: Vasopressin in 24 h before trajectory start (retained — prior-vaso group)",
-                   "n_hospitalizations": n_excl})
+                   "n_hospitalizations": n_vaso})
 
-    # cohort_s3   = cohort_s3[cohort_s3["vaso_before_traj"] == 0].copy()
+    # cohort_s3 = cohort_s3[cohort_s3["vaso_before_traj"] == 0].copy()
     # cohort_rhee = cohort_rhee[cohort_rhee["vaso_before_traj"] == 0].copy()
+    # cohort_rhee_clifpy = cohort_rhee_clifpy[cohort_rhee_clifpy["vaso_before_traj"] == 0].copy()
 
     print("\nStep 10: Location at t=0 (ADT row active at NE start)...")
     union_for_loc = (pd.concat([
         cohort_s3[["stay_id", "first_norepi_time"]],
         cohort_rhee[["stay_id", "first_norepi_time"]],
+        cohort_rhee_clifpy[["stay_id", "first_norepi_time"]],
     ]).drop_duplicates(subset=["stay_id"]))
     loc_t0 = get_location_at_t0(clif_dir, union_for_loc)
 
-    cohort_s3   = cohort_s3.drop(columns=_LOC_T0_OPTIONAL_COLS, errors="ignore")
-    cohort_s3   = cohort_s3.merge(loc_t0, on="stay_id", how="left")
-    cohort_rhee = cohort_rhee.drop(columns=_LOC_T0_OPTIONAL_COLS, errors="ignore")
-    cohort_rhee = cohort_rhee.merge(loc_t0, on="stay_id", how="left")
+    for _c in [cohort_s3, cohort_rhee, cohort_rhee_clifpy]:
+        _c.drop(columns=_LOC_T0_OPTIONAL_COLS, inplace=True, errors="ignore")
+    cohort_s3          = cohort_s3.merge(loc_t0,          on="stay_id", how="left")
+    cohort_rhee        = cohort_rhee.merge(loc_t0,        on="stay_id", how="left")
+    cohort_rhee_clifpy = cohort_rhee_clifpy.merge(loc_t0, on="stay_id", how="left")
 
     print("\nStep 11: Excluding patients in OR/procedural areas at NE start...")
     _OR_CATS = frozenset({"or", "procedure_room", "procedural", "pacu", "operating_room"})
-    for _lbl, _fl, _c in [("Sepsis-3", filter_s3, cohort_s3),
-                           ("Rhee",     filter_rhee, cohort_rhee)]:
+    for _lbl, _fl, _c in [("Sepsis-3",    filter_s3,          cohort_s3),
+                           ("Rhee",        filter_rhee,        cohort_rhee),
+                           ("Rhee-clifpy", filter_rhee_clifpy, cohort_rhee_clifpy)]:
         _loc = _c["location_category"].fillna("").str.lower().str.strip()
         _n   = int(_loc.isin(_OR_CATS).sum())
         _fl.append({"step": "Location at t=0 = OR/procedural/PACU (excluded)",
                     "n_hospitalizations": _n})
         print(f"  {_lbl}: excluding {_n} patients in OR/procedural/PACU at t=0")
-    cohort_s3   = cohort_s3[
+    cohort_s3          = cohort_s3[
         ~cohort_s3["location_category"].fillna("").str.lower().str.strip().isin(_OR_CATS)
     ].copy()
-    cohort_rhee = cohort_rhee[
+    cohort_rhee        = cohort_rhee[
         ~cohort_rhee["location_category"].fillna("").str.lower().str.strip().isin(_OR_CATS)
     ].copy()
+    cohort_rhee_clifpy = cohort_rhee_clifpy[
+        ~cohort_rhee_clifpy["location_category"].fillna("").str.lower().str.strip().isin(_OR_CATS)
+    ].copy()
 
-    filter_s3.append({"step": "Final Sepsis-3 cohort", "n_hospitalizations": len(cohort_s3)})
-    filter_rhee.append({"step": "Final Rhee cohort",    "n_hospitalizations": len(cohort_rhee)})
-    print(f"  Sepsis-3 final: {len(cohort_s3):,} | Rhee final: {len(cohort_rhee):,}")
+    filter_s3.append({"step": "Final Sepsis-3 cohort",    "n_hospitalizations": len(cohort_s3)})
+    filter_rhee.append({"step": "Final Rhee cohort",       "n_hospitalizations": len(cohort_rhee)})
+    filter_rhee_clifpy.append({"step": "Final Rhee-clifpy cohort",
+                                "n_hospitalizations": len(cohort_rhee_clifpy)})
+    print(f"  Sepsis-3 final: {len(cohort_s3):,} | "
+          f"Rhee final: {len(cohort_rhee):,} | "
+          f"Rhee-clifpy final: {len(cohort_rhee_clifpy):,}")
 
     print("\nStep 11b: Location at trajectory end (death / ICU discharge / 120-h cap)...")
     union_for_loc_end = (pd.concat([
         cohort_s3[["stay_id", "trajectory_end"]],
         cohort_rhee[["stay_id", "trajectory_end"]],
+        cohort_rhee_clifpy[["stay_id", "trajectory_end"]],
     ]).drop_duplicates(subset=["stay_id"]))
     loc_end = get_location_at_end(clif_dir, union_for_loc_end)
-    cohort_s3   = cohort_s3.merge(loc_end, on="stay_id", how="left")
-    cohort_rhee = cohort_rhee.merge(loc_end, on="stay_id", how="left")
-    for lbl, c in [("Sepsis-3", cohort_s3), ("Rhee", cohort_rhee)]:
+    cohort_s3          = cohort_s3.merge(loc_end,          on="stay_id", how="left")
+    cohort_rhee        = cohort_rhee.merge(loc_end,        on="stay_id", how="left")
+    cohort_rhee_clifpy = cohort_rhee_clifpy.merge(loc_end, on="stay_id", how="left")
+    for lbl, c in [("Sepsis-3", cohort_s3),
+                   ("Rhee", cohort_rhee),
+                   ("Rhee-clifpy", cohort_rhee_clifpy)]:
         n_end = int(c["location_category_end"].notna().sum())
         print(f"  {lbl}: end location resolved for {n_end:,} / {len(c):,} patients")
 
-    return cohort_s3, cohort_rhee, filter_s3, filter_rhee
+    return cohort_s3, cohort_rhee, cohort_rhee_clifpy, filter_s3, filter_rhee, filter_rhee_clifpy
 
 
 # ---------------------------------------------------------------------------
@@ -1623,12 +1868,56 @@ def main():
     print("=" * 60)
     print("PHASE A: COHORT IDENTIFICATION")
     print("=" * 60)
-    cohort_s3, cohort_rhee, filter_s3, filter_rhee = build_cohort(CLIF_DIR, co)
+    (cohort_s3, cohort_rhee, cohort_rhee_clifpy,
+     filter_s3, filter_rhee, filter_rhee_clifpy) = build_cohort(CLIF_DIR, co)
 
-    print(f"\nSepsis-3 cohort: {len(cohort_s3):,} patients  "
+    print(f"\nSepsis-3 cohort:    {len(cohort_s3):,} patients  "
           f"(mortality {cohort_s3['hospital_death'].mean():.1%})")
-    print(f"Rhee cohort:     {len(cohort_rhee):,} patients  "
+    print(f"Rhee cohort:        {len(cohort_rhee):,} patients  "
           f"(mortality {cohort_rhee['hospital_death'].mean():.1%})")
+    print(f"Rhee-clifpy cohort: {len(cohort_rhee_clifpy):,} patients  "
+          f"(mortality {cohort_rhee_clifpy['hospital_death'].mean():.1%})")
+
+    print("\n" + "=" * 60)
+    print("PHASE B: FEATURE EXTRACTION (union of all three cohorts)")
+    print("=" * 60)
+
+    # Union cohort for features: one row per stay_id (prefer Sepsis-3 row where duplicated)
+    union_cohort = (pd.concat([cohort_s3, cohort_rhee, cohort_rhee_clifpy])
+                    .drop_duplicates(subset=["stay_id"])
+                    .reset_index(drop=True))
+
+    features = build_features(union_cohort, co, CLIF_DIR)
+
+    # Diagnostic: flag patients with NE=0 at t=0 but DO NOT exclude them.
+    # t=0 is definitionally when NE starts (anchored to first_norepi_time).
+    # A zero dose at t=0 is a data-recording artifact — e.g. the EHR writes
+    # a zero-dose "start" marker before the actual rate is entered, so the
+    # hourly mean for that partial first hour rounds to zero.  These patients
+    # ARE NE patients and must remain in every cohort.
+    ne_at_t0 = features[features["time_hour"] == 0].set_index("stay_id")["norepinephrine"]
+    no_ne_ids = set(ne_at_t0[ne_at_t0 == 0].index)
+    if no_ne_ids:
+        n_s3  = int(cohort_s3["stay_id"].isin(no_ne_ids).sum())
+        n_rh  = int(cohort_rhee["stay_id"].isin(no_ne_ids).sum())
+        n_rc  = int(cohort_rhee_clifpy["stay_id"].isin(no_ne_ids).sum())
+        print(
+            f"\n  NOTE: {len(no_ne_ids)} patients have NE=0 at t=0 "
+            f"(Sepsis-3: {n_s3}, Rhee: {n_rh}, Rhee-clifpy: {n_rc}) — "
+            "kept in cohort (t=0 is NE start; zero is a recording artifact)."
+        )
+
+    # Update "Final" rows to reflect post-validation counts, then write CSVs
+    # (must happen after NE=0 validation so the counts match the saved parquet files)
+    for fl, label, cohort in [
+        (filter_s3,          "Final Sepsis-3 cohort",    cohort_s3),
+        (filter_rhee,        "Final Rhee cohort",        cohort_rhee),
+        (filter_rhee_clifpy, "Final Rhee-clifpy cohort", cohort_rhee_clifpy),
+    ]:
+        for row in fl:
+            if row["step"].startswith(label):
+                row["n_hospitalizations"] = len(cohort)
+                break
 
     pd.DataFrame(filter_s3).to_csv(
         PATIENT_LEVEL_DIR / "cohort_filter_counts_sepsis3.csv", index=False
@@ -1636,27 +1925,10 @@ def main():
     pd.DataFrame(filter_rhee).to_csv(
         PATIENT_LEVEL_DIR / "cohort_filter_counts_rhee.csv", index=False
     )
+    pd.DataFrame(filter_rhee_clifpy).to_csv(
+        PATIENT_LEVEL_DIR / "cohort_filter_counts_rhee_clifpy.csv", index=False
+    )
     print("Saved filter count CSVs.")
-
-    print("\n" + "=" * 60)
-    print("PHASE B: FEATURE EXTRACTION (union of both cohorts)")
-    print("=" * 60)
-
-    # Union cohort for features: one row per stay_id (prefer Sepsis-3 row where duplicated)
-    union_cohort = (pd.concat([cohort_s3, cohort_rhee])
-                    .drop_duplicates(subset=["stay_id"])
-                    .reset_index(drop=True))
-
-    features = build_features(union_cohort, co, CLIF_DIR)
-
-    # Validate: NE > 0 at t=0 for every patient
-    ne_at_t0 = features[features["time_hour"] == 0].set_index("stay_id")["norepinephrine"]
-    no_ne_ids = set(ne_at_t0[ne_at_t0 == 0].index)
-    if no_ne_ids:
-        print(f"\n  WARNING: {len(no_ne_ids)} patients have NE=0 at t=0 — excluded.")
-        features   = features[~features["stay_id"].isin(no_ne_ids)].copy()
-        cohort_s3  = cohort_s3[~cohort_s3["stay_id"].isin(no_ne_ids)].copy()
-        cohort_rhee = cohort_rhee[~cohort_rhee["stay_id"].isin(no_ne_ids)].copy()
 
     print(f"\nFeatures: {len(features):,} rows | "
           f"{features['stay_id'].nunique():,} patients")
@@ -1666,13 +1938,15 @@ def main():
         cols = [c for c in _COHORT_COLS if c in df.columns]
         df[cols].to_parquet(path, index=False)
 
-    _save_cohort(cohort_s3,   PATIENT_LEVEL_DIR / "cohort_sepsis3.parquet")
-    _save_cohort(cohort_rhee, PATIENT_LEVEL_DIR / "cohort_rhee.parquet")
+    _save_cohort(cohort_s3,          PATIENT_LEVEL_DIR / "cohort_sepsis3.parquet")
+    _save_cohort(cohort_rhee,        PATIENT_LEVEL_DIR / "cohort_rhee.parquet")
+    _save_cohort(cohort_rhee_clifpy, PATIENT_LEVEL_DIR / "cohort_rhee_clifpy.parquet")
     features.to_parquet(PATIENT_LEVEL_DIR / "features.parquet", index=False)
 
     print(f"\nOutputs written to {PATIENT_LEVEL_DIR}/")
     print("  cohort_sepsis3.parquet")
     print("  cohort_rhee.parquet")
+    print("  cohort_rhee_clifpy.parquet")
     print("  features.parquet  (union — filter to cohort IDs in downstream scripts)")
 
 
