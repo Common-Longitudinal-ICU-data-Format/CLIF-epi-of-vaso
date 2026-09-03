@@ -51,13 +51,14 @@ BASE_DIR = Path(__file__).parent.parent
 _ap = argparse.ArgumentParser(add_help=False)
 _ap.add_argument("--site",   default=None,
                  help="Override SITE_NAME from config (e.g. MIMIC, UCMC)")
-_ap.add_argument("--cohort", default="both", choices=["sepsis3", "rhee", "both"],
-                 help="Which cohort to analyse; 'both' (default) runs sepsis3 then rhee")
+_ap.add_argument("--cohort", default="both",
+                 choices=["sepsis3", "rhee", "rhee_clifpy", "both"],
+                 help="Which cohort to analyse; 'both' (default) runs all three")
 _args, _passthrough_args = _ap.parse_known_args()
 
 if _args.cohort == "both":
     import subprocess
-    for _c in ("sepsis3", "rhee"):
+    for _c in ("sepsis3", "rhee", "rhee_clifpy"):
         _cmd = [sys.executable, __file__, "--cohort", _c]
         if _args.site:
             _cmd += ["--site", _args.site]
@@ -88,24 +89,28 @@ if _args.cohort == "both":
 
     _feat_both = _pd_km.read_parquet(_pl_dir / "features.parquet")
 
-    # solid = ever-vaso, dashed = never-vaso; red family = sepsis3, blue family = rhee
+    # solid = ever-vaso, dashed = never-vaso; red = sepsis3, blue = rhee, green = rhee_clifpy
     _KM_STYLE = {
-        ("sepsis3", 1): ("#e15759", "-"),
-        ("sepsis3", 0): ("#f28e2b", "--"),
-        ("rhee",    1): ("#4e79a7", "-"),
-        ("rhee",    0): ("#76b7b2", "--"),
+        ("sepsis3",    1): ("#e15759", "-"),
+        ("sepsis3",    0): ("#f28e2b", "--"),
+        ("rhee",       1): ("#4e79a7", "-"),
+        ("rhee",       0): ("#76b7b2", "--"),
+        ("rhee_clifpy", 1): ("#59a14f", "-"),
+        ("rhee_clifpy", 0): ("#8cd17d", "--"),
     }
     _KM_LABEL = {
-        ("sepsis3", 1): "Sepsis-3 ever-vaso",
-        ("sepsis3", 0): "Sepsis-3 never-vaso",
-        ("rhee",    1): "Rhee ever-vaso",
-        ("rhee",    0): "Rhee never-vaso",
+        ("sepsis3",    1): "Sepsis-3 ever-vaso",
+        ("sepsis3",    0): "Sepsis-3 never-vaso",
+        ("rhee",       1): "Rhee ever-vaso",
+        ("rhee",       0): "Rhee never-vaso",
+        ("rhee_clifpy", 1): "Rhee-clifpy ever-vaso",
+        ("rhee_clifpy", 0): "Rhee-clifpy never-vaso",
     }
 
     _fig_km, _ax_km = _plt_km.subplots(figsize=(10, 6))
     _lr_data = {}
 
-    for _cn in ("sepsis3", "rhee"):
+    for _cn in ("sepsis3", "rhee", "rhee_clifpy"):
         _cfile = _pl_dir / f"cohort_{_cn}.parquet"
         if not _cfile.exists():
             print(f"  Skipping {_cn}: {_cfile} not found")
@@ -138,7 +143,7 @@ if _args.cohort == "both":
                                     _sub["death_in_window"].values)
 
     _annots = []
-    for _cn in ("sepsis3", "rhee"):
+    for _cn in ("sepsis3", "rhee", "rhee_clifpy"):
         if (_cn, 1) in _lr_data and (_cn, 0) in _lr_data:
             _t1, _e1 = _lr_data[(_cn, 1)]
             _t0, _e0 = _lr_data[(_cn, 0)]
@@ -283,7 +288,8 @@ _cohort_cols = ["stay_id", "hospital_death", "traj_hours",
                 "age", "gender", "race", "weight",
                 "sepsis_onset_sofa", "initial_lactate", "first_norepi_time"]
 for _c in ["trajectory_start", "vaso_before_traj", "first_vaso_time", "infection_dttm",
-           "icu_los_days", "hospital_los_days", "traj_end_reason"]:
+           "icu_los_days", "hospital_los_days", "traj_end_reason",
+           "hospital_id", "hospital_type"]:   # hospital columns for vaso-category KM
     if _c in cohort.columns:
         _cohort_cols.append(_c)
 pat = pat.merge(cohort[_cohort_cols], on="stay_id")
@@ -327,6 +333,67 @@ pat = pat.merge(pre_vaso_max, on="stay_id", how="left")
 death_in_window = features.groupby("stay_id")["death"].max().rename("death_in_window")
 pat = pat.merge(death_in_window, on="stay_id", how="left")
 pat["death_in_window"] = pat["death_in_window"].fillna(0).astype(int)
+
+# ── NEE at t=0 ────────────────────────────────────────────────────────────────
+# Fixed baseline trait: the NEE-equivalent dose recorded at the FIRST hour of
+# the trajectory (t=0 = NE start).  Using this instead of pre_vaso_max_nee for
+# KM stratification avoids immortal time bias — pre_vaso_max_nee accumulates
+# during the observation window and is undefined/0 for patients who got vaso at
+# hour 0 or before, whereas nee_at_t0 is always available at the start.
+_nee_t0 = (features[features["time_hour"] == 0][["stay_id", "nee"]]
+           .rename(columns={"nee": "nee_at_t0"}))
+pat = pat.merge(_nee_t0, on="stay_id", how="left")
+
+pat["nee_t0_group"] = pd.cut(
+    pat["nee_at_t0"],
+    bins=NEE_BIN_EDGES,
+    labels=NEE_BIN_LABELS,
+    right=False,
+    include_lowest=True,
+)
+pat["nee_t0_group"] = pd.Categorical(
+    pat["nee_t0_group"], categories=NEE_BIN_LABELS, ordered=True
+)
+
+# ── Hospital vasopressin-use category ─────────────────────────────────────────
+# Classify each hospital by the fraction of its patients who received
+# vasopressin within the first 4 hours of NE start.  This is a fixed baseline
+# trait (hospital-level) — it never changes over the observation window and
+# introduces no immortal time bias in KM analyses.
+#
+#   early_vaso_hospital   : >50 % of patients receive vaso within 4 h
+#   typical_vaso_hospital : 10–50 % receive vaso within 4 h
+#   rare_vaso_hospital    : <10 % receive vaso within 4 h
+_HOSP_CAT_ORDER  = ["early_vaso_hospital", "typical_vaso_hospital", "rare_vaso_hospital"]
+_HOSP_CAT_LABELS = {
+    "early_vaso_hospital":   ">50 % vaso ≤ 4 h (early-vaso hospital)",
+    "typical_vaso_hospital": "10–50 % vaso ≤ 4 h (typical hospital)",
+    "rare_vaso_hospital":    "<10 % vaso ≤ 4 h (rare-vaso hospital)",
+}
+if "hospital_id" in pat.columns:
+    _hs = (
+        pat.groupby("hospital_id", observed=True)
+        .apply(lambda g: pd.Series({
+            "n_patients":    len(g),
+            "n_early_vaso":  int(
+                ((g["ever_vaso"] == 1) & (g["first_vaso_hour"].fillna(999) <= 4)).sum()
+            ),
+        }))
+        .reset_index()
+    )
+    _hs["early_vaso_frac"] = _hs["n_early_vaso"] / _hs["n_patients"].clip(lower=1)
+    _hs["hospital_vaso_category"] = _hs["early_vaso_frac"].apply(
+        lambda f: ("early_vaso_hospital"   if f > 0.50 else
+                   "typical_vaso_hospital" if f >= 0.10 else
+                   "rare_vaso_hospital")
+    )
+    pat = pat.merge(_hs[["hospital_id", "hospital_vaso_category"]], on="hospital_id", how="left")
+    _cat_counts = pat["hospital_vaso_category"].value_counts()
+    print(f"  Hospital vaso categories: {_cat_counts.to_dict()}")
+else:
+    # Single-hospital site: treat it as "typical" so KM still runs
+    pat["hospital_vaso_category"] = "typical_vaso_hospital"
+    print("  No hospital_id column — all patients assigned typical_vaso_hospital")
 
 # Approximate clock hour of vasopressin initiation.
 # trajectory_start (exact) used if available; else first_norepi_time is a proxy
@@ -413,6 +480,50 @@ def mean_ci(df, col, group_col="rel_hour"):
     return g
 
 
+_KM_TICK_TIMES = [0, 24, 48, 72, 96, 120]
+
+
+def _at_risk_counts(kmf, tick_times=_KM_TICK_TIMES):
+    """Number at risk at each tick time from a fitted KaplanMeierFitter."""
+    et = kmf.event_table
+    n0 = int(et["at_risk"].iloc[0]) if len(et) else 0
+    counts = []
+    for t in tick_times:
+        sub = et[et.index <= t]
+        counts.append(int(sub["at_risk"].iloc[-1]) if len(sub) else n0)
+    return counts
+
+
+def _add_risk_table(ax_risk, group_risk, tick_times, xlim):
+    """Populate a pre-created axes with the at-risk table (no x-tick labels).
+
+    group_risk: list of (label, color, counts_at_ticks)
+    """
+    n_groups = len(group_risk)
+    ax_risk.patch.set_visible(False)
+    ax_risk.set_xlim(xlim)
+    ax_risk.set_ylim(-0.6, n_groups + 0.4)
+    label_x = -0.14
+    ax_risk.text(label_x, n_groups + 0.1, "No. at risk",
+                 transform=ax_risk.get_yaxis_transform(),
+                 ha="right", va="bottom", fontsize=9, style="italic", color="#555",
+                 clip_on=False)
+    for gi, (label, color, counts) in enumerate(group_risk):
+        y = n_groups - 1 - gi
+        ax_risk.text(label_x, y, label,
+                     transform=ax_risk.get_yaxis_transform(),
+                     ha="right", va="center", fontsize=9, color=color,
+                     fontweight="bold", clip_on=False)
+        for t, cnt in zip(tick_times, counts):
+            if cnt is not None:
+                ax_risk.text(t, y, f"{cnt:,}", ha="center", va="center", fontsize=9)
+    ax_risk.set_yticks([])
+    ax_risk.set_xticks(tick_times)
+    ax_risk.tick_params(axis="x", labelbottom=False, bottom=False)
+    for spine in ax_risk.spines.values():
+        spine.set_visible(False)
+
+
 # =============================================================================
 # Analysis 0.5: Who receives vasopressin before NE start?
 # =============================================================================
@@ -464,11 +575,14 @@ for var, label in _tbl_vars_cont.items():
             row[lbl] = "—"
     _tbl_rows_05.append(row)
 
+_SUPPRESS_K_05 = 11
 for var, label in _tbl_vars_bin.items():
     row = {"Variable": label}
     for lbl, gdf in _grp_dfs_05.items():
         col = gdf[var].dropna() if var in gdf.columns else pd.Series(dtype=float)
-        if len(col) > 0:
+        if len(gdf) < _SUPPRESS_K_05:
+            row[lbl] = f"n<{_SUPPRESS_K_05}"
+        elif len(col) > 0:
             row[lbl] = f"{col.mean():.1%} ({int(col.sum())}/{len(gdf)})"
         else:
             row[lbl] = "—"
@@ -478,10 +592,13 @@ if "traj_end_reason" in pat.columns:
     for _reason in ["death", "discharge", "hour_cap"]:
         row = {"Variable": f"  Trajectory end: {_reason}"}
         for lbl, gdf in _grp_dfs_05.items():
-            _col = gdf["traj_end_reason"].dropna() if "traj_end_reason" in gdf.columns else pd.Series()
-            _n = int((_col == _reason).sum())
-            _pct = _n / len(gdf) if len(gdf) > 0 else 0
-            row[lbl] = f"{_pct:.1%} ({_n})"
+            if len(gdf) < _SUPPRESS_K_05:
+                row[lbl] = f"n<{_SUPPRESS_K_05}"
+            else:
+                _col = gdf["traj_end_reason"].dropna() if "traj_end_reason" in gdf.columns else pd.Series()
+                _n = int((_col == _reason).sum())
+                _pct = _n / len(gdf) if len(gdf) > 0 else 0
+                row[lbl] = f"{_pct:.1%} ({_n})"
         _tbl_rows_05.append(row)
 
 _compare_df_05 = pd.DataFrame(_tbl_rows_05)
@@ -562,7 +679,6 @@ if _has_timing:
     import base64 as _b64
     _vf = pat[pat["vaso_group"] == "vaso_first"].copy()
     _vf = _vf.dropna(subset=["_h_vaso_inf", "_h_ne_inf"])
-    _sw_b64 = None
     if len(_vf) > 0:
         _vf = _vf.sort_values(["_h_vaso_inf", "_h_ne_inf"],
                                ascending=[True, True]).reset_index(drop=True)
@@ -610,30 +726,22 @@ if _has_timing:
         _sw_buf = _io.BytesIO()
         _fig_sw.savefig(_sw_buf, dpi=150, bbox_inches="tight", format="png")
         _sw_buf.seek(0)
-        _sw_b64 = _b64.b64encode(_sw_buf.read()).decode()
 
-        # Also save PNG to disk for reference
-        _sw_path = OUT_DIR / f"{SITE_LOWER}_prior_vaso_swimlane_{COHORT_NAME}.png"
+        # PHI — per-patient rows: save locally only, never to upload_to_box
+        PATIENT_LEVEL_DIR.mkdir(parents=True, exist_ok=True)
+        _sw_path = PATIENT_LEVEL_DIR / f"{SITE_LOWER}_prior_vaso_swimlane_{COHORT_NAME}.png"
         with open(_sw_path, "wb") as _fh:
-            _sw_buf.seek(0)
             _fh.write(_sw_buf.read())
         plt.close(_fig_sw)
-        print(f"  Saved swimlane: {_n_vf_sw:,} patients → {_sw_path.name}")
+        print(f"  Saved swimlane (local only — PHI): {_n_vf_sw:,} patients → {_sw_path}")
 
     # ── HTML report (embeds both the population timing plot and the swimlane) ──
     with open(_timing_png, "rb") as _fh:
         _img_b64 = _b64.b64encode(_fh.read()).decode()
 
+    # Swimlane is PHI (per-patient rows) — omitted from this shared HTML report.
+    # The PNG is saved locally to PATIENT_LEVEL_DIR for local review only.
     _sw_section = ""
-    if _sw_b64 is not None:
-        _sw_section = (
-            "<h2>Per-patient swimlane: prior-vaso group (PHI — local only)</h2>"
-            "<p>Each row is one patient, sorted by vasopressin start time. "
-            "Green circle = first NE dose; red star = first vasopressin dose; "
-            "red line = vasopressin came before NE; green line = NE came before vasopressin.</p>"
-            f'<img src="data:image/png;base64,{_sw_b64}" '
-            'style="max-width:100%;border:1px solid #ddd">'
-        )
 
     _tbl_html = _compare_df_05.to_html(index=False, border=0, classes="tbl")
     _html_05 = f"""<!DOCTYPE html>
@@ -713,25 +821,27 @@ km0["event_time"] = np.where(
 )
 km0["event"] = km0["ever_vaso"].astype(int)
 
-fig, ax = plt.subplots(figsize=(11, 6))
+_km0_groups = [(grp, km0[km0["pre_vaso_nee_group"] == grp]) for grp in NEE_BIN_LABELS
+               if len(km0[km0["pre_vaso_nee_group"] == grp]) >= 5]
+_n_grps0 = len(_km0_groups)
+fig, (ax, ax_risk) = plt.subplots(
+    2, 1, figsize=(11, 6.5 + 0.35 * _n_grps0),
+    gridspec_kw={"height_ratios": [4, 0.5 + 0.35 * _n_grps0], "hspace": 0.12},
+)
 
-for i, grp in enumerate(NEE_BIN_LABELS):
-    sub = km0[km0["pre_vaso_nee_group"] == grp]
-    if len(sub) < 5:
-        continue
-    n_init = sub["event"].sum()
+_risk0 = []
+for i, (grp, sub) in enumerate(_km0_groups):
+    n_init = int(sub["event"].sum())
     kmf = KaplanMeierFitter()
     kmf.fit(sub["event_time"], event_observed=sub["event"])
-
-    # Plot 1 - KM_estimate (cumulative incidence)
-    sf  = kmf.survival_function_["KM_estimate"]
+    sf    = kmf.survival_function_["KM_estimate"]
     ci_lo = kmf.confidence_interval_["KM_estimate_lower_0.95"]
     ci_hi = kmf.confidence_interval_["KM_estimate_upper_0.95"]
     ax.fill_between(sf.index, 1 - ci_hi, 1 - ci_lo, alpha=0.12, color=PALETTE[i])
     ax.step(sf.index, 1 - sf, where="post", color=PALETTE[i], linewidth=2,
             label=f"{grp} μg/kg/min  (n={len(sub)}, {n_init} initiated)")
+    _risk0.append((f"{grp} μg/kg/min", PALETTE[i], _at_risk_counts(kmf)))
 
-ax.set_xlabel("Hours from trajectory start", fontsize=12)
 ax.set_ylabel("Cumulative proportion started on vasopressin", fontsize=12)
 ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda y, _: f"{y:.0%}"))
 ax.set_title(
@@ -739,11 +849,16 @@ ax.set_title(
     f"(event = vaso start; censored at trajectory end; binned by NEE before vaso)",
     fontsize=12,
 )
+ax.set_xticks(_KM_TICK_TIMES)
 ax.set_xlim(0)
 ax.set_ylim(0)
-ax.legend(title="Pre-vaso max NEE", bbox_to_anchor=(1.02, 1),
-          loc="upper left", fontsize=9)
+ax.set_xlabel("Hours from trajectory start", fontsize=12)
+ax.tick_params(axis="x", labelsize=9)
+ax.legend(title="Pre-vaso max NEE", bbox_to_anchor=(1.02, 1), loc="upper left", fontsize=9)
+
+_add_risk_table(ax_risk, _risk0, _KM_TICK_TIMES, ax.get_xlim())
 fig.tight_layout()
+fig.subplots_adjust(left=0.18)
 fig.savefig(OUT_DIR / f"{SITE_LOWER}_analysis0_time_to_vaso_by_nee.png",
             dpi=500, bbox_inches="tight")
 plt.close(fig)
@@ -754,15 +869,21 @@ print("  Saved analysis0")
 # =============================================================================
 print("\nAnalysis 1: KM by pre-vaso NEE dose bin...")
 
-fig, ax = plt.subplots(figsize=(11, 6))
-for i, grp in enumerate(NEE_BIN_LABELS):
-    sub = pat[pat["pre_vaso_nee_group"] == grp]
-    if len(sub) < 5:
-        continue
+_km1_groups = [(grp, pat[pat["pre_vaso_nee_group"] == grp]) for grp in NEE_BIN_LABELS
+               if len(pat[pat["pre_vaso_nee_group"] == grp]) >= 5]
+_n_grps1 = len(_km1_groups)
+fig, (ax, ax_risk) = plt.subplots(
+    2, 1, figsize=(11, 6.5 + 0.35 * _n_grps1),
+    gridspec_kw={"height_ratios": [4, 0.5 + 0.35 * _n_grps1], "hspace": 0.12},
+)
+
+_risk1 = []
+for i, (grp, sub) in enumerate(_km1_groups):
     kmf = KaplanMeierFitter()
     kmf.fit(sub["traj_hours"], event_observed=sub["death_in_window"],
             label=f"{grp} μg/kg/min (n={len(sub)})")
     kmf.plot_survival_function(ax=ax, ci_show=True, color=PALETTE[i], linewidth=2)
+    _risk1.append((f"{grp} μg/kg/min", PALETTE[i], _at_risk_counts(kmf)))
 
 _lr1_dat = pat[["pre_vaso_nee_group", "traj_hours", "death_in_window"]].dropna(subset=["pre_vaso_nee_group"])
 _lr1_res = multivariate_logrank_test(_lr1_dat["traj_hours"], _lr1_dat["pre_vaso_nee_group"], _lr1_dat["death_in_window"])
@@ -772,10 +893,15 @@ ax.text(0.98, 0.02, f"Log-rank {fmt_p(_lr1_res.p_value)}",
 ax.set_xlabel("Hours from trajectory start", fontsize=12)
 ax.set_ylabel("Survival probability", fontsize=12)
 ax.set_title(f"{SITE_NAME}: Kaplan–Meier survival by pre-vaso max NEE dose", fontsize=13)
+ax.set_xticks(_KM_TICK_TIMES)
+ax.tick_params(axis="x", labelsize=9)
 ax.set_xlim(0)
 ax.set_ylim(0, 1.02)
 ax.legend(title="Pre-vaso max NEE bin", bbox_to_anchor=(1.02, 1), loc="upper left", fontsize=9)
+
+_add_risk_table(ax_risk, _risk1, _KM_TICK_TIMES, ax.get_xlim())
 fig.tight_layout()
+fig.subplots_adjust(left=0.18)
 fig.savefig(OUT_DIR / f"{SITE_LOWER}_analysis1_km_nee_dose.png", dpi=500, bbox_inches="tight")
 plt.close(fig)
 print("  Saved analysis1")
@@ -785,7 +911,12 @@ print("  Saved analysis1")
 # =============================================================================
 print("Analysis 1.5: KM ever-vaso vs never-vaso...")
 
-fig, ax = plt.subplots(figsize=(9, 6))
+fig, (ax, ax_risk) = plt.subplots(
+    2, 1, figsize=(9, 7),
+    gridspec_kw={"height_ratios": [4, 1.3], "hspace": 0.12},
+)
+
+_risk15 = []
 for label, mask, color in [
     ("Ever vasopressin",  pat["ever_vaso"] == 1, PALETTE[2]),
     ("Never vasopressin", pat["ever_vaso"] == 0, PALETTE[0]),
@@ -793,8 +924,9 @@ for label, mask, color in [
     sub = pat[mask]
     kmf = KaplanMeierFitter()
     kmf.fit(sub["traj_hours"], event_observed=sub["death_in_window"],
-            label=f"{label} (n={len(sub)})")
+            label=f"{label} (n={len(sub):,})")
     kmf.plot_survival_function(ax=ax, ci_show=True, color=color, linewidth=2.5)
+    _risk15.append((label, color, _at_risk_counts(kmf)))
 
 _ev15 = pat[pat["ever_vaso"] == 1]
 _nv15 = pat[pat["ever_vaso"] == 0]
@@ -807,11 +939,16 @@ ax.text(0.98, 0.02, f"Log-rank {fmt_p(_lr15.p_value)}",
 ax.set_xlabel("Hours from trajectory start", fontsize=12)
 ax.set_ylabel("Survival probability", fontsize=12)
 ax.set_title(f"{SITE_NAME}: Kaplan–Meier — ever vs never vasopressin", fontsize=13)
+ax.set_xticks(_KM_TICK_TIMES)
+ax.tick_params(axis="x", labelsize=9)
 ax.set_xlim(0)
 ax.set_ylim(0, 1.02)
 ax.legend(fontsize=11)
+
+_add_risk_table(ax_risk, _risk15, _KM_TICK_TIMES, ax.get_xlim())
 fig.tight_layout()
-fig.savefig(OUT_DIR / f"{SITE_LOWER}_analysis1_5_km_evervaso.png", dpi=500)
+fig.subplots_adjust(left=0.18)
+fig.savefig(OUT_DIR / f"{SITE_LOWER}_analysis1_5_km_evervaso.png", dpi=500, bbox_inches="tight")
 plt.close(fig)
 print("  Saved analysis1_5")
 
@@ -1581,6 +1718,75 @@ if _comp_avail and len(ever_vaso_ids) > 0:
 
                 except Exception as _e_psm_lr:
                     print(f"  pressor_strategy logreg/PSM failed: {_e_psm_lr}")
+
+                # ── Pressor-strategy survival table (federated-safe) ──────────
+                # Produces KM summary at fixed time points — no patient IDs,
+                # just aggregate at-risk / event / survival-estimate columns.
+                print("  Pressor strategy survival table...")
+                if "death_in_window" in pat.columns and "traj_hours" in pat.columns:
+                    _non_ne_s = [c for c in _comp_avail if c != "norepinephrine"]
+                    _used_other_s = (
+                        _drug_used_per_pt[_non_ne_s].any(axis=1)
+                        if _non_ne_s
+                        else pd.Series(False, index=_drug_used_per_pt.index)
+                    )
+                    _surv_pairs = [
+                        ("other_pressor_before_vaso", _used_other_s),
+                        ("direct_to_vaso",            ~_used_other_s),
+                    ]
+                    _TIME_PTS = list(range(0, 121, 6))   # 0, 6, 12, ..., 120 h
+                    _surv_rows = []
+                    for _sname, _smask in _surv_pairs:
+                        _ids = set(_used_other_s.index[_smask])
+                        _gp = pat[pat["stay_id"].isin(_ids)][
+                            ["stay_id", "traj_hours", "death_in_window"]
+                        ].copy()
+                        if len(_gp) < _MIN_CELL:
+                            continue
+                        try:
+                            _kmf_s = KaplanMeierFitter()
+                            _kmf_s.fit(
+                                _gp["traj_hours"],
+                                event_observed=_gp["death_in_window"],
+                                label=_sname,
+                            )
+                            _et  = _kmf_s.event_table
+                            _sf  = _kmf_s.survival_function_
+                            _ci  = _kmf_s.confidence_interval_survival_function_
+                            for _tp in _TIME_PTS:
+                                _prev_et = _et[_et.index <= _tp]
+                                if len(_prev_et) == 0:
+                                    _nar, _nev = len(_gp), 0
+                                    _km_val, _ci_lo, _ci_hi = 1.0, 1.0, 1.0
+                                else:
+                                    _nar = int(_prev_et["at_risk"].iloc[-1])
+                                    _nev = int(_prev_et["observed"].sum())
+                                    _sf_prev = _sf[_sf.index <= _tp]
+                                    _ci_prev = _ci[_ci.index <= _tp]
+                                    _km_val = float(_sf_prev.iloc[-1, 0])
+                                    _ci_lo  = float(_ci_prev.iloc[-1, 0])
+                                    _ci_hi  = float(_ci_prev.iloc[-1, 1])
+                                _surv_rows.append({
+                                    "pressor_strategy": _sname,
+                                    "time_point":        _tp,
+                                    "n_total":           len(_gp),
+                                    "n_at_risk":         _nar,
+                                    "n_events_cumulative": _nev,
+                                    "km_survival":       round(_km_val, 4),
+                                    "km_ci_lower":       round(_ci_lo,  4),
+                                    "km_ci_upper":       round(_ci_hi,  4),
+                                })
+                        except Exception as _e_ks:
+                            print(f"    KM for {_sname} failed: {_e_ks}")
+                    if _surv_rows:
+                        pd.DataFrame(_surv_rows).to_csv(
+                            OUT_DIR / "pressor_strategy_survival.csv", index=False
+                        )
+                        print("  Saved pressor_strategy_survival.csv")
+                else:
+                    print("  Skipped pressor_strategy_survival "
+                          "(death_in_window or traj_hours not in pat)")
+
             else:
                 print("  Skipped pressor_count/dose distribution (no pre-vaso hours found)")
     else:
@@ -1695,6 +1901,40 @@ if _comp_avail:
         print("  Saved analysis2D_prop_by_nee")
 else:
     print("  Skipped analysis2D by NEE dose (no drug component columns)")
+
+# ── pressor_counts_full_traj.csv ──────────────────────────────────────────────
+# Full 120-h trajectory (ALL patients in cohort), per trajectory-hour from NE
+# start (t=0).  Federated-safe aggregate: per-hour total patients present
+# (n_total) + count of patients with drug > 0 (n_<drug>) at that hour.
+# Including vasopressin (action_vaso column, any dose > 0).
+# Coordinating site pools by summing counts across sites — no weighting needed.
+print("Aggregate: pressor_counts_full_traj.csv...")
+if _comp_avail:
+    _VASO_COL = "action_vaso"
+    _has_vaso_col = _VASO_COL in features.columns
+    _ft_drug_cols = _comp_avail + ([_VASO_COL] if _has_vaso_col else [])
+    _ft = features[["time_hour"] + _ft_drug_cols].copy()
+    _ft_n = _ft.groupby("time_hour").size().rename("n_total")
+    # Count of patients with drug > 0 at each trajectory hour (binary presence)
+    _ft_on = (_ft[_ft_drug_cols] > 0).astype(int)
+    _ft_on["time_hour"] = _ft["time_hour"]
+    _ft_counts = _ft_on.groupby("time_hour")[_ft_drug_cols].sum()
+    _traj_df = pd.concat([_ft_n, _ft_counts], axis=1).reset_index().rename(
+        columns={"time_hour": "traj_hour"}
+    )
+    _rename_map = {_c: f"n_{_c}" for _c in _comp_avail}
+    if _has_vaso_col:
+        _rename_map[_VASO_COL] = "n_vasopressin"
+    _traj_df = _traj_df.rename(columns=_rename_map)
+    _traj_out_cols = ["traj_hour", "n_total"] + [f"n_{_c}" for _c in _comp_avail]
+    if _has_vaso_col:
+        _traj_out_cols.append("n_vasopressin")
+    _traj_df.sort_values("traj_hour")[_traj_out_cols].to_csv(
+        OUT_DIR / "pressor_counts_full_traj.csv", index=False
+    )
+    print("  Saved pressor_counts_full_traj.csv")
+else:
+    print("  Skipped pressor_counts_full_traj (no drug component columns in features)")
 
 # =============================================================================
 # Analysis 3: Boxplots — feature distributions by NEE bin × vaso status
@@ -2689,9 +2929,12 @@ pd.DataFrame(_rows).to_csv(AGG_DIR / "km_cif_by_nee_bin.csv", index=False)
 print("  1/12 km_cif_by_nee_bin.csv")
 
 # ── 2. km_survival_by_nee_bin.csv ────────────────────────────────────────────
+# Stratified by nee_t0_group (NEE-equivalent dose at t=0, the very first hour
+# of observation).  This is a fixed baseline trait — no immortal time bias.
+# Previous versions used pre_vaso_max_nee, which accumulated during the window.
 _rows = []
 for _grp in NEE_BIN_LABELS:
-    _sub = pat[pat["pre_vaso_nee_group"] == _grp].dropna(subset=["traj_hours", "death_in_window"])
+    _sub = pat[pat["nee_t0_group"] == _grp].dropna(subset=["traj_hours", "death_in_window"])
     if len(_sub) < 5:
         continue
     _n_total = len(_sub)
@@ -2706,13 +2949,22 @@ for _grp in NEE_BIN_LABELS:
                           km_survival=_sf[_t], ci_lo=_cilo[_t], ci_hi=_cihi[_t],
                           n_at_risk=int(_nar[_t]), n_total=_n_total))
 pd.DataFrame(_rows).to_csv(AGG_DIR / "km_survival_by_nee_bin.csv", index=False)
-print("  2/12 km_survival_by_nee_bin.csv")
+print("  2/12 km_survival_by_nee_bin.csv  [stratified by NEE at t=0]")
 
 # ── 3. km_survival_ever_never_vaso.csv ───────────────────────────────────────
+# Stratified by hospital_vaso_category (hospital-level fraction of patients
+# receiving vasopressin within the first 4 hours of NE start).
+# This replaces ever/never vasopressin stratification, which carries immortal
+# time bias: a patient who gets vaso at hour 6 cannot have died before hour 6,
+# artificially favouring the "ever vaso" group in early follow-up.
+# Hospital category is a fixed baseline trait assigned before follow-up begins.
 _rows = []
-for _label, _mask in [("ever_vaso", pat["ever_vaso"] == 1),
-                       ("never_vaso", pat["ever_vaso"] == 0)]:
-    _sub = pat[_mask].dropna(subset=["traj_hours", "death_in_window"])
+for _cat in _HOSP_CAT_ORDER:
+    _sub = pat[pat["hospital_vaso_category"] == _cat].dropna(
+        subset=["traj_hours", "death_in_window"]
+    )
+    if len(_sub) < 5:
+        continue
     _n_total = len(_sub)
     _kmf = KaplanMeierFitter()
     _kmf.fit(_sub["traj_hours"], event_observed=_sub["death_in_window"])
@@ -2721,11 +2973,11 @@ for _label, _mask in [("ever_vaso", pat["ever_vaso"] == 1),
     _cihi = _kmf.confidence_interval_["KM_estimate_upper_0.95"]
     _nar  = _kmf.event_table["at_risk"].reindex(_sf.index, method="ffill")
     for _t in _sf.index:
-        _rows.append(dict(group=_label, time_hour=_t,
+        _rows.append(dict(group=_cat, time_hour=_t,
                           km_survival=_sf[_t], ci_lo=_cilo[_t], ci_hi=_cihi[_t],
                           n_at_risk=int(_nar[_t]), n_total=_n_total))
 pd.DataFrame(_rows).to_csv(AGG_DIR / "km_survival_ever_never_vaso.csv", index=False)
-print("  3/12 km_survival_ever_never_vaso.csv")
+print("  3/12 km_survival_ever_never_vaso.csv  [stratified by hospital_vaso_category]")
 
 # ── 4. nee_proportion_on_vaso.csv ────────────────────────────────────────────
 (binned[["x", "count", "prop", "ci_lo", "ci_hi"]]
@@ -2850,7 +3102,7 @@ for _col, _label in INIT_FEATURES:
                                              alternative="two-sided")
         _mw_bonf = min(_mw_p * N_TESTS, 1.0)
     for _i, (_q, _d) in enumerate(zip(Q_LABELS, _grp_data)):
-        if len(_d) < 5:
+        if len(_d) < 11:
             continue
         _lo = Q_EDGES[_i];   _hi = Q_EDGES[_i + 1]
         _sem_q = np.std(_d, ddof=1) / np.sqrt(len(_d)) if len(_d) > 1 else np.nan
@@ -2862,7 +3114,6 @@ for _col, _label in INIT_FEATURES:
             mean=float(np.mean(_d)),
             ci_lo_mean=float(np.mean(_d) - 1.96 * _sem_q) if not np.isnan(_sem_q) else np.nan,
             ci_hi_mean=float(np.mean(_d) + 1.96 * _sem_q) if not np.isnan(_sem_q) else np.nan,
-            min_val=float(np.min(_d)), max_val=float(np.max(_d)),
             p5=np.percentile(_d, 5), q1=np.percentile(_d, 25),
             median=np.median(_d),    q3=np.percentile(_d, 75),
             p95=np.percentile(_d, 95),
@@ -2876,7 +3127,7 @@ _rows = []
 for _col, _label in INIT_FEATURES:
     for _grp in NEE_BIN_LABELS:
         _d = initiators[initiators["nee_init_bin"] == _grp][_col].dropna()
-        if len(_d) < 5:
+        if len(_d) < 11:
             continue
         _sem_b = _d.std(ddof=1) / np.sqrt(len(_d)) if len(_d) > 1 else np.nan
         _rows.append(dict(
@@ -2884,7 +3135,6 @@ for _col, _label in INIT_FEATURES:
             mean=_d.mean(),
             ci_lo_mean=_d.mean() - 1.96 * _sem_b if not np.isnan(_sem_b) else np.nan,
             ci_hi_mean=_d.mean() + 1.96 * _sem_b if not np.isnan(_sem_b) else np.nan,
-            min_val=_d.min(), max_val=_d.max(),
             p5=_d.quantile(0.05), q1=_d.quantile(0.25),
             median=_d.median(), q3=_d.quantile(0.75),
             p95=_d.quantile(0.95),
@@ -2915,7 +3165,12 @@ if _avail_drugs_13:
         _pos13 = features.loc[features[_col13] > 0].groupby("stay_id")["time_hour"].min()
         _fh13[_name13] = _combo13["stay_id"].map(_pos13)
     _first13 = pd.DataFrame(_fh13, index=_combo13.index)
-    _combo13["first_drug"] = _first13.idxmin(axis=1)
+    # idxmin raises ValueError on all-NA rows (patients with no positive dose
+    # recorded for any drug — e.g., NE trajectory is all-zero for that patient).
+    # Apply row-wise, returning NaN for patients with no drug data.
+    _combo13["first_drug"] = _first13.apply(
+        lambda row: row.idxmin() if row.notna().any() else np.nan, axis=1
+    )
     _rows13 = []
     for _col13, _name13 in _avail_drugs_13:
         _ac_i = f"any_{_name13}"
@@ -2942,12 +3197,14 @@ if _avail_drugs_13:
     pd.DataFrame(_rows13).to_csv(AGG_DIR / "vasopressor_combinations.csv", index=False)
     print("  13/14 vasopressor_combinations.csv")
 
-    # ── 13b. vaso_timing_individual.csv ──────────────────────────────────────
-    # For vasopressin recipients: hours from each co-drug's first dose to vaso
-    # (negative = co-drug started before vasopressin)
+    # ── 13b. vaso_timing_summary.csv ─────────────────────────────────────────
+    # Federated-safe aggregate: for vasopressin recipients, per-drug summary of
+    # timing difference (first co-drug dose − first vasopressin dose).
+    # Negative = co-drug started before vasopressin.
+    _TIMING_SUPPRESS_K = 11
     if "VASO" in _first13.columns:
         _vaso_mask13 = _combo13["any_VASO"]
-        _timing_ind_rows = []
+        _timing_sum_rows = []
         for _, _name13 in _avail_drugs_13:
             if _name13 == "VASO":
                 continue
@@ -2958,15 +3215,35 @@ if _avail_drugs_13:
             _diff13 = (
                 _first13.loc[_both_mask13, _name13] - _first13.loc[_both_mask13, "VASO"]
             ).dropna()
-            for _dh in _diff13.values:
-                _timing_ind_rows.append({"drug": _name13, "diff_hours": round(float(_dh), 3)})
-        if _timing_ind_rows:
-            pd.DataFrame(_timing_ind_rows).to_csv(AGG_DIR / "vaso_timing_individual.csv", index=False)
-            print("  13b vaso_timing_individual.csv")
+            if len(_diff13) == 0:
+                continue
+            for _direction, _sub in [
+                ("before", _diff13[_diff13 < 0]),
+                ("after",  _diff13[_diff13 > 0]),
+                ("all",    _diff13),
+            ]:
+                _n = len(_sub)
+                if _n < _TIMING_SUPPRESS_K:
+                    _timing_sum_rows.append({
+                        "drug": _name13, "direction": _direction,
+                        "n": _n, "suppressed": True,
+                        "median_h": None, "q25_h": None, "q75_h": None,
+                    })
+                else:
+                    _timing_sum_rows.append({
+                        "drug": _name13, "direction": _direction,
+                        "n": _n, "suppressed": False,
+                        "median_h": round(float(_sub.median()), 2),
+                        "q25_h":   round(float(_sub.quantile(0.25)), 2),
+                        "q75_h":   round(float(_sub.quantile(0.75)), 2),
+                    })
+        if _timing_sum_rows:
+            pd.DataFrame(_timing_sum_rows).to_csv(AGG_DIR / "vaso_timing_summary.csv", index=False)
+            print("  13b vaso_timing_summary.csv")
         else:
-            print("  13b vaso_timing_individual empty — skipped")
+            print("  13b vaso_timing_summary empty — skipped")
     else:
-        print("  13b skipped vaso_timing_individual (no VASO feature column)")
+        print("  13b skipped vaso_timing_summary (no VASO feature column)")
 else:
     print("  13/14 skipped vasopressor_combinations (no drug columns in features)")
 

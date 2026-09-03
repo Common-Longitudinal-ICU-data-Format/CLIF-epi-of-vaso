@@ -193,11 +193,15 @@ def identify_sepsis3_cohort(
     ne_df: pd.DataFrame,
     window_hours: int = 24,
 ) -> tuple:
-    """Sepsis-3 (CMS) criteria within ±window_hours of NE start (t=0):
-      1. Blood culture within ±window_hours of NE start
-      2. CMS qualifying IV abx within ±window_hours of NE start
+    """Sepsis-3 (CMS) criteria during hospitalization (no ±window relative to NE start):
+      1. Blood culture during hospitalization
+      2. CMS qualifying IV abx during hospitalization
       3. Abx + culture within 24 h of each other (presumed infection)
-      4. Lactate > LACTATE_THRESHOLD within ±window_hours of NE start
+      4. Lactate > LACTATE_THRESHOLD within ±window_hours of presumed infection time
+
+    The ≥MIN_NE_RECORDS check (upstream) ensures genuine NE exposure; infection
+    criteria are evaluated across the full hospitalization so patients who receive
+    NE well outside the ±24 h window are still captured.
 
     Returns: (result_df, step_counts)
       result_df — hospitalization_id, presumed_infection_dttm, initial_lactate
@@ -211,28 +215,16 @@ def identify_sepsis3_cohort(
 
     ne = ne_df[["hospitalization_id", "first_norepi_time"]].copy()
     ne["t0"] = to_naive_utc(pd.to_datetime(ne["first_norepi_time"], utc=True))
-    ne["win_start"] = ne["t0"] - pd.Timedelta(hours=window_hours)
-    ne["win_end"]   = ne["t0"] + pd.Timedelta(hours=window_hours)
 
-    # Filter abx to window
-    abx_win = abx.merge(ne[["hospitalization_id", "win_start", "win_end"]], on="hospitalization_id")
-    abx_win = abx_win[
-        (abx_win["admin_dttm"] >= abx_win["win_start"]) &
-        (abx_win["admin_dttm"] <= abx_win["win_end"])
-    ]
-
-    # Filter cultures to window
-    cx_win = blood_cx.merge(ne[["hospitalization_id", "win_start", "win_end"]], on="hospitalization_id")
-    cx_win = cx_win[
-        (cx_win["collect_dttm"] >= cx_win["win_start"]) &
-        (cx_win["collect_dttm"] <= cx_win["win_end"])
-    ]
+    # No ±window filter: infection criteria evaluated across full hospitalization.
+    abx_win = abx.merge(ne[["hospitalization_id"]], on="hospitalization_id")
+    cx_win  = blood_cx.merge(ne[["hospitalization_id"]], on="hospitalization_id")
 
     # Sub-step counts for the cascade
     n_cx     = cx_win["hospitalization_id"].nunique()
     ids_cx   = set(cx_win["hospitalization_id"])
     ids_abx  = set(abx_win["hospitalization_id"])
-    n_abx_cx = len(ids_cx & ids_abx)   # patients with BOTH in window
+    n_abx_cx = len(ids_cx & ids_abx)   # patients with BOTH during hospitalization
 
     # Pair abx + culture within 24 h of each other
     paired = abx_win[["hospitalization_id", "admin_dttm"]].merge(
@@ -252,19 +244,19 @@ def identify_sepsis3_cohort(
     def _build_steps(n_lactate: int) -> list:
         return [
             {
-                "step": "Blood culture not within ±24 h of NE start (excluded)",
+                "step": "No blood culture during hospitalization (excluded)",
                 "n_hospitalizations": n_ne - n_cx,
             },
             {
-                "step": "Blood culture within ±24 h of NE start",
+                "step": "Blood culture during hospitalization",
                 "n_hospitalizations": n_cx,
             },
             {
-                "step": "IV abx not within ±24 h of NE start (excluded)",
+                "step": "No IV abx during hospitalization (excluded)",
                 "n_hospitalizations": n_cx - n_abx_cx,
             },
             {
-                "step": "IV abx AND blood culture both within ±24 h of NE start",
+                "step": "IV abx AND blood culture during hospitalization",
                 "n_hospitalizations": n_abx_cx,
             },
             {
@@ -278,14 +270,14 @@ def identify_sepsis3_cohort(
             {
                 "step": (
                     f"Lactate ≤{LACTATE_THRESHOLD} or missing"
-                    " within ±24 h of NE start (excluded)"
+                    f" within ±{window_hours} h of presumed infection (excluded)"
                 ),
                 "n_hospitalizations": n_paired - n_lactate,
             },
             {
                 "step": (
                     "Sepsis-3 (CMS): presumed infection + lactate"
-                    f" >{LACTATE_THRESHOLD} mmol/L within ±24 h of NE start"
+                    f" >{LACTATE_THRESHOLD} mmol/L within ±{window_hours} h of infection"
                 ),
                 "n_hospitalizations": n_lactate,
             },
@@ -295,7 +287,7 @@ def identify_sepsis3_cohort(
         infection["initial_lactate"] = np.nan
         return infection, _build_steps(0)
 
-    # Lactate check
+    # Lactate check: within ±window_hours of presumed_infection_dttm (not NE start)
     labs = pd.read_parquet(clif_dir / "clif_labs.parquet")
     lac_df = labs[labs["lab_category"] == "lactate"][
         ["hospitalization_id", "lab_result_dttm", "lab_value_numeric"]
@@ -303,11 +295,17 @@ def identify_sepsis3_cohort(
     lac_df["lab_result_dttm"] = to_naive_utc(lac_df["lab_result_dttm"])
 
     lac_merged = lac_df.merge(
-        ne[["hospitalization_id", "win_start", "win_end"]], on="hospitalization_id"
+        infection[["hospitalization_id", "presumed_infection_dttm"]], on="hospitalization_id"
+    )
+    lac_merged["lac_win_start"] = (
+        lac_merged["presumed_infection_dttm"] - pd.Timedelta(hours=window_hours)
+    )
+    lac_merged["lac_win_end"] = (
+        lac_merged["presumed_infection_dttm"] + pd.Timedelta(hours=window_hours)
     )
     lac_win = lac_merged[
-        (lac_merged["lab_result_dttm"] >= lac_merged["win_start"]) &
-        (lac_merged["lab_result_dttm"] <= lac_merged["win_end"]) &
+        (lac_merged["lab_result_dttm"] >= lac_merged["lac_win_start"]) &
+        (lac_merged["lab_result_dttm"] <= lac_merged["lac_win_end"]) &
         lac_merged["lab_value_numeric"].notna()
     ]
 
@@ -334,11 +332,15 @@ def identify_rhee_cohort(
     mortality_df: pd.DataFrame,
     window_hours: int = 24,
 ) -> pd.DataFrame:
-    """Rhee/CDC Adult Sepsis Event criteria within ±window_hours of NE start (t=0):
-      1. Blood culture within ±window_hours of NE start
+    """Rhee/CDC Adult Sepsis Event criteria during hospitalization (no ±window relative to NE start):
+      1. Blood culture during hospitalization
       2. First qualifying IV abx within 2 calendar days of culture date
       3. ≥4 consecutive qualifying antibiotic calendar days (≤1-day gap allowed),
          OR antibiotic course runs until ≤1 day before discharge/death
+
+    The ≥MIN_NE_RECORDS check (upstream) ensures genuine NE exposure; infection
+    criteria are evaluated across the full hospitalization so patients who receive
+    NE well outside the original ±24 h window are still captured.
 
     Returns: hospitalization_id, blood_culture_dttm
     """
@@ -347,17 +349,9 @@ def identify_rhee_cohort(
 
     ne = ne_df[["hospitalization_id", "first_norepi_time"]].copy()
     ne["t0"] = to_naive_utc(pd.to_datetime(ne["first_norepi_time"], utc=True))
-    ne["win_start"] = ne["t0"] - pd.Timedelta(hours=window_hours)
-    ne["win_end"]   = ne["t0"] + pd.Timedelta(hours=window_hours)
 
-    # Step 1: Blood culture within ±window_hours of NE start
-    cx_win = blood_cx.merge(
-        ne[["hospitalization_id", "win_start", "win_end"]], on="hospitalization_id"
-    )
-    cx_win = cx_win[
-        (cx_win["collect_dttm"] >= cx_win["win_start"]) &
-        (cx_win["collect_dttm"] <= cx_win["win_end"])
-    ].copy()
+    # Step 1: Blood culture during hospitalization (no ±window relative to NE start)
+    cx_win = blood_cx.merge(ne[["hospitalization_id"]], on="hospitalization_id").copy()
     if cx_win.empty:
         return pd.DataFrame(columns=["hospitalization_id", "blood_culture_dttm"])
 
@@ -469,8 +463,11 @@ def identify_rhee_clifpy_cohort(
 ) -> tuple:
     """Rhee/CDC ASE cohort via clifpy.utils.ase.compute_ase.
 
-    Blood culture must fall within ±window_hours of NE start so that t=0
-    anchoring is consistent with the Sepsis-3 and hand-coded Rhee definitions.
+    No ±window filter relative to NE start: all ASE episodes during the
+    hospitalization are included. The ≥MIN_NE_RECORDS check (upstream) ensures
+    genuine NE exposure; infection criteria are evaluated across the full
+    hospitalization so patients who receive NE well outside the original ±24 h
+    window are still captured.
 
     Lactate >= 2 mmol/L counts as one of several organ-dysfunction criteria
     (vasopressor, IMV, AKI, thrombocytopenia, hyperbilirubinemia, lactate);
@@ -481,8 +478,7 @@ def identify_rhee_clifpy_cohort(
       result_df — hospitalization_id, blood_culture_dttm
       step_counts — list of {"step": ..., "n_hospitalizations": ...} dicts for
         the filter cascade:
-          • Exclusion row for patients whose ASE episode falls outside ±24 h of NE
-          • Retention row for the in-window cohort
+          • Retention row showing full ASE-qualifying cohort
           • NOTE: rows (one per OD criterion) showing how many patients had each
             criterion met (non-exclusive; a patient can trigger multiple criteria)
     """
@@ -511,31 +507,17 @@ def identify_rhee_clifpy_cohort(
     sepsis_rows = ase_df[ase_df["sepsis"] == 1][keep_cols].copy()
     n_all_ase = sepsis_rows["hospitalization_id"].nunique()
 
-    # Apply ±window_hours filter: blood culture within ±window_hours of NE start
-    # (t=0 = first_norepi_time, consistent with Sepsis-3 and hand-coded Rhee)
-    ne = ne_df[["hospitalization_id", "first_norepi_time"]].copy()
-    ne["t0"]        = to_naive_utc(pd.to_datetime(ne["first_norepi_time"], utc=True))
-    ne["win_start"] = ne["t0"] - pd.Timedelta(hours=window_hours)
-    ne["win_end"]   = ne["t0"] + pd.Timedelta(hours=window_hours)
-
+    # No ±window filter: all ASE episodes during the hospitalization are included.
     sepsis_rows["blood_culture_dttm"] = to_naive_utc(
         pd.to_datetime(sepsis_rows["blood_culture_dttm"], utc=True)
     )
-    sepsis_win = sepsis_rows.merge(
-        ne[["hospitalization_id", "win_start", "win_end"]], on="hospitalization_id"
-    )
-    sepsis_win = sepsis_win[
-        (sepsis_win["blood_culture_dttm"] >= sepsis_win["win_start"]) &
-        (sepsis_win["blood_culture_dttm"] <= sepsis_win["win_end"])
-    ].drop(columns=["win_start", "win_end"])
 
-    # One row per patient: earliest qualifying episode in window
-    final = (sepsis_win
+    # One row per patient: earliest qualifying episode
+    final = (sepsis_rows
              .sort_values("blood_culture_dttm")
              .groupby("hospitalization_id")
              .first()
              .reset_index())
-    n_in_window = len(final)
 
     # Build step counts for filter cascade
     step_counts: list[dict] = [
@@ -545,16 +527,6 @@ def identify_rhee_clifpy_cohort(
                 " + organ dysfunction (RIT applied)"
             ),
             "n_hospitalizations": n_all_ase,
-        },
-        {
-            "step": "Blood culture not within ±24 h of NE start (excluded)",
-            "n_hospitalizations": n_all_ase - n_in_window,
-        },
-        {
-            "step": (
-                "Rhee/CDC ASE (clifpy) with blood culture within ±24 h of NE start"
-            ),
-            "n_hospitalizations": n_in_window,
         },
     ]
 
@@ -788,6 +760,188 @@ def get_cci(clif_dir: Path, hosp_ids: set) -> pd.DataFrame:
     return cci[["hospitalization_id", "cci_score"]].rename(
         columns={"hospitalization_id": "stay_id"}
     )
+
+
+# ---------------------------------------------------------------------------
+# Phase A-5b: Central venous catheter
+# ---------------------------------------------------------------------------
+# CPT 36556 — insertion of non-tunneled CVC, age ≥ 5 (internal jugular / subclavian / femoral)
+# ICD-10-PCS 02HV33Z — insertion of infusion device into superior vena cava, percutaneous approach
+_CVC_CPT      = {"36556"}
+_CVC_ICD10PCS = {"02HV33Z"}
+
+
+def get_cvc(clif_dir: Path, hosp_ids: set) -> pd.DataFrame:
+    """CVC placement from clif_patient_procedures.parquet.
+
+    Returns one row per stay_id with:
+      cvc_during_hosp  — 1 if a qualifying CVC code was billed during the
+                         hospitalization (any time), 0 otherwise.
+      first_cvc_dttm   — UTC datetime of first qualifying procedure (NaT if none).
+
+    Falls back gracefully if the procedures file is absent.
+    Note: only captures CPT 36556 (non-tunneled CVC) and ICD-10-PCS 02HV33Z
+    (SVC infusion device insertion).  Tunneled lines, implanted ports, and PICC
+    lines are NOT included.
+    """
+    result = pd.DataFrame({"stay_id": list(hosp_ids),
+                           "cvc_during_hosp": 0,
+                           "first_cvc_dttm": pd.NaT})
+
+    path = clif_dir / "clif_patient_procedures.parquet"
+    if not path.exists():
+        print("  clif_patient_procedures.parquet not found — cvc_during_hosp=0")
+        return result
+
+    procs = pd.read_parquet(
+        path,
+        columns=["hospitalization_id", "procedure_code",
+                 "procedure_code_format", "procedure_billed_dttm"],
+    )
+    procs = procs[procs["hospitalization_id"].isin(hosp_ids)].copy()
+    if procs.empty:
+        return result
+
+    fmt = procs["procedure_code_format"].str.upper().str.strip()
+    cvc_mask = (
+        (fmt == "CPT"      ) & procs["procedure_code"].isin(_CVC_CPT)      |
+        (fmt == "ICD10PCS" ) & procs["procedure_code"].isin(_CVC_ICD10PCS)
+    )
+    cvc = procs[cvc_mask].copy()
+    if cvc.empty:
+        return result
+
+    cvc["procedure_billed_dttm"] = pd.to_datetime(
+        cvc["procedure_billed_dttm"], utc=True, errors="coerce"
+    )
+    first_cvc = (
+        cvc.groupby("hospitalization_id")["procedure_billed_dttm"]
+        .min()
+        .reset_index()
+        .rename(columns={"hospitalization_id": "stay_id",
+                         "procedure_billed_dttm": "first_cvc_dttm"})
+    )
+    first_cvc["cvc_during_hosp"] = 1
+
+    result = (
+        result.drop(columns=["cvc_during_hosp", "first_cvc_dttm"])
+              .merge(first_cvc, on="stay_id", how="left")
+    )
+    result["cvc_during_hosp"] = result["cvc_during_hosp"].fillna(0).astype(int)
+    return result[["stay_id", "cvc_during_hosp", "first_cvc_dttm"]]
+
+
+# ---------------------------------------------------------------------------
+# Phase A-5c: ICD-based comorbidities (present-on-admission)
+# ---------------------------------------------------------------------------
+# Each entry is a tuple of ICD-10-CM prefix strings; any diagnosis code whose
+# stripped/uppercased value starts with one of those prefixes counts.
+# poa_present == 1 restricts to conditions present before admission, not
+# acquired in the ICU.
+_COMORBIDITY_DEFS: dict[str, tuple[str, ...]] = {
+    # Cirrhosis (specific hepatic codes only — not the broader fibrosis range)
+    "comorbid_cirrhosis": (
+        "K70.30", "K70.31",  # alcoholic cirrhosis ±ascites
+        "K71.7",              # toxic liver disease with fibrosis/cirrhosis
+        "K74.3",              # primary biliary cirrhosis (pre-2020 ICD-10)
+        "K83.01",             # primary biliary cholangitis (ICD-10 2020+)
+        "K74.4",              # secondary biliary cirrhosis
+        "K74.5",              # biliary cirrhosis, unspecified
+        "K74.60",             # unspecified cirrhosis of liver
+        "K74.69",             # other cirrhosis of liver
+    ),
+    # Chronic liver disease — broader; includes but does not require cirrhosis
+    # Excludes K72 (hepatic failure, often acute) and K75 (mostly acute hepatitis)
+    "comorbid_liver_disease": (
+        "K70",    # alcoholic liver disease (any)
+        "K71",    # toxic liver disease (any)
+        "K73",    # chronic hepatitis, NEC
+        "K74",    # fibrosis and cirrhosis (any)
+        "K76.0",  # fatty (change of) liver / NAFLD
+        "K76.1",  # chronic passive congestion of liver
+        "K76.8",  # other specified liver disease
+        "K76.9",  # liver disease, unspecified
+        "B18",    # chronic viral hepatitis (B18.0=HBV, B18.1=HBV without delta,
+                  #   B18.2=HCV — most important for cirrhosis risk)
+    ),
+    # Coronary artery disease / chronic ischemic heart disease
+    # Excludes I21/I22 (acute MI — captured separately if needed)
+    "comorbid_cad": ("I25",),
+    # Aortic stenosis (rheumatic, non-rheumatic, congenital)
+    "comorbid_aortic_stenosis": (
+        "I35.0",  # nonrheumatic aortic valve stenosis
+        "I35.2",  # nonrheumatic aortic stenosis with insufficiency
+        "I06.0",  # rheumatic aortic stenosis
+        "Q23.0",  # congenital aortic valve stenosis
+    ),
+    # Carotid artery occlusion / stenosis
+    "comorbid_carotid_stenosis": ("I65.2",),
+}
+
+
+def get_comorbidities(clif_dir: Path, hosp_ids: set) -> pd.DataFrame:
+    """One-hot comorbidity flags from clif_hospital_diagnosis.parquet.
+
+    Filters to ICD-10-CM codes with poa_present == 1 (present on admission)
+    to capture pre-existing conditions.  Falls back to all ICD-10-CM codes
+    with a warning if poa_present is entirely null.
+
+    Returns one row per stay_id with binary (0/1) columns for each key in
+    _COMORBIDITY_DEFS.
+    """
+    cols = list(_COMORBIDITY_DEFS.keys())
+    result = pd.DataFrame({"stay_id": list(hosp_ids)})
+    for col in cols:
+        result[col] = 0
+
+    path = clif_dir / "clif_hospital_diagnosis.parquet"
+    if not path.exists():
+        print("  clif_hospital_diagnosis.parquet not found — comorbidity flags set to 0")
+        return result
+
+    dx = pd.read_parquet(
+        path,
+        columns=["hospitalization_id", "diagnosis_code",
+                 "diagnosis_code_format", "poa_present"],
+    )
+    dx = dx[dx["hospitalization_id"].isin(hosp_ids)].copy()
+    if dx.empty:
+        return result
+
+    # Restrict to ICD-10-CM only
+    dx = dx[dx["diagnosis_code_format"].str.upper().str.strip() == "ICD10CM"].copy()
+
+    # Use poa_present == 1 when available; fall back with warning
+    if dx["poa_present"].notna().any():
+        dx_use = dx[dx["poa_present"] == 1].copy()
+        if dx_use.empty:
+            print("  WARNING: poa_present present but no poa_present=1 rows; "
+                  "using all ICD-10-CM diagnoses for comorbidities.")
+            dx_use = dx
+    else:
+        print("  NOTE: poa_present all-null; using all ICD-10-CM diagnoses "
+              "for comorbidities (pre-existing vs. acquired cannot be distinguished).")
+        dx_use = dx
+
+    codes = dx_use["diagnosis_code"].str.strip().str.upper()
+    for col, prefixes in _COMORBIDITY_DEFS.items():
+        mask = codes.str.startswith(tuple(p.upper() for p in prefixes))
+        flagged_ids = dx_use.loc[mask, "hospitalization_id"].unique()
+        result.loc[result["stay_id"].isin(flagged_ids), col] = 1
+
+    # Mutually exclusive liver disease staging: cirrhosis vs. non-cirrhotic chronic liver disease.
+    # comorbid_cirrhosis ⊆ comorbid_liver_disease, so putting both in a model causes collinearity.
+    # comorbid_liver_nocirrh is used in the GLMM/DLMM instead.
+    result["comorbid_liver_nocirrh"] = (
+        (result["comorbid_liver_disease"] == 1) & (result["comorbid_cirrhosis"] == 0)
+    ).astype(int)
+
+    all_cols = cols + ["comorbid_liver_nocirrh"]
+    n_any = int((result[all_cols] == 1).any(axis=1).sum())
+    print(f"  Comorbidities flagged in {n_any:,} / {len(result):,} hospitalizations")
+    for col in all_cols:
+        print(f"    {col}: {int(result[col].sum()):,}")
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -1066,7 +1220,8 @@ def build_cohort(clif_dir: Path, co: ClifOrchestrator) -> tuple:
     cohort_rhee_clifpy = cohort_rhee_clifpy.merge(clifpy_lac, on="stay_id", how="left")
     print(f"  Rhee-clifpy: {len(cohort_rhee_clifpy):,} (lactate criterion applied by compute_ase)")
 
-    print("\nStep 8: Demographics, weight, vasopressin pre-trajectory, location, CCI...")
+    print("\nStep 8: Demographics, weight, vasopressin pre-trajectory, location, CCI, "
+          "CVC, comorbidities...")
     all_stay_ids = (set(cohort_s3["stay_id"]) |
                     set(cohort_rhee["stay_id"]) |
                     set(cohort_rhee_clifpy["stay_id"]))
@@ -1076,26 +1231,47 @@ def build_cohort(clif_dir: Path, co: ClifOrchestrator) -> tuple:
         cohort_rhee_clifpy[["stay_id", "trajectory_start", "trajectory_end"]],
     ]).drop_duplicates(subset=["stay_id"]))
 
-    demo     = get_demographics(clif_dir, all_stay_ids)
-    weight_df = get_weight_at_onset(clif_dir, union_for_shared)
-    vaso_pre  = get_vaso_pretraj(clif_dir, union_for_shared)
-    cci_df    = get_cci(clif_dir, all_stay_ids)
+    demo        = get_demographics(clif_dir, all_stay_ids)
+    weight_df   = get_weight_at_onset(clif_dir, union_for_shared)
+    vaso_pre    = get_vaso_pretraj(clif_dir, union_for_shared)
+    cci_df      = get_cci(clif_dir, all_stay_ids)
+    cvc_df      = get_cvc(clif_dir, all_stay_ids)
+    comorbid_df = get_comorbidities(clif_dir, all_stay_ids)
 
-    cohort_s3          = cohort_s3.merge(demo,      on="stay_id", how="left")
-    cohort_s3          = cohort_s3.merge(weight_df, on="stay_id", how="left")
-    cohort_s3          = cohort_s3.merge(vaso_pre,  on="stay_id", how="left")
-    cohort_s3          = cohort_s3.merge(cci_df,    on="stay_id", how="left")
-    cohort_rhee        = cohort_rhee.merge(demo,      on="stay_id", how="left")
-    cohort_rhee        = cohort_rhee.merge(weight_df, on="stay_id", how="left")
-    cohort_rhee        = cohort_rhee.merge(vaso_pre,  on="stay_id", how="left")
-    cohort_rhee        = cohort_rhee.merge(cci_df,    on="stay_id", how="left")
-    cohort_rhee_clifpy = cohort_rhee_clifpy.merge(demo,      on="stay_id", how="left")
-    cohort_rhee_clifpy = cohort_rhee_clifpy.merge(weight_df, on="stay_id", how="left")
-    cohort_rhee_clifpy = cohort_rhee_clifpy.merge(vaso_pre,  on="stay_id", how="left")
-    cohort_rhee_clifpy = cohort_rhee_clifpy.merge(cci_df,    on="stay_id", how="left")
+    cohort_s3          = cohort_s3.merge(demo,        on="stay_id", how="left")
+    cohort_s3          = cohort_s3.merge(weight_df,   on="stay_id", how="left")
+    cohort_s3          = cohort_s3.merge(vaso_pre,    on="stay_id", how="left")
+    cohort_s3          = cohort_s3.merge(cci_df,      on="stay_id", how="left")
+    cohort_s3          = cohort_s3.merge(cvc_df,      on="stay_id", how="left")
+    cohort_s3          = cohort_s3.merge(comorbid_df, on="stay_id", how="left")
+    cohort_rhee        = cohort_rhee.merge(demo,        on="stay_id", how="left")
+    cohort_rhee        = cohort_rhee.merge(weight_df,   on="stay_id", how="left")
+    cohort_rhee        = cohort_rhee.merge(vaso_pre,    on="stay_id", how="left")
+    cohort_rhee        = cohort_rhee.merge(cci_df,      on="stay_id", how="left")
+    cohort_rhee        = cohort_rhee.merge(cvc_df,      on="stay_id", how="left")
+    cohort_rhee        = cohort_rhee.merge(comorbid_df, on="stay_id", how="left")
+    cohort_rhee_clifpy = cohort_rhee_clifpy.merge(demo,        on="stay_id", how="left")
+    cohort_rhee_clifpy = cohort_rhee_clifpy.merge(weight_df,   on="stay_id", how="left")
+    cohort_rhee_clifpy = cohort_rhee_clifpy.merge(vaso_pre,    on="stay_id", how="left")
+    cohort_rhee_clifpy = cohort_rhee_clifpy.merge(cci_df,      on="stay_id", how="left")
+    cohort_rhee_clifpy = cohort_rhee_clifpy.merge(cvc_df,      on="stay_id", how="left")
+    cohort_rhee_clifpy = cohort_rhee_clifpy.merge(comorbid_df, on="stay_id", how="left")
 
+    # All binary flags: fill NaN (patients not in procedures/diagnosis tables) → 0
+    _comorbid_cols = list(_COMORBIDITY_DEFS.keys()) + ["comorbid_liver_nocirrh"]
     for _c in [cohort_s3, cohort_rhee, cohort_rhee_clifpy]:
-        _c["vaso_before_traj"] = _c["vaso_before_traj"].fillna(0).astype(int)
+        _c["vaso_before_traj"]  = _c["vaso_before_traj"].fillna(0).astype(int)
+        _c["cvc_during_hosp"]   = _c["cvc_during_hosp"].fillna(0).astype(int)
+        for _col in _comorbid_cols:
+            _c[_col] = _c[_col].fillna(0).astype(int)
+
+        # cvc_before_ne_start: CVC placed strictly before first NE dose
+        # Useful for stratifying DLMM outcomes (does earlier CVC → faster/lower-dose initiation?)
+        _fcvc = pd.to_datetime(_c["first_cvc_dttm"], utc=True, errors="coerce")
+        _fne  = pd.to_datetime(_c["first_norepi_time"], utc=True, errors="coerce")
+        _c["cvc_before_ne_start"] = (
+            _fcvc.notna() & _fne.notna() & (_fcvc < _fne)
+        ).astype(int)
 
     print("\nStep 9: Vasopressin before trajectory start (logging only, exclusion disabled)...")
     for fl, cohort in [(filter_s3, cohort_s3),
@@ -1852,6 +2028,19 @@ _COHORT_COLS = [
     "hospital_id", "hospital_type",
     "location_category_end", "location_type_end",
     "icu_los_days", "hospital_los_days", "traj_end_reason",
+    # CVC placement
+    "cvc_during_hosp",      # 1 if CVC (CPT 36556 / ICD-10-PCS 02HV33Z) placed any time during hosp
+    "first_cvc_dttm",       # UTC datetime of first qualifying CVC procedure (NaT if none)
+    "cvc_before_ne_start",  # 1 if first_cvc_dttm < first_norepi_time (CVC pre-dated NE)
+    # Comorbidities (present-on-admission ICD-10-CM, binary 0/1)
+    # comorbid_liver_disease and comorbid_cirrhosis overlap; use comorbid_liver_nocirrh
+    # (non-cirrhotic chronic liver disease) with comorbid_cirrhosis in models.
+    "comorbid_cirrhosis",
+    "comorbid_liver_disease",    # kept for Table 1 descriptives; NOT used as model fixed effect
+    "comorbid_liver_nocirrh",    # comorbid_liver_disease AND NOT comorbid_cirrhosis
+    "comorbid_cad",
+    "comorbid_aortic_stenosis",
+    "comorbid_carotid_stenosis",
 ]
 
 

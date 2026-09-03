@@ -57,14 +57,15 @@ def _load_site_config():
 import argparse as _ap
 _parser = _ap.ArgumentParser(add_help=False)
 _parser.add_argument("--site",   default=None, help="Override SITE_NAME from config")
-_parser.add_argument("--cohort", default="both", choices=["sepsis3", "rhee", "both"],
+_parser.add_argument("--cohort", default="both",
+                     choices=["sepsis3", "rhee", "rhee_clifpy", "both"],
                      help="Which cohort file to read (cohort_<cohort>.parquet); "
-                          "'both' (default) runs sepsis3 then rhee")
+                          "'both' (default) runs sepsis3, rhee, and rhee_clifpy")
 _cli_args, _passthrough_args = _parser.parse_known_args()
 
 if _cli_args.cohort == "both":
     import subprocess
-    for _c in ("sepsis3", "rhee"):
+    for _c in ("sepsis3", "rhee", "rhee_clifpy"):
         _cmd = [sys.executable, __file__, "--cohort", _c]
         if _cli_args.site:
             _cmd += ["--site", _cli_args.site]

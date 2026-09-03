@@ -36,15 +36,15 @@ Mixed-effects pooling (runs when ≥2 sites' data are available locally):
   Pooled logistic GLM with site dummies (fixed effects) for comparison
   Optional GLMM with site random intercept via BinomialBayesMixedGLM
 
-Approach 3 — Ward/ICU-type + hospital variance, 4-level decomposition
+Approach 3 — Ward/ICU-type + hospital variance, 4-level variance attribution
 (this site only):
-  Same fixed-effects-intercept + DL pooling technique as the site-level mixed
-  effects above (fit_grouped_variance), applied twice within this site:
-    - ICU/ward type (from cohort.location_type, canonicalized) -> tau2_ward
-    - hospital_id (community/academic hospital within this site) -> tau2_hospital
-  Combined with the site-level tau2 (mixed_effects.dl_tau2) and the fixed
-  patient-level logistic residual variance (pi^2/3), this gives a 4-level
-  variance decomposition: patient / ward (ICU type) / hospital / site.
+  ONE expanded logistic GLM per site using site-wide centering (globally
+  comparable intercepts) with ward/ICU-type and hospital fixed-effect dummies.
+  Effective intercepts computed via delta method from the full covariance matrix.
+  DL-pools effective intercepts -> tau2_ward / tau2_hosp for this site.
+  Combined with the cross-site tau2 (mixed_effects.dl_tau2) from Approach 1 and
+  the logistic latent residual (pi^2/3 ≈ 3.29), Nakagawa & Schielzeth R²
+  decomposition gives: covariate groups + ward + hospital + site + unexplained = 100%.
 
 Outputs:
   output/upload_to_box_<SITE>/<cohort>/
@@ -116,7 +116,7 @@ BASE_DIR = Path(__file__).parent.parent
 
 _ap = argparse.ArgumentParser(add_help=False)
 _ap.add_argument("--site",   default=None)
-_ap.add_argument("--cohort", default="both", choices=["sepsis3", "rhee", "both"])
+_ap.add_argument("--cohort", default="both", choices=["sepsis3", "rhee", "rhee_clifpy", "both"])
 _args, _ = _ap.parse_known_args()
 
 
@@ -142,7 +142,7 @@ LOGO_PAL    = getattr(_cfg, "LOGO_PALETTE", {})
 
 PATIENT_LEVEL_DIR = OUTPUT_ROOT / "output" / f"patient_level_data_{SITE_NAME}"
 
-_COHORT_LABELS = {"sepsis3": "Sepsis-3 (CMS)", "rhee": "Rhee/CDC ASE"}
+_COHORT_LABELS = {"sepsis3": "Sepsis-3 (CMS)", "rhee": "Rhee/CDC ASE", "rhee_clifpy": "Rhee/CDC ASE (clifpy)"}
 
 # Reference patient for Approach 2 plots. SOFA components replace the
 # aggregate SOFA score (see fit_site_logistic) so NEE's mechanical overlap
@@ -151,6 +151,29 @@ _COHORT_LABELS = {"sepsis3": "Sepsis-3 (CMS)", "rhee": "Rhee/CDC ASE"}
 REF_AGE       = 60.0
 REF_NEE       = 0.3    # mcg/kg/min
 REF_TIME      = 5.0    # hours from NE start used as the fixed time in dose-varying plots
+
+# Fixed centering for DLMM design matrix — pre-specified so all sites share
+# the same column interpretation without a coordination round.
+# Approximate clinical references: SOFA-normal / mild-threshold values.
+_DLMM_REFS: dict = {
+    "age":                    65.0,   # years
+    "p_f_ratio":             200.0,   # mmHg (ARDS threshold)
+    "creatinine":              1.0,   # mg/dL
+    "platelet":              150.0,   # x10³/µL
+    "bilirubin":               1.0,   # mg/dL
+    "gcs":                    15.0,   # GCS total score (normal)
+    "rrt":                     0.0,   # binary; reference = not on RRT
+    "invasive_vent":           0.0,   # binary; reference = not invasively ventilated
+    "nee":                     0.15,  # mcg/kg/min — approximate typical dose at vaso initiation
+    "time_to_vaso_h_log1p":    1.79,  # ≈ log1p(5 h) — approximate median delay to initiation
+    # Binary comorbidity / procedure covariates — all centered at 0 (no comorbidity = reference)
+    "comorbid_cirrhosis":       0.0,
+    "comorbid_liver_nocirrh":   0.0,
+    "comorbid_cad":             0.0,
+    "comorbid_aortic_stenosis": 0.0,
+    "comorbid_carotid_stenosis":0.0,
+}
+_DLMM_AGE_REF = _DLMM_REFS["age"]  # back-compat alias
 REF_PF        = 300.0  # p/f ratio (mild/no ARDS)
 REF_DEVICE    = "Room Air"
 REF_CREATININE = 0.8   # mg/dL
@@ -163,6 +186,23 @@ REF_GCS       = 15.0
 # is dummy-coded separately with REF_DEVICE as the reference level.
 _CONT_COLS = ["age", "p_f_ratio", "creatinine", "platelet", "bilirubin", "gcs"]
 _DEVICE_REF = REF_DEVICE
+
+# Binary baseline covariates used as fixed effects in the GLM / GLMM / DLMM.
+# All have reference value 0 (no comorbidity / no procedure).
+# NOTE: comorbid_liver_disease is deliberately excluded here — it is collinear with
+# comorbid_cirrhosis.  comorbid_liver_nocirrh (non-cirrhotic liver disease) is used
+# instead to form a mutually exclusive pair.
+# Must stay in sync with _BIN_COLS_MODELS in 08_cross_site_variation_analysis.py.
+_BIN_COLS_MODELS = [
+    "comorbid_cirrhosis",
+    "comorbid_liver_nocirrh",
+    "comorbid_cad",
+    "comorbid_aortic_stenosis",
+    "comorbid_carotid_stenosis",
+]
+# Drop a binary covariate from a site's model if fewer than this fraction of
+# that site's patients carry it — avoids separation / inflated SEs.
+_MIN_BIN_PREVALENCE = 0.01
 
 _DEFAULT_COLORS = ["#4e79a7", "#e15759", "#59a14f", "#f28e2b", "#b07aa1", "#76b7b2"]
 
@@ -319,7 +359,15 @@ def _prep_person_hours(cohort: pd.DataFrame, features: pd.DataFrame) -> pd.DataF
     ph["vaso_on"] = (ph["vaso_dose"] > 0).astype(int)
     ph = ph.sort_values(["stay_id", "time_hour"])
     ph[_LOCF_COLS] = ph.groupby("stay_id")[_LOCF_COLS].ffill()
-    ph = ph.merge(cohort[["stay_id", "age"]], on="stay_id", how="left")
+
+    # Merge static baseline features (age + binary comorbidities)
+    _static = ["stay_id", "age"] + [c for c in _BIN_COLS_MODELS if c in cohort.columns]
+    ph = ph.merge(cohort[_static], on="stay_id", how="left")
+    # Binary cols default to 0 when absent (e.g. procedures file missing at a site)
+    for c in _BIN_COLS_MODELS:
+        if c in ph.columns:
+            ph[c] = ph[c].fillna(0).astype(int)
+
     ph = ph.dropna(subset=["nee", "age", "rrt", "device_category"] + _LOCF_COLS).copy()
     return ph
 
@@ -332,18 +380,32 @@ def _build_design_matrix(
     device_categories: list = None,
     means: dict = None,
     sds: dict = None,
+    present_bin_cols: list = None,
+    candidate_bin_cols: list = None,  # if None, uses _BIN_COLS_MODELS
+    extra_cont_cols: list = None,     # additional continuous covariates to standardise & include
 ):
     """vaso_on ~ intercept + age_c + p_f_ratio_c + device_category + creatinine_c
-    + rrt + platelet_c + bilirubin_c + gcs_c + rcs(NEE,4) + rcs(time,4).
+    + rrt + platelet_c + bilirubin_c + gcs_c
+    + [binary comorbidities: cirrhosis, liver_nocirrh, cad, aortic_stenosis, carotid_stenosis]
+    + rcs(NEE,4) + rcs(time,4).
 
     SOFA components replace the aggregate SOFA score so NEE's mechanical
     overlap with the cardiovascular SOFA axis is excluded; cardiovascular
     itself is intentionally omitted (captured by NEE on the RHS instead).
 
-    knots/means/sds/device_categories can be passed in (pooled cross-site fit
-    reusing one shared scaling) or left None to derive from `df` (per-group
-    refits, each on their own scale).
+    Binary comorbidity covariates are not z-scored (reference = 0); any binary
+    covariate whose patient-level prevalence is below _MIN_BIN_PREVALENCE is
+    dropped from that site's model to avoid quasi-separation.
+
+    extra_cont_cols: list of additional continuous column names already present in df;
+    they are standardised (mean 0, sd 1) and appended after the SOFA components.
+
+    knots/means/sds/device_categories/present_bin_cols can be passed in
+    (pooled/refit reusing one shared structure) or left None to derive from `df`.
     """
+    _extra = list(extra_cont_cols) if extra_cont_cols else []
+    _all_cont = _CONT_COLS + _extra
+
     if nee_knots is None:
         nee_knots = _rcs_knots(df["nee"].values, df=4)
     if time_knots is None:
@@ -353,44 +415,85 @@ def _build_design_matrix(
 
     if means is None or sds is None:
         means, sds = {}, {}
-        for c in _CONT_COLS:
+        for c in _all_cont:
             means[c] = float(df[c].mean())
             sds[c]   = float(df[c].std()) or 1.0
-    centered = {c: (df[c].values - means[c]) / sds[c] for c in _CONT_COLS}
+    else:
+        # Compute means/sds for any extra cols not already stored
+        for c in _extra:
+            if c not in means:
+                means[c] = float(df[c].mean())
+                sds[c]   = float(df[c].std()) or 1.0
+    centered = {c: (df[c].values - means[c]) / sds[c] for c in _all_cont}
 
     if device_categories is None:
         device_categories = sorted(set(df["device_category"].unique()) - {_DEVICE_REF})
     device_cols = {d: (df["device_category"].values == d).astype(np.float64)
                    for d in device_categories}
 
+    # Binary comorbidity covariates — prevalence-checked, not z-scored
+    if present_bin_cols is None:
+        _cand_bin = candidate_bin_cols if candidate_bin_cols is not None else _BIN_COLS_MODELS
+        present_bin_cols = []
+        for c in _cand_bin:
+            if c not in df.columns:
+                continue
+            # Prevalence at patient level (binary cols are constant within a stay_id)
+            if "stay_id" in df.columns:
+                prev = (df.groupby("stay_id")[c].max() == 1).mean()
+            else:
+                prev = float((df[c] == 1).mean())
+            if prev >= _MIN_BIN_PREVALENCE:
+                present_bin_cols.append(c)
+            else:
+                print(f"    [{c}]: prevalence {prev:.1%} < {_MIN_BIN_PREVALENCE:.0%}"
+                      f" — excluded from model")
+
     nee_cols  = [f"rcs_nee_{i}"  for i in range(nee_b.shape[1])]
     time_cols = [f"rcs_time_{i}" for i in range(time_b.shape[1])]
-    col_names = (["intercept"] + [f"{c}_c" for c in _CONT_COLS] + ["rrt"]
+    col_names = (["intercept"] + [f"{c}_c" for c in _all_cont] + ["rrt"]
+                 + present_bin_cols
                  + [f"device_{d}" for d in device_categories] + nee_cols + time_cols)
 
     X = np.column_stack(
         [np.ones(len(df))]
-        + [centered[c] for c in _CONT_COLS]
+        + [centered[c] for c in _all_cont]
         + [df["rrt"].values.astype(np.float64)]
+        + [df[c].values.astype(np.float64) for c in present_bin_cols]
         + [device_cols[d] for d in device_categories]
         + [nee_b, time_b]
     ).astype(np.float64)
 
-    return X, col_names, means, sds, nee_knots, time_knots, device_categories
+    return X, col_names, means, sds, nee_knots, time_knots, device_categories, present_bin_cols
 
 
 # ── Approach 1 & 2: Per-site logistic GLM ─────────────────────────────────────
-def fit_site_logistic(ph: pd.DataFrame, cohort_label: str, site: str) -> dict:
+def fit_site_logistic(
+    ph: pd.DataFrame,
+    cohort_label: str,
+    site: str,
+    bin_cols: list = None,
+    extra_cont_cols: list = None,
+) -> dict:
     """Fit the shared logistic spec (see _build_design_matrix) independently
-    on this group's person-hours (its own knots/scaling/device categories)."""
+    on this group's person-hours (its own knots/scaling/device categories).
+
+    bin_cols:        list of binary covariate names to include; defaults to _BIN_COLS_MODELS.
+    extra_cont_cols: list of additional continuous covariate names (already in ph);
+                     they are standardised and included alongside the base _CONT_COLS.
+    """
     from statsmodels.genmod.generalized_linear_model import GLM
     from statsmodels.genmod import families as fam
 
+    _cand  = bin_cols if bin_cols is not None else _BIN_COLS_MODELS
+    _extra = list(extra_cont_cols) if extra_cont_cols else []
+    _bin_present = [c for c in _cand if c in ph.columns]
+    _extra_present = [c for c in _extra if c in ph.columns]
     df = ph[["stay_id", "time_hour", "vaso_on", "nee", "rrt", "device_category"]
-            + _CONT_COLS].dropna().copy()
+            + _CONT_COLS + _extra_present + _bin_present].dropna().copy()
 
-    X, col_names, means, sds, nee_knots, time_knots, device_categories = (
-        _build_design_matrix(df)
+    X, col_names, means, sds, nee_knots, time_knots, device_categories, present_bin_cols = (
+        _build_design_matrix(df, candidate_bin_cols=_cand, extra_cont_cols=_extra_present)
     )
     Y = df["vaso_on"].values.astype(np.float64)
 
@@ -403,18 +506,21 @@ def fit_site_logistic(ph: pd.DataFrame, cohort_label: str, site: str) -> dict:
     }
 
     result = {
-        "site":        site,
-        "cohort":      cohort_label,
-        "n_patients":  int(df["stay_id"].nunique()),
-        "n_ph_rows":   int(len(df)),
-        "n_vaso_on":   int(Y.sum()),
-        "means": means, "sds": sds,
+        "site":              site,
+        "cohort":            cohort_label,
+        "n_patients":        int(df["stay_id"].nunique()),
+        "n_ph_rows":         int(len(df)),
+        "n_vaso_on":         int(Y.sum()),
+        "means":             means,
+        "sds":               sds,
         "device_categories": device_categories,
-        "nee_knots":   nee_knots.tolist(),
-        "time_knots":  time_knots.tolist(),
-        "coefficients": coef_out,
+        "present_bin_cols":  present_bin_cols,
+        "extra_cont_cols":   _extra_present,
+        "nee_knots":         nee_knots.tolist(),
+        "time_knots":        time_knots.tolist(),
+        "coefficients":      coef_out,
     }
-    result["ref_patient_p_t5"] = float(predict_p(result, REF_AGE, REF_NEE, REF_TIME))
+    result["ref_patient_p_t5"] = float(predict_p(result, REF_AGE, REF_NEE, REF_TIME).item())
     return result
 
 
@@ -422,9 +528,15 @@ def predict_p(
     model: dict, ages, nees, times,
     p_f_ratio=REF_PF, device_category=REF_DEVICE, creatinine=REF_CREATININE,
     rrt=REF_RRT, platelet=REF_PLATELET, bilirubin=REF_BILIRUBIN, gcs=REF_GCS,
+    bin_vals: dict = None,
 ) -> np.ndarray:
     """Vectorized P(vaso_on) prediction from a fitted model dict. Component
-    axes not being varied by the caller stay at their reference values."""
+    axes not being varied by the caller stay at their reference values.
+
+    bin_vals: optional dict mapping binary covariate name → scalar (0 or 1).
+              Defaults to 0 for each binary covariate (reference patient:
+              no comorbidities).
+    """
     arrs = {
         "age": ages, "p_f_ratio": p_f_ratio, "creatinine": creatinine,
         "platelet": platelet, "bilirubin": bilirubin, "gcs": gcs,
@@ -444,6 +556,11 @@ def predict_p(
         centered = (arrs[c] - means[c]) / sds[c]
         lp += coef[f"{c}_c"]["beta"] * centered
     lp += coef["rrt"]["beta"] * arrs["rrt"]
+    # Binary comorbidity terms (reference = 0; caller may pass specific values)
+    _bv = bin_vals or {}
+    for c in model.get("present_bin_cols", []):
+        if c in coef:
+            lp += coef[c]["beta"] * float(_bv.get(c, 0.0))
     for d in model.get("device_categories", []):
         col = f"device_{d}"
         if col in coef:
@@ -452,6 +569,59 @@ def predict_p(
         lp += coef[f"rcs_nee_{i}"]["beta"]  * nee_b[:, i]
     for i in range(time_b.shape[1]):
         lp += coef[f"rcs_time_{i}"]["beta"] * time_b[:, i]
+
+    return 1.0 / (1.0 + np.exp(-lp))
+
+
+def predict_p_structural(
+    model: dict, ages, nees, times,
+    ward_type: str = None,
+    hospital_id: str = None,
+    p_f_ratio=REF_PF, device_category=REF_DEVICE,
+    creatinine=REF_CREATININE, rrt=REF_RRT,
+    platelet=REF_PLATELET, bilirubin=REF_BILIRUBIN, gcs=REF_GCS,
+) -> np.ndarray:
+    """P(vaso_on) from the structural (expanded) model.
+
+    Identical to predict_p but also activates the appropriate ward / hospital
+    dummy.  ward_type=None → reference ward (all ward dummies = 0).
+    hospital_id=None → reference hospital.  Coefficients not present in the
+    model dict (e.g. ward dummies for a single-ward site) are silently skipped.
+    """
+    arrs = {
+        "age": ages, "p_f_ratio": p_f_ratio, "creatinine": creatinine,
+        "platelet": platelet, "bilirubin": bilirubin, "gcs": gcs,
+        "nee": nees, "time": times, "rrt": rrt,
+    }
+    arrs = {k: np.atleast_1d(np.asarray(v, dtype=float)) for k, v in arrs.items()}
+    n = max(len(v) for v in arrs.values())
+    arrs = {k: np.broadcast_to(v, (n,)).copy() for k, v in arrs.items()}
+    device_arr = np.broadcast_to(np.asarray(device_category, dtype=object), (n,))
+
+    means, sds, coef = model["means"], model["sds"], model["coefficients"]
+    nee_b  = _rcs_basis(arrs["nee"],  np.array(model["nee_knots"]))
+    time_b = _rcs_basis(arrs["time"], np.array(model["time_knots"]))
+
+    lp = np.full(n, coef["intercept"]["beta"])
+    for c in _CONT_COLS:
+        lp += coef[f"{c}_c"]["beta"] * (arrs[c] - means[c]) / sds[c]
+    lp += coef["rrt"]["beta"] * arrs["rrt"]
+    for d in model.get("device_categories", []):
+        col = f"device_{d}"
+        if col in coef:
+            lp += coef[col]["beta"] * (device_arr == d).astype(float)
+    for i in range(nee_b.shape[1]):
+        lp += coef[f"rcs_nee_{i}"]["beta"] * nee_b[:, i]
+    for i in range(time_b.shape[1]):
+        lp += coef[f"rcs_time_{i}"]["beta"] * time_b[:, i]
+    if ward_type is not None:
+        wd_col = f"ward_{ward_type}"
+        if wd_col in coef:
+            lp += coef[wd_col]["beta"]
+    if hospital_id is not None:
+        hd_col = f"hosp_{hospital_id}"
+        if hd_col in coef:
+            lp += coef[hd_col]["beta"]
 
     return 1.0 / (1.0 + np.exp(-lp))
 
@@ -627,15 +797,16 @@ def fit_and_plot_mixed_effects(
     # ── Pooled GLM with site dummies ────────────────────────────────────────
     frames = []
     for s in sites:
+        _bin_cols_s = [c for c in _BIN_COLS_MODELS if c in ph_by_site[s].columns]
         ph = ph_by_site[s][["stay_id", "time_hour", "vaso_on", "nee", "rrt",
-                             "device_category"] + _CONT_COLS].copy()
+                             "device_category"] + _CONT_COLS + _bin_cols_s].copy()
         ph["site"] = s
         frames.append(ph)
     all_ph = pd.concat(frames, ignore_index=True).dropna(
         subset=["nee", "rrt", "device_category", "vaso_on"] + _CONT_COLS
     )
 
-    X_base, base_col_names, _means, _sds, _nee_kp, _time_kp, _dev_cats = (
+    X_base, base_col_names, _means, _sds, _nee_kp, _time_kp, _dev_cats, _pbc = (
         _build_design_matrix(all_ph)
     )
     n_base = len(base_col_names)
@@ -758,154 +929,215 @@ def fit_and_plot_mixed_effects(
     }
 
 
-# ── Approach 3: ward/ICU-type + hospital variance (this site only) ───────────
-def fit_grouped_variance(
-    cohort: pd.DataFrame, ph: pd.DataFrame, cohort_label: str, site: str,
-    group_col: str, min_n: int, label: str, canon_fn=None,
-) -> dict:
-    """Same fixed-effects-intercept + DL pooling technique as the site-level
-    mixed effects, applied within `site` to whatever local grouping factor is
-    passed in (ICU/ward type or hospital) — shared machinery for both levels
-    of the local variance hierarchy.
+# ── Approach 3: expanded model with ward/ICU-type + hospital fixed effects ──────
+def _build_cohort_structural_df(cohort: pd.DataFrame) -> pd.DataFrame:
+    """Per-stay structural lookup: canonical _ward and hospital_id.
 
-    Fits the shared logistic spec (see _build_design_matrix) independently
-    within each group with >= min_n patients, then DL-pools those intercepts
-    -> tau2/ICC/MOR for that grouping factor. Purely local to `site` — no
-    cross-site data needed, so this is safe to compute (and share as an
-    aggregate number) at any single site.
+    Used by fit_site_logistic_with_structure to join structural grouping
+    columns onto person-hours by stay_id.
     """
-    if group_col not in cohort.columns:
-        print(f"  No usable {label} column ('{group_col}') found — skipping {label}-level variance.")
-        return {}
+    c = cohort.copy()
+    c["_ward"] = _canon_icu_series(_effective_location(c))
+    cols = ["stay_id", "_ward"]
+    if "hospital_id" in c.columns:
+        cols.append("hospital_id")
+    return c[cols].drop_duplicates("stay_id")
 
-    group_map = cohort[["stay_id", group_col]].copy()
-    if canon_fn is not None:
-        group_map[group_col] = canon_fn(group_map[group_col])
-    group_map = group_map.dropna(subset=[group_col])[["stay_id", group_col]]
 
-    ph_grp = ph.merge(group_map, on="stay_id", how="inner")
-    if ph_grp.empty:
-        print(f"  No person-hours with a known {label} — skipping {label}-level variance.")
-        return {}
+def fit_site_logistic_with_structure(
+    ph: pd.DataFrame,
+    cohort: pd.DataFrame,
+    cohort_label: str,
+    site: str,
+) -> dict:
+    """Expanded logistic GLM: shared spec + ward/ICU-type dummies + hospital
+    dummies, fit on this site's person-hours (Approach 3).
 
-    group_models: dict = {}
-    for grp, sub in ph_grp.groupby(group_col):
-        n_pat = sub["stay_id"].nunique()
-        if n_pat < min_n:
-            print(f"    Skipping {label} '{grp}' (n={n_pat} < {min_n} patients)")
-            continue
-        try:
-            group_models[grp] = fit_site_logistic(sub, cohort_label, f"{site}:{grp}")
-            m = group_models[grp]
-            se = m["coefficients"]["intercept"]["se"]
-            m["stable"] = bool(se < MAX_STABLE_INTERCEPT_SE)
-            flag = "" if m["stable"] else "  [UNSTABLE — likely separation; excluded from DL pooling]"
-            print(f"    [{grp}] n={m['n_patients']:,}  vaso_on={m['n_vaso_on']:,}  "
-                  f"α={m['coefficients']['intercept']['beta']:+.4f} (SE={se:.3f}){flag}")
-        except Exception as _e:
-            print(f"    WARNING: model fit failed for {label} '{grp}': {_e}")
+    Uses site-wide (global) means/sds for centering so per-ward effective
+    intercepts are all evaluated at the same reference patient — making them
+    directly comparable without the reference-shift bias of per-group refits.
 
-    stable_models = {g: m for g, m in group_models.items() if m.get("stable", True)}
-    if len(stable_models) < 2:
-        print(f"  <2 stable {label}s with >= {min_n} patients — skipping {label}-level variance.")
-        return {"group_column": group_col, "group_models": group_models}
+    Effective intercept for ward j:
+        α_j = β_intercept + β_{ward_j}
+        SE_j = √(Var(β₀) + Var(β_j) + 2·Cov(β₀, β_j))
 
-    alphas    = np.array([m["coefficients"]["intercept"]["beta"] for m in stable_models.values()])
-    alpha_var = np.array([m["coefficients"]["intercept"]["se"]   for m in stable_models.values()]) ** 2
-    dl = _dl_pool(alphas, alpha_var)
+    Reference level: highest-N ward / hospital (most stable baseline).
+    Groups below MIN_ICU_N_PATIENTS / MIN_HOSPITAL_N_PATIENTS are excluded
+    from the dummy set; their person-hours remain in the fit and are absorbed
+    into the reference intercept.
 
-    n_excluded = len(group_models) - len(stable_models)
-    if n_excluded:
-        print(f"  {label.capitalize()}-level DL: excluded {n_excluded} unstable group(s) from pooling")
-    print(f"  {label.capitalize()}-level DL: τ²={dl['tau2']:.4f}  ICC={dl['icc']:.3f}  "
-          f"MOR={dl['mor']:.3f}  (k={dl['k']} {label}s)")
+    Also DL-pools the effective intercepts to produce tau2_ward / tau2_hosp —
+    equivalent to the old separate-fit DL approach but statistically sounder.
+    """
+    from statsmodels.genmod.generalized_linear_model import GLM
+    from statsmodels.genmod import families as fam
 
-    return {
-        "group_column": group_col,
-        "group_models": group_models,
-        "tau2": dl["tau2"], "icc": dl["icc"], "mor": dl["mor"],
-        "pooled_alpha": dl["pooled_alpha"], "se": dl["se"], "k": dl["k"],
+    struct_df = _build_cohort_structural_df(cohort)
+
+    df = ph[["stay_id", "time_hour", "vaso_on", "nee", "rrt", "device_category"]
+            + _CONT_COLS].dropna().copy()
+
+    # Site-wide means/sds — consistent centering across all groups
+    means_g, sds_g = {}, {}
+    for c_col in _CONT_COLS:
+        means_g[c_col] = float(df[c_col].mean())
+        sds_g[c_col]   = float(df[c_col].std()) or 1.0
+
+    X_base, col_names_base, _, _, nee_knots, time_knots, device_categories, present_bin_cols_s = (
+        _build_design_matrix(df, means=means_g, sds=sds_g)
+    )
+
+    # Merge structural labels (one assignment per stay_id)
+    df = df.merge(struct_df, on="stay_id", how="left")
+
+    # ── Ward dummies ───────────────────────────────────────────────────────
+    ward_pat_n: dict = {}
+    if "_ward" in df.columns:
+        ward_pat_n = (
+            df.dropna(subset=["_ward"])
+            .groupby("_ward")["stay_id"].nunique()
+            .sort_values(ascending=False)
+            .to_dict()
+        )
+    ward_cats   = [w for w, n in ward_pat_n.items() if n >= MIN_ICU_N_PATIENTS]
+    ward_ref    = ward_cats[0] if ward_cats else None
+    ward_levels = [w for w in ward_cats if w != ward_ref]
+
+    # ── Hospital dummies ───────────────────────────────────────────────────
+    hosp_pat_n: dict = {}
+    if "hospital_id" in df.columns:
+        hosp_pat_n = (
+            df.dropna(subset=["hospital_id"])
+            .groupby("hospital_id")["stay_id"].nunique()
+            .sort_values(ascending=False)
+            .to_dict()
+        )
+    hosp_cats   = [h for h, n in hosp_pat_n.items() if n >= MIN_HOSPITAL_N_PATIENTS]
+    hosp_ref    = hosp_cats[0] if len(hosp_cats) >= 2 else None
+    hosp_levels = [h for h in hosp_cats if h != hosp_ref] if hosp_ref else []
+
+    # ── Build expanded X ───────────────────────────────────────────────────
+    ward_col_names = [f"ward_{w}" for w in ward_levels]
+    hosp_col_names = [f"hosp_{h}" for h in hosp_levels]
+    col_names      = col_names_base + ward_col_names + hosp_col_names
+
+    parts = [X_base]
+    if ward_levels:
+        wv = df["_ward"].values
+        parts.append(np.column_stack(
+            [(wv == w).astype(np.float64) for w in ward_levels]
+        ))
+    if hosp_levels:
+        hv = df["hospital_id"].values
+        parts.append(np.column_stack(
+            [(hv == h).astype(np.float64) for h in hosp_levels]
+        ))
+    X_full = np.column_stack(parts) if len(parts) > 1 else X_base
+    Y      = df["vaso_on"].values.astype(np.float64)
+
+    fit = GLM(Y, X_full, family=fam.Binomial()).fit(maxiter=200)
+    cov = fit.cov_params()
+
+    coef_out = {
+        name: {"beta": float(fit.params[i]), "se": float(fit.bse[i]),
+               "or":   float(np.exp(fit.params[i]))}
+        for i, name in enumerate(col_names)
     }
 
+    i_int    = col_names.index("intercept")
+    ward_npt = df.groupby("_ward")["stay_id"].nunique().to_dict() if "_ward" in df.columns else {}
+    hosp_npt = df.groupby("hospital_id")["stay_id"].nunique().to_dict() if "hospital_id" in df.columns else {}
 
-def fit_ward_level_variance(cohort: pd.DataFrame, ph: pd.DataFrame, cohort_label: str, site: str) -> dict:
-    """ICU/ward-type variance via fit_grouped_variance.
+    # ── Effective intercepts per ward ──────────────────────────────────────
+    ward_ei: dict = {}
+    if ward_ref:
+        ward_ei[ward_ref] = {
+            "alpha": float(fit.params[i_int]),
+            "se":    float(fit.bse[i_int]),
+            "n_patients": int(ward_npt.get(ward_ref, 0)),
+            "is_reference": True, "stable": True,
+        }
+        print(f"    ward [{ward_ref}] n={ward_npt.get(ward_ref,0):,}  "
+              f"α={fit.params[i_int]:+.4f} (SE={fit.bse[i_int]:.3f})  [reference]")
+    for w in ward_levels:
+        i_w    = col_names.index(f"ward_{w}")
+        alpha  = float(fit.params[i_int] + fit.params[i_w])
+        se     = float(np.sqrt(max(0.0, cov[i_int, i_int] + cov[i_w, i_w] + 2 * cov[i_int, i_w])))
+        stable = bool(se < MAX_STABLE_INTERCEPT_SE)
+        flag   = "" if stable else "  [UNSTABLE — likely separation]"
+        print(f"    ward [{w}] n={ward_npt.get(w,0):,}  α={alpha:+.4f} (SE={se:.3f}){flag}")
+        ward_ei[w] = {"alpha": alpha, "se": se,
+                      "n_patients": int(ward_npt.get(w, 0)),
+                      "is_reference": False, "stable": stable}
 
-    Builds a per-row effective location column: location_type when non-null,
-    else location_category (fills in 'ed', 'ward', etc. rather than dropping
-    those patients entirely).
-    """
-    cohort = cohort.copy()
-    cohort["_eff_location"] = _effective_location(cohort)
-    if cohort["_eff_location"].isna().all():
-        print("  No usable ICU/ward location column found — skipping ward-level variance.")
-        return {}
-    return fit_grouped_variance(
-        cohort, ph, cohort_label, site,
-        group_col="_eff_location", min_n=MIN_ICU_N_PATIENTS, label="ward", canon_fn=_canon_icu_series,
-    )
+    # ── Effective intercepts per hospital ──────────────────────────────────
+    hosp_ei: dict = {}
+    if hosp_ref is not None:
+        hosp_ei[str(hosp_ref)] = {
+            "alpha": float(fit.params[i_int]),
+            "se":    float(fit.bse[i_int]),
+            "n_patients": int(hosp_npt.get(hosp_ref, 0)),
+            "is_reference": True, "stable": True,
+        }
+    for h in hosp_levels:
+        i_h   = col_names.index(f"hosp_{h}")
+        alpha = float(fit.params[i_int] + fit.params[i_h])
+        se    = float(np.sqrt(max(0.0, cov[i_int, i_int] + cov[i_h, i_h] + 2 * cov[i_int, i_h])))
+        hosp_ei[str(h)] = {"alpha": alpha, "se": se,
+                           "n_patients": int(hosp_npt.get(h, 0)),
+                           "is_reference": False, "stable": bool(se < MAX_STABLE_INTERCEPT_SE)}
 
-
-def fit_hospital_level_variance(cohort: pd.DataFrame, ph: pd.DataFrame, cohort_label: str, site: str) -> dict:
-    """Hospital variance via fit_grouped_variance — hospital_id identifies
-    the individual community/academic hospital within this CLIF site's data
-    pool (single-hospital sites/pulls just yield <2 groups and are skipped)."""
-    return fit_grouped_variance(
-        cohort, ph, cohort_label, site,
-        group_col="hospital_id", min_n=MIN_HOSPITAL_N_PATIENTS, label="hospital",
-    )
-
-
-def fit_hospital_type_variance(cohort: pd.DataFrame, ph: pd.DataFrame, cohort_label: str, site: str) -> dict:
-    """Academic vs. community hospital-type variance via fit_grouped_variance.
-
-    Meaningful only at sites with both hospital types present; sites with a
-    single type (or missing hospital_type) yield <2 groups and are skipped."""
-    if "hospital_type" not in cohort.columns:
-        return {}
-    return fit_grouped_variance(
-        cohort, ph, cohort_label, site,
-        group_col="hospital_type", min_n=MIN_HOSPITAL_N_PATIENTS, label="hospital_type",
-    )
-
-
-def compute_variance_decomposition(
-    ward_result: dict, hospital_result: dict, site_mixed_effects: dict
-) -> dict:
-    """4-level variance decomposition: patient (fixed logistic residual,
-    pi^2/3) / ward-ICU-type (tau2_ward, within this site) / hospital
-    (tau2_hospital, within this site's own community/academic hospitals) /
-    site (tau2_dl, this site's contribution to the cross-site DL pooling —
-    "site" here is the CLIF-site / larger data pool, not an individual
-    hospital).
-    """
-    tau2_ward = ward_result.get("tau2")
-    tau2_hosp = hospital_result.get("tau2")
-    tau2_site = site_mixed_effects.get("dl_tau2")
-    if tau2_ward is None or tau2_site is None:
-        return {}
-    # Single/no-hospital sites (e.g. UCMC, MIMIC) can't estimate a hospital-level
-    # component — report it as 0% rather than dropping the whole decomposition.
-    if tau2_hosp is None:
-        tau2_hosp = 0.0
-
-    pi2_3 = float(np.pi ** 2 / 3)
-    total = pi2_3 + tau2_ward + tau2_hosp + tau2_site
-    return {
-        "patient_variance": pi2_3, "ward_variance": tau2_ward,
-        "hospital_variance": tau2_hosp, "site_variance": tau2_site,
-        "total_variance": total,
-        "pct_patient":  pi2_3     / total * 100,
-        "pct_ward":     tau2_ward / total * 100,
-        "pct_hospital": tau2_hosp / total * 100,
-        "pct_site":     tau2_site / total * 100,
+    result: dict = {
+        "site": site, "cohort": cohort_label,
+        "n_patients":  int(df["stay_id"].nunique()),
+        "n_ph_rows":   int(len(df)),
+        "n_vaso_on":   int(Y.sum()),
+        "means": means_g, "sds": sds_g,
+        "device_categories": device_categories,
+        "nee_knots":   nee_knots.tolist(),
+        "time_knots":  time_knots.tolist(),
+        "ward_levels": ward_levels,
+        "ward_ref":    ward_ref,
+        "hosp_levels": [str(h) for h in hosp_levels],
+        "hosp_ref":    str(hosp_ref) if hosp_ref is not None else None,
+        "coefficients": coef_out,
+        "ward_effective_intercepts":     ward_ei,
+        "hospital_effective_intercepts": hosp_ei,
     }
+
+    # DL-pool stable effective intercepts → tau2_ward / tau2_hosp
+    stable_w = {g: v for g, v in ward_ei.items() if v.get("stable", True) and v["se"] > 0}
+    if len(stable_w) >= 2:
+        dl_w = _dl_pool(
+            np.array([v["alpha"] for v in stable_w.values()]),
+            np.array([v["se"]    for v in stable_w.values()]) ** 2,
+        )
+        result.update({"tau2_ward": dl_w["tau2"], "icc_ward": dl_w["icc"], "mor_ward": dl_w["mor"]})
+        print(f"  Ward-level DL: τ²={dl_w['tau2']:.4f}  ICC={dl_w['icc']:.3f}  "
+              f"MOR={dl_w['mor']:.3f}  (k={dl_w['k']} wards)")
+    else:
+        result.update({"tau2_ward": None, "icc_ward": None, "mor_ward": None})
+        print("  Ward-level DL: <2 stable wards — τ² not estimable")
+
+    stable_h = {g: v for g, v in hosp_ei.items() if v.get("stable", True) and v["se"] > 0}
+    if len(stable_h) >= 2:
+        dl_h = _dl_pool(
+            np.array([v["alpha"] for v in stable_h.values()]),
+            np.array([v["se"]    for v in stable_h.values()]) ** 2,
+        )
+        result.update({"tau2_hosp": dl_h["tau2"], "icc_hosp": dl_h["icc"], "mor_hosp": dl_h["mor"]})
+        print(f"  Hospital-level DL: τ²={dl_h['tau2']:.4f}  ICC={dl_h['icc']:.3f}  "
+              f"MOR={dl_h['mor']:.3f}  (k={dl_h['k']} hospitals)")
+    else:
+        result.update({"tau2_hosp": None, "icc_hosp": None, "mor_hosp": None})
+
+    return result
 
 
 def plot_variance_decomposition(decomp: dict, out_dir: Path, cohort_label: str, site: str) -> None:
     if not decomp:
         return
-    labels = ["Patient", "Ward / ICU type", "Hospital", "Site (CLIF data pool)"]
+    labels = ["Patient", "Ward / ICU type", "Hospital", "Site"]
     pcts   = [decomp["pct_patient"], decomp["pct_ward"], decomp["pct_hospital"], decomp["pct_site"]]
     colors = ["#4e79a7", "#f28e2b", "#e15759", "#59a14f"]
 
@@ -930,7 +1162,7 @@ def plot_variance_decomposition(decomp: dict, out_dir: Path, cohort_label: str, 
         f"Variance decomposition — {site}  [{_COHORT_LABELS.get(cohort_label, cohort_label)}]\n"
         f"Patient-specific factors accounted for {decomp['pct_patient']:.1f}% of variation; "
         f"{decomp['pct_ward']:.1f}%, {decomp['pct_hospital']:.1f}%, and {decomp['pct_site']:.1f}% "
-        f"were attributed to ward/ICU type, hospital, and CLIF site respectively.",
+        f"were attributed to ward/ICU type, hospital, and site respectively.",
         fontsize=9, fontweight="bold", wrap=True,
     )
     for spine in ax.spines.values():
@@ -980,15 +1212,25 @@ _COVAR_COLORS: dict = {
 def compute_covariate_variance_explained(
     ph_by_site: dict,
     site_models: dict,
-    variance_decomp: dict,
+    structural_models: dict,
+    me_result: dict,
 ) -> dict:
     """Variance of each covariate's linear predictor contribution, per site.
 
     For predictor group g:  σ²_g = Var(β_g ᵀ X_g) over all patient-hours.
 
     Total latent variance = Σ σ²_g + σ²_ward + σ²_hosp + σ²_site + π²/3
-    R²_marginal    = Σ σ²_g  / σ²_total
-    R²_conditional = (Σ σ²_g + σ²_random) / σ²_total
+    where:
+      • σ²_g  = Var(β_g X_g) from the Approach 1 model (shared logistic spec)
+      • σ²_ward = τ²_ward from DL pooling of Approach 3 effective intercepts
+      • σ²_hosp = τ²_hosp from DL pooling of Approach 3 effective intercepts
+      • σ²_site = dl_tau2 from cross-site mixed-effects pooling (Approach 1)
+      • π²/3  ≈ 3.29 = logistic latent-variable residual (fixed mathematical constant)
+
+    This gives a single decomposition across all 4 levels summing to 100%.
+
+    R²_marginal    = Σ σ²_g  / σ²_total   (covariate fixed effects only)
+    R²_conditional = (Σ σ²_g + σ²_ward + σ²_hosp + σ²_site) / σ²_total
 
     Reference: Nakagawa & Schielzeth (2013) Methods Ecol Evol 4:133-142.
     """
@@ -1000,19 +1242,22 @@ def compute_covariate_variance_explained(
             continue
         model = site_models[site]
         ph = ph_by_site[site].copy()
+        _pbc = model.get("present_bin_cols", [])
+        _bin_in_ph = [c for c in _pbc if c in ph.columns]
         ph = (ph[["stay_id", "time_hour", "vaso_on", "nee", "rrt",
-                   "device_category"] + _CONT_COLS].dropna().copy())
+                   "device_category"] + _CONT_COLS + _bin_in_ph].dropna().copy())
         if ph.empty:
             continue
 
         try:
-            X, col_names, _, _, _, _, _ = _build_design_matrix(
+            X, col_names, _, _, _, _, _, _ = _build_design_matrix(
                 ph,
                 nee_knots=np.array(model["nee_knots"]),
                 time_knots=np.array(model["time_knots"]),
                 means=model["means"],
                 sds=model["sds"],
                 device_categories=model["device_categories"],
+                present_bin_cols=_pbc,
             )
         except Exception as exc:
             print(f"  [{site}] covariate variance skipped — {exc}")
@@ -1027,11 +1272,15 @@ def compute_covariate_variance_explained(
             group_sigma2[grp] = float(np.var(lp))
 
         sigma2_fixed = float(sum(group_sigma2.values()))
-        decomp_s = variance_decomp.get(site, {})
-        sigma2_ward = float(decomp_s.get("ward_variance", 0.0))
-        sigma2_hosp = float(decomp_s.get("hospital_variance", 0.0))
-        sigma2_site = float(decomp_s.get("site_variance", 0.0))
-        sigma2_rand = sigma2_ward + sigma2_hosp + sigma2_site
+
+        # Structural variance from Approach 3 DL pooling of effective intercepts
+        struct_s    = structural_models.get(site, {})
+        sigma2_ward = float(struct_s.get("tau2_ward") or 0.0)
+        sigma2_hosp = float(struct_s.get("tau2_hosp") or 0.0)
+        # Cross-site variance from Approach 1 DL pooling
+        sigma2_site = float(me_result.get("dl_tau2") or 0.0)
+
+        sigma2_rand  = sigma2_ward + sigma2_hosp + sigma2_site
         sigma2_total = sigma2_fixed + sigma2_rand + pi2_3
 
         def _pct(v: float) -> float:
@@ -1151,20 +1400,24 @@ def export_covariate_variance_csv(
 
 
 def plot_group_intercepts(
-    group_result: dict, out_dir: Path, cohort_label: str, site: str, label: str
+    structural_model: dict, out_dir: Path, cohort_label: str, site: str, label: str
 ) -> None:
-    """Forest plot of each ward/ICU-type or hospital's fixed-effects intercept
-    ± 95% CI (the DL-pooling input for this site's ward-/hospital-level
-    variance) — the group-level counterpart of plot_approach1's site-level
-    intercept comparison."""
-    group_models = group_result.get("group_models", {})
-    if len(group_models) < 2:
+    """Forest plot of each ward/ICU-type or hospital's effective logit intercept
+    ± 95% CI — computed via delta method from the single expanded structural model.
+
+    structural_model: result of fit_site_logistic_with_structure for this site.
+    label: "ward"     → reads ward_effective_intercepts
+           "hospital" → reads hospital_effective_intercepts
+    """
+    ei_key = "ward_effective_intercepts" if label == "ward" else "hospital_effective_intercepts"
+    ei = structural_model.get(ei_key, {})
+    if len(ei) < 2:
         return
 
-    groups = list(group_models.keys())
-    alphas   = [group_models[g]["coefficients"]["intercept"]["beta"] for g in groups]
-    alpha_se = [group_models[g]["coefficients"]["intercept"]["se"]   for g in groups]
-    ns       = [group_models[g]["n_patients"] for g in groups]
+    groups   = list(ei.keys())
+    alphas   = [ei[g]["alpha"]      for g in groups]
+    alpha_se = [ei[g]["se"]         for g in groups]
+    ns       = [ei[g]["n_patients"] for g in groups]
 
     order = np.argsort(alphas)
     groups, alphas, alpha_se, ns = (
@@ -1180,10 +1433,11 @@ def plot_group_intercepts(
     ax.axvline(0, color="lightgrey", linestyle="--", linewidth=1)
     ax.set_yticks(y_pos)
     ax.set_yticklabels([f"{g}  (n={n:,})" for g, n in zip(groups, ns)], fontsize=9)
-    ax.set_xlabel("Logit intercept ± 95% CI", fontsize=9)
+    ax.set_xlabel("Effective logit intercept ± 95% CI\n(ref patient at site-wide mean covariates)", fontsize=9)
 
-    pooled = group_result.get("tau2")
-    subtitle = f"τ²={pooled:.3f}" if pooled is not None else "τ² not estimable"
+    tau2_key = "tau2_ward" if label == "ward" else "tau2_hosp"
+    tau2     = structural_model.get(tau2_key)
+    subtitle = f"τ²={tau2:.3f}" if tau2 is not None else "τ² not estimable"
     ax.set_title(
         f"{label.capitalize()}-level intercept comparison — {site}  "
         f"[{_COHORT_LABELS.get(cohort_label, cohort_label)}]  ({subtitle})",
@@ -1199,21 +1453,28 @@ def plot_group_intercepts(
 
 # ── Approach 2A/2B broken down by ward/ICU-type or hospital (per site) ────────
 def plot_approach2_time_by_group(
-    group_result: dict,
+    structural_model: dict,
     out_dir: Path,
     cohort_label: str,
     site: str,
     label: str,
 ) -> None:
-    """P(vaso_on) vs time for the reference patient, one line per ICU-type or hospital."""
-    group_models = group_result.get("group_models", {})
-    if len(group_models) < 2:
+    """P(vaso_on) vs time for the reference patient, one curve per ward/ICU-type or hospital.
+
+    Uses predict_p_structural so all curves share the same base model — the
+    only difference between curves is the ward or hospital dummy being activated.
+    structural_model: result of fit_site_logistic_with_structure for this site.
+    label: "ward" or "hospital".
+    """
+    ei_key = "ward_effective_intercepts" if label == "ward" else "hospital_effective_intercepts"
+    ei = structural_model.get(ei_key, {})
+    if len(ei) < 2:
         return
 
-    t_max = min(max(max(m["time_knots"]) for m in group_models.values()), 120)
+    t_max = min(max(structural_model.get("time_knots", [120])), 120)
     time_grid = np.linspace(5, t_max, 300)
 
-    keys = sorted(group_models.keys())
+    keys = sorted(ei.keys())
     cmap = plt.cm.tab10
     color_map = {
         k: _GROUP_TYPE_COLOR_MAP.get(k, cmap(i / max(len(keys) - 1, 1)))
@@ -1222,10 +1483,14 @@ def plot_approach2_time_by_group(
 
     fig, ax = plt.subplots(figsize=(10, 5))
     for grp in keys:
-        m = group_models[grp]
-        p_t = predict_p(m, REF_AGE, REF_NEE, time_grid)
+        ward_arg = grp if label == "ward"     else None
+        hosp_arg = grp if label == "hospital" else None
+        p_t = predict_p_structural(
+            structural_model, REF_AGE, REF_NEE, time_grid,
+            ward_type=ward_arg, hospital_id=hosp_arg,
+        )
         ax.plot(time_grid, p_t, color=color_map[grp], linewidth=2.0,
-                label=f"{grp}  (n={m['n_patients']:,})")
+                label=f"{grp}  (n={ei[grp]['n_patients']:,})")
 
     ax.set_xlabel("Hours from NE start", fontsize=11)
     ax.set_ylabel("P(vasopressin on | hour)", fontsize=11)
@@ -1248,7 +1513,7 @@ def plot_approach2_time_by_group(
 
 
 def plot_approach2_nee_by_group(
-    group_result: dict,
+    structural_model: dict,
     site_ph: "pd.DataFrame",
     out_dir: Path,
     cohort_label: str,
@@ -1256,9 +1521,13 @@ def plot_approach2_nee_by_group(
     label: str,
     ref_time: float = REF_TIME,
 ) -> None:
-    """P(vaso_on) vs NEE dose for the reference patient, one line per ICU-type or hospital."""
-    group_models = group_result.get("group_models", {})
-    if len(group_models) < 2:
+    """P(vaso_on) vs NEE dose for the reference patient, one curve per ward/ICU-type or hospital.
+
+    Uses predict_p_structural so curves share the same base model.
+    """
+    ei_key = "ward_effective_intercepts" if label == "ward" else "hospital_effective_intercepts"
+    ei = structural_model.get(ei_key, {})
+    if len(ei) < 2:
         return
 
     all_nee = site_ph["nee"].dropna().values if site_ph is not None else np.array([])
@@ -1266,7 +1535,7 @@ def plot_approach2_nee_by_group(
     nee_max = float(np.percentile(finite, 95)) if len(finite) else 2.0
     nee_grid = np.linspace(0.0, min(nee_max, 2.0), 300)
 
-    keys = sorted(group_models.keys())
+    keys = sorted(ei.keys())
     cmap = plt.cm.tab10
     color_map = {
         k: _GROUP_TYPE_COLOR_MAP.get(k, cmap(i / max(len(keys) - 1, 1)))
@@ -1275,10 +1544,14 @@ def plot_approach2_nee_by_group(
 
     fig, ax = plt.subplots(figsize=(10, 5))
     for grp in keys:
-        m = group_models[grp]
-        p_nee = predict_p(m, REF_AGE, nee_grid, ref_time)
+        ward_arg = grp if label == "ward"     else None
+        hosp_arg = grp if label == "hospital" else None
+        p_nee = predict_p_structural(
+            structural_model, REF_AGE, nee_grid, ref_time,
+            ward_type=ward_arg, hospital_id=hosp_arg,
+        )
         ax.plot(nee_grid, p_nee, color=color_map[grp], linewidth=2.0,
-                label=f"{grp}  (n={m['n_patients']:,})")
+                label=f"{grp}  (n={ei[grp]['n_patients']:,})")
 
     ax.set_xlabel("NEE dose (mcg/kg/min)", fontsize=11)
     ax.set_ylabel("P(vasopressin on)", fontsize=11)
@@ -1300,18 +1573,23 @@ def plot_approach2_nee_by_group(
     print(f"  Saved: {out.name}")
 
 
+# Minimum patients per cell for outcome heatmaps (privacy floor + stability).
+# Must be defined before _draw_outcome_heatmap uses it as a default argument.
+_MIN_CELL_HM = 11
+
 # ── Location transition heatmap ───────────────────────────────────────────────
 def _draw_transition_heatmap(
     counts: "pd.DataFrame",
     title: str,
     out_path: Path,
     loc_order: "list | None" = None,
+    min_cell: int = _MIN_CELL_HM,
 ) -> None:
     """Transition matrix heatmap: rows = start location, columns = end location.
 
     Color = count / row_total (row-normalised fraction, 0–1).
     Blank (white) cells have zero actual transitions.
-    Cell text = count on top, row_total in parentheses below.
+    Cells with count < min_cell show 'n<K' instead of the exact count.
     """
     # Square matrix over the canonical location universe
     if loc_order is not None:
@@ -1358,8 +1636,10 @@ def _draw_transition_heatmap(
             if cnt == 0:
                 ax.text(j, i, "—", ha="center", va="center",
                         fontsize=12, color="#cccccc")
+            elif cnt < min_cell:
+                ax.text(j, i, f"n<{min_cell}", ha="center", va="center",
+                        fontsize=9, color="#aaaaaa")
             else:
-                row_total = int(row_sums[i])
                 pct = frac[i, j] * 100
                 text_color = "white" if frac[i, j] > 0.55 else "black"
                 ax.text(
@@ -1454,7 +1734,6 @@ def plot_pooled_location_transition_heatmap(
 
 
 # ── Outcome-annotated location transition heatmaps ───────────────────────────
-_MIN_CELL_HM = 11
 
 
 def _compute_cell_outcomes(
@@ -1775,21 +2054,706 @@ def export_coefficient_table(model: dict) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-def export_group_intercept_table(group_result: dict) -> pd.DataFrame:
-    """One row per hospital / ICU-ward-type: fixed-effects intercept (the
-    input to DL pooling), SE, n_patients, n_vaso_on — persists what
-    fit_grouped_variance already prints to console."""
+def export_group_intercept_table(structural_model: dict, label: str = "ward") -> pd.DataFrame:
+    """One row per ward/ICU-type or hospital: effective logit intercept (delta-method SE),
+    n_patients — from fit_site_logistic_with_structure's effective intercepts.
+
+    label: "ward"     → reads ward_effective_intercepts
+           "hospital" → reads hospital_effective_intercepts
+    """
+    ei_key = "ward_effective_intercepts" if label == "ward" else "hospital_effective_intercepts"
     rows = []
-    for grp, m in group_result.get("group_models", {}).items():
-        c = m["coefficients"]["intercept"]
+    for grp, v in structural_model.get(ei_key, {}).items():
         rows.append({
-            "group": grp, "alpha": c["beta"], "se": c["se"],
-            "n_patients": m["n_patients"], "n_vaso_on": m["n_vaso_on"],
+            "group": grp, "alpha": v["alpha"], "se": v["se"],
+            "n_patients": v["n_patients"],
+            "is_reference": v.get("is_reference", False),
+            "stable": v.get("stable", True),
         })
     return pd.DataFrame(rows)
 
 
 # ── Site discovery & main logic ───────────────────────────────────────────────
+def compute_dlmm_stats(cohort_by_site: dict, features_by_site: dict, bin_cols: list = None) -> dict:
+    """Compute per-outcome DLMM aggregate statistics for all sites.
+
+    bin_cols: list of binary covariate names to include; defaults to _BIN_COLS_MODELS.
+    Extra columns (e.g. OD criterion flags) must already be present in cohort_by_site[site].
+
+    Each site's statistics are mathematically sufficient for the coordinating
+    script (08) to fit a Distributed Linear Mixed Model (Luo et al., Nat
+    Commun 2022) without accessing patient-level data. One round of
+    communication, no iteration.
+
+    Covariates centered at _DLMM_REFS — pre-specified so all sites share the
+    same column interpretation without a coordination round.
+
+    Shared base design matrix (both outcomes):
+      [1, age-65, p_f_ratio-200, creatinine-1, platelet-150,
+       bilirubin-1, gcs-15, rrt, device_non_invasive, device_invasive_imv]
+
+    device_category is encoded via 3 canonical buckets (Room Air = reference):
+      device_non_invasive : 1 if NIV / CPAP / BiPAP / high-flow O2
+      device_invasive_imv : 1 if invasive mechanical ventilation / intubation
+    IMV check takes priority (avoids ambiguity with "non-invasive ventilation").
+
+    Outcome-specific extra covariate:
+      time_to_vaso_h_log1p outcome: + nee (NEE dose at vaso initiation, -0.15)
+      nee_at_init outcome:          + time_to_vaso_h_log1p (log1p hours, -1.79)
+
+    Outcomes (vasopressin-user population only):
+      time_to_vaso_h_log1p : log(1 + hours from NE start to first vasopressin)
+      nee_at_init           : NEE-equivalent dose (mcg/kg/min) at initiation
+
+    Random effect: Z_i = column of 1s (random site intercept).
+    ZtZ = n (scalar), ZtX = col sums of X, Zty = sum(y) — all already in sx/sy/n;
+    also stored under explicit "ztz"/"ztx"/"zty" keys for clarity in script 08.
+
+    Returned dict: {site: {outcome_key: {n, XtX, Xty, yty, sx, sy, ztz, ztx, zty, ...}}}
+    """
+    _BIN_COLS = bin_cols if bin_cols is not None else _BIN_COLS_MODELS
+    _FEAT_COVS = ["p_f_ratio", "creatinine", "platelet", "bilirubin", "gcs", "rrt"]
+    # Canonical device buckets — portable across sites with different vocabularies.
+    # Room Air = reference (no dummy). Check IMV first (takes priority over NIV matches).
+    _IMV_KWDS    = [r"\binvasive\b", "imv", "intubat", "mechanic", "ett", "endotrach"]
+    _NONIMV_KWDS = [r"non.?inv", r"niv\b", "cpap", "bipap", r"high.?flow", "high_flow"]
+
+    results: dict = {}
+
+    for site, cohort in cohort_by_site.items():
+        features = features_by_site.get(site)
+        if features is None or cohort is None:
+            continue
+
+        if "action_vaso" not in features.columns:
+            print(f"  [{site}] DLMM: action_vaso column missing — skipping")
+            continue
+
+        vaso_rows = features[(features["action_vaso"] == 1) & (features["time_hour"] >= 0)]
+        if vaso_rows.empty:
+            print(f"  [{site}] DLMM: no vasopressin events — skipping")
+            continue
+
+        first_vhr = (
+            vaso_rows.groupby("stay_id")["time_hour"]
+            .min()
+            .reset_index()
+            .rename(columns={"time_hour": "time_to_vaso_h"})
+        )
+
+        # Start with age + timing; binary comorbidities merged in below
+        _cohort_base_cols = ["stay_id", "age"] + [c for c in _BIN_COLS
+                                                   if c in cohort.columns]
+        pat = (
+            cohort[_cohort_base_cols]
+            .merge(first_vhr, on="stay_id", how="inner")
+            .dropna(subset=["age", "time_to_vaso_h"])
+        )
+        # Fill any missing binary cols (site may not have procedures/diagnosis table)
+        for _bc in _BIN_COLS:
+            if _bc in pat.columns:
+                pat[_bc] = pat[_bc].fillna(0.0)
+
+        # Grab NEE + device_category + severity covariates at the initiation hour,
+        # plus raw NE dose, MAP, lactate, BUN for the feature-bin scatter plots.
+        _BIN_EXTRAS = ["norepinephrine", "mbp", "lactate", "bun"]
+        grab_cols = [c for c in ["nee", "device_category"] + _BIN_EXTRAS + _FEAT_COVS
+                     if c in features.columns]
+        if grab_cols:
+            vt = pat[["stay_id", "time_to_vaso_h"]].copy()
+            vt["_init_hr"] = vt["time_to_vaso_h"].astype(int)
+            feat_at = (
+                features[["stay_id", "time_hour"] + grab_cols]
+                .merge(vt[["stay_id", "_init_hr"]], on="stay_id", how="inner")
+            )
+            feat_at = feat_at[feat_at["time_hour"] == feat_at["_init_hr"]]
+            feat_at = feat_at.groupby("stay_id")[grab_cols].first().reset_index()
+            pat = pat.merge(feat_at, on="stay_id", how="left")
+
+        # Canonical device buckets (Room Air = reference, no dummy).
+        # IMV check takes priority: "non-invasive ventilation" → non-invasive, not IMV.
+        import re as _re
+        if "device_category" in pat.columns:
+            dcl = pat["device_category"].fillna("").astype(str).str.lower()
+            pat["device_invasive_imv"]  = dcl.apply(
+                lambda x: float(any(_re.search(kw, x) for kw in _IMV_KWDS))
+            )
+            pat["device_non_invasive"] = dcl.apply(
+                lambda x: float(
+                    not any(_re.search(kw, x) for kw in _IMV_KWDS)
+                    and any(_re.search(kw, x) for kw in _NONIMV_KWDS)
+                )
+            )
+        else:
+            pat["device_invasive_imv"]  = 0.0
+            pat["device_non_invasive"] = 0.0
+
+        # log1p(time_to_vaso_h) used as a predictor in the nee_at_init model
+        pat["time_to_vaso_h_log1p"] = np.log1p(pat["time_to_vaso_h"])
+
+        # ── Attach ward/hospital location for 4-level variance decomp ───────
+        # Merge from cohort: location_type / location_category → canonical ward,
+        # hospital_id / hospital_type (when present) for hospital-level ICC.
+        _loc_cols = [c for c in ["location_type", "location_category",
+                                  "hospital_id", "hospital_type"]
+                     if c in cohort.columns]
+        if _loc_cols:
+            loc_df = cohort[["stay_id"] + _loc_cols].copy()
+            loc_df["_ward"] = _canon_icu_series(_effective_location(loc_df))
+            _hcols = [c for c in ["hospital_id", "hospital_type"] if c in loc_df.columns]
+            pat = pat.merge(loc_df[["stay_id", "_ward"] + _hcols],
+                            on="stay_id", how="left")
+
+        # ── Attach SOFA for feature-bin scatter plots ─────────────────────
+        # Use first available SOFA column from cohort (sofa > sofa_total).
+        _sofa_col = next((c for c in ["sofa", "sofa_total", "sepsis_onset_sofa"]
+                          if c in cohort.columns), None)
+        if _sofa_col:
+            pat = pat.merge(cohort[["stay_id", _sofa_col]].rename(columns={_sofa_col: "_sofa"}),
+                            on="stay_id", how="left")
+
+        if len(pat) < 5:
+            continue
+
+        # Binary comorbidity covariates — prevalence-screened at patient level
+        _bin_dlmm = []
+        for _bc in _BIN_COLS:
+            if _bc not in pat.columns:
+                continue
+            _prev = float((pat[_bc] == 1).mean())
+            if _prev >= _MIN_BIN_PREVALENCE:
+                _bin_dlmm.append(_bc)
+            else:
+                print(f"  [{site}] DLMM: {_bc} prevalence {_prev:.1%} — excluded")
+
+        # Shared base covariates: SOFA components + device dummies + binary comorbidities
+        _BASE_COV = (["age"]
+                     + [c for c in _FEAT_COVS if c in pat.columns]
+                     + ["device_non_invasive", "device_invasive_imv"]
+                     + _bin_dlmm)
+
+        # Per-outcome covariate lists:
+        #   time_to_vaso model: + NEE at vaso initiation (the dose "threshold" clinicians waited for)
+        #   nee_at_init  model: + log1p(time) elapsed before initiation
+        _COV_TIME = _BASE_COV + (["nee"] if "nee" in pat.columns else [])
+        _COV_NEE  = _BASE_COV + ["time_to_vaso_h_log1p"]
+
+        def _cov_names(cov_cols_: list) -> list:
+            """Human-readable column names: plain name for 0-reference, name_minus_ref otherwise."""
+            names = ["intercept"]
+            for c in cov_cols_:
+                ref = _DLMM_REFS.get(c, 0.0)
+                if ref == 0.0:
+                    names.append(c)
+                elif ref == int(ref):
+                    names.append(f"{c}_minus_{int(ref)}")
+                else:
+                    names.append(f"{c}_minus_{ref:.2f}")
+            return names
+
+        def _build_X(mask_: np.ndarray, cov_cols_: list) -> np.ndarray:
+            cols = [np.ones(mask_.sum())]
+            for c in cov_cols_:
+                arr = pat[c].values.astype(float)
+                cols.append(arr[mask_] - _DLMM_REFS.get(c, 0.0))
+            return np.column_stack(cols)
+
+        def _finite_mask(cov_cols_: list) -> np.ndarray:
+            m = np.ones(len(pat), dtype=bool)
+            for c in cov_cols_:
+                m &= np.isfinite(pat[c].values.astype(float))
+            return m
+
+        def _ward_hosp_stats(y: np.ndarray, mask_: np.ndarray) -> dict:
+            """Per-ward and per-hospital mean/SD/N for DL pooling in 08.
+
+            Only groups with >= MIN_ICU_N_PATIENTS patients are included.
+            Returns dict with keys 'ward_stats', 'hospital_stats',
+            'hospital_type_stats' — each a list of {group, n, mean, sd, se}.
+            """
+            out: dict = {}
+            _group_cols = [("_ward", "ward_stats")]
+            for hcol in ["hospital_id", "hospital_type"]:
+                if hcol in pat.columns:
+                    _group_cols.append((hcol, f"{hcol}_stats"))
+            for col, key in _group_cols:
+                if col not in pat.columns:
+                    continue
+                groups = pat[col].values[mask_]
+                grp_set = sorted(
+                    {g for g in groups
+                     if pd.notna(g) and str(g).lower() not in ["nan", "other", "other icu"]},
+                    key=str,
+                )
+                rows = []
+                for g in grp_set:
+                    sel = groups == g
+                    yn  = y[sel]
+                    n   = int(sel.sum())
+                    if n < MIN_ICU_N_PATIENTS:
+                        continue
+                    rows.append({
+                        "group": str(g),
+                        "n":     n,
+                        "mean":  round(float(yn.mean()), 6),
+                        "sd":    round(float(yn.std(ddof=1)), 6) if n > 1 else 0.0,
+                        "se":    round(float(yn.std(ddof=1) / np.sqrt(n)), 6) if n > 1 else 0.0,
+                    })
+                if len(rows) >= 2:
+                    out[key] = rows
+            return out
+
+        def _outcome_feature_bins(y: np.ndarray, mask_: np.ndarray) -> dict:
+            """Per-bin mean/SD of outcome y, grouped by patient features.
+
+            Used for the feature-bin scatter plot in 10 — each dot = one
+            feature bin at one site, axes = (SD, mean) of the outcome.
+            Only bins with >= 5 patients included.
+
+            Features computed:
+              sofa         — integer SOFA bins
+              age_10bins   — age in 10 quantile groups
+              ne_dose      — NE dose at initiation (5 quantile bins)
+              nee_dose     — NEE-equivalent dose at initiation (5 quantile bins)
+              map          — MAP at initiation (5 quantile bins)
+              lactate      — lactate at initiation (5 quantile bins)
+              creatinine   — creatinine at initiation (5 quantile bins)
+              bun          — BUN at initiation (5 quantile bins)
+              time_to_vaso — hours from NE start to vasopressin (5 quantile bins)
+            """
+            out: dict = {}
+
+            def _bin_stats(feature_vals, y_, label_fn) -> list:
+                rows = []
+                for uval in sorted(set(feature_vals)):
+                    if not np.isfinite(uval):
+                        continue
+                    sel = feature_vals == uval
+                    yn  = y_[sel]
+                    n   = int(sel.sum())
+                    if n < 5:
+                        continue
+                    rows.append({
+                        "bin_label": label_fn(uval),
+                        "bin_value": float(uval),
+                        "n":         n,
+                        "mean":      round(float(yn.mean()), 4),
+                        "sd":        round(float(yn.std(ddof=1)), 4) if n > 1 else 0.0,
+                    })
+                return rows
+
+            def _qbins(col: str, key: str, n_bins: int = 5, fmt: str = ".2g") -> None:
+                """Quantile-bin pat[col] → n_bins groups; store per-bin mean/SD of y."""
+                if col not in pat.columns:
+                    return
+                arr = pat[col].values.astype(float)[mask_]
+                fin = np.isfinite(arr)
+                if fin.sum() < n_bins * 5:
+                    return
+                arr_ok = arr[fin]
+                edges  = np.unique(np.percentile(arr_ok, np.linspace(0, 100, n_bins + 1)))
+                if len(edges) < 2:
+                    return
+                quantized = np.full(len(arr), np.nan)
+                centers, labels = [], []
+                for i in range(len(edges) - 1):
+                    lo, hi = edges[i], edges[i + 1]
+                    last   = (i == len(edges) - 2)
+                    sel    = (arr >= lo) & (arr <= hi if last else arr < hi)
+                    mid    = round(float((lo + hi) / 2), 4)
+                    quantized[sel] = mid
+                    centers.append(mid)
+                    labels.append(f"{lo:{fmt}}–{hi:{fmt}}")
+                lbl_map = {c: l for c, l in zip(centers, labels)}
+                fin2    = np.isfinite(quantized)
+                rows    = _bin_stats(
+                    quantized[fin2], y[fin2],
+                    lambda v, m=lbl_map: m.get(v, str(v)),
+                )
+                if rows:
+                    out[key] = rows
+
+            # ── SOFA by integer value ────────────────────────────────────────
+            if "_sofa" in pat.columns:
+                sofa_arr = pat["_sofa"].values.astype(float)[mask_]
+                sofa_arr = np.round(sofa_arr).astype(float)  # snap to integer
+                rows = _bin_stats(sofa_arr, y, lambda v: str(int(v)))
+                if rows:
+                    out["sofa"] = rows
+
+            # ── Age in 10 quantile bins ──────────────────────────────────────
+            age_arr = pat["age"].values.astype(float)[mask_]
+            age_ok  = age_arr[np.isfinite(age_arr)]
+            if len(age_ok) >= 20:
+                edges = np.percentile(age_ok, np.linspace(0, 100, 11))
+                edges = np.unique(edges)
+                bin_centers = []
+                bin_labels  = []
+                quantized   = np.full(len(age_arr), np.nan)
+                for i in range(len(edges) - 1):
+                    lo, hi = edges[i], edges[i + 1]
+                    sel = (age_arr >= lo) & (age_arr <= hi if i == len(edges) - 2 else age_arr < hi)
+                    mid = round((lo + hi) / 2, 1)
+                    quantized[sel] = mid
+                    bin_centers.append(mid)
+                    bin_labels.append(f"{int(lo)}-{int(hi)}")
+                # Override with edge labels for bin_stats label_fn
+                _lbl_map = {c: l for c, l in zip(bin_centers, bin_labels)}
+                rows = _bin_stats(
+                    quantized[np.isfinite(quantized)],
+                    y[np.isfinite(quantized)],
+                    lambda v, m=_lbl_map: m.get(v, str(v)),
+                )
+                if rows:
+                    out["age_10bins"] = rows
+
+            # ── Clinical feature quantile bins (5 groups each) ───────────────
+            _qbins("norepinephrine", "ne_dose",     fmt=".2g")
+            _qbins("nee",            "nee_dose",    fmt=".2g")
+            _qbins("mbp",            "map",         fmt=".0f")
+            _qbins("lactate",        "lactate",     fmt=".1f")
+            _qbins("creatinine",     "creatinine",  fmt=".1f")
+            _qbins("bun",            "bun",         fmt=".0f")
+            _qbins("time_to_vaso_h", "time_to_vaso", fmt=".0f")
+
+            return out
+
+        def _stats(y: np.ndarray, X: np.ndarray, mask_: np.ndarray,
+                   transform: str, unit: str, cov_names_: list) -> dict:
+            n_  = int(len(y))
+            sx_ = X.sum(axis=0).tolist()
+            sy_ = float(y.sum())
+            result = {
+                "n":                 n_,
+                "XtX":               (X.T @ X).tolist(),
+                "Xty":               (X.T @ y).tolist(),
+                "yty":               float(y @ y),
+                "sx":                sx_,
+                "sy":                sy_,
+                # ZtZ / ZtX / Zty — explicit DLMM labels for the random site intercept.
+                # Z_i = column of 1s  →  Z'Z = n,  Z'X = col sums of X,  Z'y = sum(y).
+                "ztz":               n_,
+                "ztx":               sx_,
+                "zty":               sy_,
+                "covariate_names":   cov_names_,
+                "outcome_transform": transform,
+                "y_mean":            float(y.mean()),
+                "y_sd":              float(y.std(ddof=1)) if len(y) > 1 else 0.0,
+                "unit":              unit,
+            }
+            result.update(_ward_hosp_stats(y, mask_))
+            result["feature_bin_stats"] = _outcome_feature_bins(y, mask_)
+            return result
+
+        site_stats: dict = {}
+
+        # ── Outcome 1: log(1 + hours to vasopressin) ────────────────────────
+        names1 = _cov_names(_COV_TIME)
+        mask1 = (
+            _finite_mask(_COV_TIME)
+            & np.isfinite(pat["time_to_vaso_h"].values)
+            & (pat["time_to_vaso_h"].values >= 0)
+        )
+        if mask1.sum() >= 5:
+            y1 = np.log1p(pat["time_to_vaso_h"].values[mask1])
+            site_stats["time_to_vaso_h_log1p"] = _stats(
+                y1, _build_X(mask1, _COV_TIME), mask1, "log1p(hours)", "log1p-hours", names1
+            )
+
+        # ── Outcome 2: NEE dose at vasopressin initiation ───────────────────
+        nee_vals = pat["nee"].values if "nee" in pat.columns else np.full(len(pat), np.nan)
+        names2 = _cov_names(_COV_NEE)
+        mask2 = (
+            _finite_mask(_COV_NEE)
+            & np.isfinite(nee_vals)
+            & (nee_vals >= 0)
+        )
+        if mask2.sum() >= 5:
+            y2 = nee_vals[mask2]
+            site_stats["nee_at_init"] = _stats(
+                y2, _build_X(mask2, _COV_NEE), mask2, "raw (mcg/kg/min)", "mcg/kg/min", names2
+            )
+
+        if site_stats:
+            results[site] = site_stats
+            for ok, s in site_stats.items():
+                p_val = len(s["covariate_names"])
+                print(f"  [{site}] DLMM {ok}: n={s['n']} (p={p_val}), "
+                      f"mean={s['y_mean']:.3f} ({s['outcome_transform']})")
+
+    return results
+
+
+# ── CVC stratification table ──────────────────────────────────────────────────
+
+def compute_cvc_stratification(cohort_by_site: dict, features_by_site: dict) -> dict:
+    """Descriptive table: time-to-vaso and NEE-at-initiation by CVC-before-NE status.
+
+    Among vasopressin initiators in each cohort, compares patients who had a CVC
+    placed *before* their first NE dose ('CVC before NE start') vs. those who did
+    not.  The hypothesis is that pre-existing vascular access may facilitate
+    earlier or lower-dose vasopressin initiation.
+
+    Outcomes (vasopressin-user population only):
+      time_to_vaso_h  : hours from NE start to first vasopressin
+      nee_at_init     : NEE-equivalent dose (mcg/kg/min) at vasopressin initiation
+      cvc_lead_h      : hours by which CVC preceded NE start (CVC=1 group only)
+
+    Returns {site: pd.DataFrame} where each DataFrame has two rows (cvc_flag=1/0)
+    with summary statistics and Mann-Whitney U p-values.
+    """
+    from scipy import stats as _scipy_stats
+
+    def _med_iqr(s: pd.Series) -> tuple:
+        s = s.dropna()
+        if len(s) < 5:
+            return np.nan, np.nan, np.nan
+        return float(s.median()), float(s.quantile(0.25)), float(s.quantile(0.75))
+
+    results: dict = {}
+
+    for site, cohort in cohort_by_site.items():
+        features = features_by_site.get(site)
+        if features is None:
+            continue
+        if "cvc_before_ne_start" not in cohort.columns:
+            print(f"  [{site}] CVC stratification: cvc_before_ne_start not in cohort — skipping")
+            continue
+        if "action_vaso" not in features.columns:
+            print(f"  [{site}] CVC stratification: action_vaso not in features — skipping")
+            continue
+
+        # ── Vasopressin initiators: first vaso hour per patient ───────────────
+        vaso_rows = features[(features["action_vaso"] == 1) & (features["time_hour"] >= 0)]
+        if vaso_rows.empty:
+            print(f"  [{site}] CVC stratification: no vasopressin events — skipping")
+            continue
+
+        first_vhr = (
+            vaso_rows.groupby("stay_id")["time_hour"]
+            .min()
+            .reset_index()
+            .rename(columns={"time_hour": "time_to_vaso_h"})
+        )
+
+        # NEE at the initiation hour (take the row where time_hour == floor(time_to_vaso_h))
+        vt2 = first_vhr.copy()
+        vt2["_init_hr"] = vt2["time_to_vaso_h"].astype(int)
+        feat_init = (
+            features[["stay_id", "time_hour", "nee"]]
+            .merge(vt2[["stay_id", "_init_hr"]], on="stay_id", how="inner")
+        )
+        feat_init = feat_init[feat_init["time_hour"] == feat_init["_init_hr"]]
+        nee_init = (
+            feat_init[["stay_id", "nee"]]
+            .drop_duplicates("stay_id")
+            .rename(columns={"nee": "nee_at_init"})
+        )
+
+        # ── Merge with cohort for CVC flag and timestamps ─────────────────────
+        cvc_cols = ["stay_id", "cvc_before_ne_start"]
+        if "first_cvc_dttm" in cohort.columns and "first_norepi_time" in cohort.columns:
+            cvc_cols += ["first_cvc_dttm", "first_norepi_time"]
+
+        pat = (
+            cohort[cvc_cols]
+            .merge(first_vhr, on="stay_id", how="inner")
+            .merge(nee_init,  on="stay_id", how="left")
+        )
+
+        # CVC lead time: hours by which CVC preceded NE start (positive = CVC first)
+        if "first_cvc_dttm" in pat.columns and "first_norepi_time" in pat.columns:
+            _fcvc = pd.to_datetime(pat["first_cvc_dttm"],    utc=True, errors="coerce")
+            _fne  = pd.to_datetime(pat["first_norepi_time"], utc=True, errors="coerce")
+            pat["cvc_lead_h"] = (_fne - _fcvc).dt.total_seconds() / 3600.0
+        else:
+            pat["cvc_lead_h"] = np.nan
+
+        # ── Summary statistics by group ───────────────────────────────────────
+        rows = []
+        for cvc_flag, label in [(1, "CVC before NE start"), (0, "No CVC before NE start")]:
+            grp = pat[pat["cvc_before_ne_start"] == cvc_flag]
+            tv_med, tv_q25, tv_q75 = _med_iqr(grp["time_to_vaso_h"])
+            ni_med, ni_q25, ni_q75 = _med_iqr(grp["nee_at_init"])
+            cl_med, cl_q25, cl_q75 = (
+                _med_iqr(grp["cvc_lead_h"]) if cvc_flag == 1 else (np.nan, np.nan, np.nan)
+            )
+            rows.append({
+                "site":                  site,
+                "cvc_group":             label,
+                "cvc_flag":              cvc_flag,
+                "n_vaso_initiators":     len(grp),
+                "time_to_vaso_h_median": tv_med,
+                "time_to_vaso_h_q25":    tv_q25,
+                "time_to_vaso_h_q75":    tv_q75,
+                "nee_at_init_median":    ni_med,
+                "nee_at_init_q25":       ni_q25,
+                "nee_at_init_q75":       ni_q75,
+                # CVC lead time (hours CVC preceded NE; CVC=1 group only)
+                "cvc_lead_h_median":     cl_med,
+                "cvc_lead_h_q25":        cl_q25,
+                "cvc_lead_h_q75":        cl_q75,
+            })
+
+        # ── Mann-Whitney U tests ──────────────────────────────────────────────
+        g1 = pat[pat["cvc_before_ne_start"] == 1]
+        g0 = pat[pat["cvc_before_ne_start"] == 0]
+        tv1, tv0 = g1["time_to_vaso_h"].dropna(), g0["time_to_vaso_h"].dropna()
+        ni1, ni0 = g1["nee_at_init"].dropna(),    g0["nee_at_init"].dropna()
+
+        tv_p = (
+            _scipy_stats.mannwhitneyu(tv1, tv0, alternative="two-sided").pvalue
+            if len(tv1) >= 5 and len(tv0) >= 5 else np.nan
+        )
+        ni_p = (
+            _scipy_stats.mannwhitneyu(ni1, ni0, alternative="two-sided").pvalue
+            if len(ni1) >= 5 and len(ni0) >= 5 else np.nan
+        )
+
+        df_out = pd.DataFrame(rows)
+        df_out["n_total_vaso_initiators"] = len(pat)
+        df_out["time_to_vaso_p"] = tv_p    # same p-value repeated on both rows
+        df_out["nee_at_init_p"]  = ni_p
+
+        print(
+            f"  [{site}] CVC strat: CVC-before n={len(g1)}, no-CVC n={len(g0)}, "
+            f"time-to-vaso p={tv_p:.3g}, NEE-at-init p={ni_p:.3g}"
+        )
+        results[site] = df_out
+
+    return results
+
+
+# ── Model variant comparison (original / +comorbid / +Rhee-OD) ───────────────
+# Binary OD criterion flags derivable without re-running 01:
+#   od_lactate    : initial_lactate >= 2.0 mmol/L (Rhee/lactate arm — in cohort parquet)
+#   od_coagulation: platelet < 100 K/µL at NE start (Rhee thrombocytopenia criterion)
+#   od_liver      : bilirubin > 2.0 mg/dL at NE start (Rhee hyperbilirubinemia criterion)
+# IMV and AKI/RRT criteria are already captured by device dummies and rrt/creatinine
+# covariates in the base model; these three add threshold-specific binary signals.
+_OD_COLS_RHEE = ["od_lactate", "od_coagulation", "od_liver"]
+
+
+def compute_model_variants(
+    cohort_label: str,
+    cohort_by_site: dict,
+    ph_by_site: dict,
+    features_by_site: dict,
+) -> dict:
+    """Run three model variants and return comparison dict for storage in the packet.
+
+    v1_original  — SOFA components + age + device + RRT + RCS(NEE,time); no comorbidities
+    v2_comorbid  — v1 + 5 comorbidity binaries (current specification)
+    v3_rhee_od   — v2 + 3 Rhee OD criterion binary flags; Rhee cohorts only
+
+    For each variant, computes:
+      - DL random-effects pooling of site intercepts → tau2, ICC, MOR
+      - DLMM sufficient statistics for 08 to fit LMMs and compute DLMM ICCs
+
+    Returns: {variant_name: {"bin_cols": [...], "dl": {...}, "dlmm_stats": {...}}}
+    """
+    # ── Variant definitions ──────────────────────────────────────────────────
+    _variants: dict = {
+        "v1_original": [],
+        "v2_comorbid": list(_BIN_COLS_MODELS),
+    }
+
+    # ── Derive Rhee OD criterion flags for v3 (Rhee cohorts only) ────────────
+    _od_cohort_by_site: dict = {}
+    _od_ph_by_site: dict    = {}
+    if cohort_label.startswith("rhee"):
+        for _s in cohort_by_site:
+            _coh = cohort_by_site[_s].copy()
+            _ph  = ph_by_site.get(_s, pd.DataFrame()).copy()
+
+            # od_lactate: initial_lactate >= 2.0 mmol/L (in cohort parquet)
+            if "initial_lactate" in _coh.columns:
+                _coh["od_lactate"] = (
+                    _coh["initial_lactate"].fillna(0.0) >= 2.0
+                ).astype(float)
+            else:
+                _coh["od_lactate"] = 0.0
+
+            # od_coagulation: platelet < 100 — use first available value per stay in ph
+            if not _ph.empty and "platelet" in _ph.columns:
+                _first_plt = _ph.groupby("stay_id")["platelet"].first()
+                _coh["od_coagulation"] = (
+                    _coh["stay_id"].map(_first_plt < 100.0).fillna(False)
+                ).astype(float)
+            else:
+                _coh["od_coagulation"] = 0.0
+
+            # od_liver: bilirubin > 2.0 mg/dL — use first available value per stay
+            if not _ph.empty and "bilirubin" in _ph.columns:
+                _first_bili = _ph.groupby("stay_id")["bilirubin"].first()
+                _coh["od_liver"] = (
+                    _coh["stay_id"].map(_first_bili > 2.0).fillna(False)
+                ).astype(float)
+            else:
+                _coh["od_liver"] = 0.0
+
+            _od_cohort_by_site[_s] = _coh
+
+            if not _ph.empty:
+                _od_merge = _coh[["stay_id"] + _OD_COLS_RHEE].copy()
+                for _c in _OD_COLS_RHEE:
+                    if _c not in _ph.columns:
+                        _ph = _ph.merge(_od_merge[["stay_id", _c]], on="stay_id", how="left")
+                        _ph[_c] = _ph[_c].fillna(0.0)
+                _od_ph_by_site[_s] = _ph
+
+        _variants["v3_rhee_od"] = list(_BIN_COLS_MODELS) + _OD_COLS_RHEE
+
+    # ── Run each variant ─────────────────────────────────────────────────────
+    variant_results: dict = {}
+    for _vname, _bin_cols in _variants.items():
+        print(f"  [variant: {_vname}]  bin_cols={_bin_cols or '(none)'}")
+
+        _coh_dict = _od_cohort_by_site if _vname == "v3_rhee_od" else cohort_by_site
+        _ph_dict  = _od_ph_by_site     if _vname == "v3_rhee_od" else ph_by_site
+
+        # Fit per-site GLMs with this covariate set
+        _vsite_models: dict = {}
+        for _s in _ph_dict:
+            try:
+                _vsite_models[_s] = fit_site_logistic(
+                    _ph_dict[_s], cohort_label, _s, bin_cols=_bin_cols
+                )
+                _m = _vsite_models[_s]
+                print(f"    [{_s}] p={len(_m['coefficients'])}  "
+                      f"α={_m['coefficients']['intercept']['beta']:+.4f}")
+            except Exception as _exc:
+                print(f"    [{_s}] GLM failed: {_exc}")
+
+        if not _vsite_models:
+            print(f"    No models fitted — skipping {_vname}.")
+            continue
+
+        # DL random-effects pooling of site intercepts
+        _slist     = sorted(_vsite_models)
+        _alphas    = np.array([_vsite_models[_s]["coefficients"]["intercept"]["beta"]
+                               for _s in _slist])
+        _alpha_var = np.array([_vsite_models[_s]["coefficients"]["intercept"]["se"]
+                               for _s in _slist]) ** 2
+        _dl = _dl_pool(_alphas, _alpha_var) if len(_slist) >= 2 else {}
+        if _dl:
+            print(f"    DL  tau2={_dl['tau2']:.4f}  ICC={_dl['icc']:.3f}  MOR={_dl['mor']:.3f}")
+        else:
+            print(f"    DL  (only 1 site — no pooling)")
+
+        # DLMM sufficient stats for this variant
+        _dlmm = compute_dlmm_stats(_coh_dict, features_by_site, bin_cols=_bin_cols)
+
+        variant_results[_vname] = {
+            "bin_cols":    _bin_cols,
+            "n_sites":     len(_slist),
+            "dl":          _dl,
+            "dlmm_stats":  _dlmm,
+        }
+
+    return variant_results
+
+
 def _discover_sites(output_root: Path) -> list:
     return sorted(
         p.name.replace("patient_level_data_", "")
@@ -1878,69 +2842,42 @@ def run_for_cohort(cohort_label: str):
     else:
         print("  Skipping: only 1 site available.")
 
-    # ── Approach 3: ward/ICU-type + hospital variance + 4-level decomposition ──
-    # Ward/hospital fitting only needs this site's own data — always run it.
-    # The 4-level decomposition also needs cross-site tau2 (dl_tau2 from mixed
-    # effects); if that's unavailable (single-site run), we store ward/hospital
-    # results in the packet so the coordinating script can backfill it later.
-    print("\n--- Approach 3: Ward/ICU-type + hospital variance + 4-level decomposition ---")
-    ward_results:          dict = {}
-    hospital_results:      dict = {}
-    hospital_type_results: dict = {}
-    variance_decomp:       dict = {}
+    # ── Approach 3: expanded model with ward/ICU-type + hospital fixed effects ──
+    # Fits one expanded logistic GLM per site using site-wide centering so
+    # effective intercepts are comparable across groups (no reference-shift bias).
+    # DL-pools the effective intercepts to get tau2_ward / tau2_hosp.
+    # Results feed directly into covariate_variance_explained via structural_models.
+    print("\n--- Approach 3: Expanded structural model (ward/ICU-type + hospital dummies) ---")
+    structural_models: dict = {}
     for site in site_models:
-        print(f"\n  [{site}] ward/ICU type:")
-        ward_results[site] = fit_ward_level_variance(
-            cohort_by_site[site], ph_by_site[site], cohort_label, site
-        )
-        print(f"  [{site}] hospital:")
-        hospital_results[site] = fit_hospital_level_variance(
-            cohort_by_site[site], ph_by_site[site], cohort_label, site
-        )
-        if me_result.get("dl_tau2") is not None:
-            decomp = compute_variance_decomposition(
-                ward_results[site], hospital_results[site], me_result
+        print(f"\n  [{site}] fitting expanded model:")
+        try:
+            structural_models[site] = fit_site_logistic_with_structure(
+                ph_by_site[site], cohort_by_site[site], cohort_label, site
             )
-            if decomp:
-                variance_decomp[site] = decomp
-                print(f"    Patient-specific factors accounted for {decomp['pct_patient']:.1f}% of "
-                      f"variation; {decomp['pct_ward']:.1f}%, {decomp['pct_hospital']:.1f}%, and "
-                      f"{decomp['pct_site']:.1f}% were attributed to ward/ICU type, hospital, and "
-                      f"CLIF site respectively.")
-                plot_variance_decomposition(decomp, cross_out, cohort_label, site)
-        else:
-            print(f"  [{site}] variance decomposition deferred — no cross-site τ² available "
-                  f"(single-site run); coordinating script will backfill from cross-site analysis.")
-        plot_group_intercepts(ward_results[site], cross_out, cohort_label, site, "ward")
-        plot_group_intercepts(hospital_results[site], cross_out, cohort_label, site, "hospital")
+            sm = structural_models[site]
+            n_wards = len(sm.get("ward_effective_intercepts", {}))
+            n_hosps = len(sm.get("hospital_effective_intercepts", {}))
+            print(f"    {n_wards} wards  ·  {n_hosps} hospitals  ·  "
+                  f"τ²_ward={sm.get('tau2_ward')}  τ²_hosp={sm.get('tau2_hosp')}")
+        except Exception as _e:
+            import traceback
+            print(f"    WARNING: structural model failed for {site}: {_e}")
+            traceback.print_exc()
+            structural_models[site] = {}
+        sm = structural_models.get(site, {})
+        plot_group_intercepts(sm, cross_out, cohort_label, site, "ward")
+        plot_group_intercepts(sm, cross_out, cohort_label, site, "hospital")
         # Approach 2A/2B broken down by ward/ICU-type and hospital
-        plot_approach2_time_by_group(
-            ward_results[site], cross_out, cohort_label, site, "ward"
-        )
-        plot_approach2_nee_by_group(
-            ward_results[site], ph_by_site[site], cross_out, cohort_label, site, "ward"
-        )
-        plot_approach2_time_by_group(
-            hospital_results[site], cross_out, cohort_label, site, "hospital"
-        )
-        plot_approach2_nee_by_group(
-            hospital_results[site], ph_by_site[site], cross_out, cohort_label, site, "hospital"
-        )
-        print(f"  [{site}] hospital type (academic vs. community):")
-        hospital_type_results[site] = fit_hospital_type_variance(
-            cohort_by_site[site], ph_by_site[site], cohort_label, site
-        )
-        plot_approach2_time_by_group(
-            hospital_type_results[site], cross_out, cohort_label, site, "hospital_type"
-        )
-        plot_approach2_nee_by_group(
-            hospital_type_results[site], ph_by_site[site], cross_out, cohort_label, site, "hospital_type"
-        )
+        plot_approach2_time_by_group(sm, cross_out, cohort_label, site, "ward")
+        plot_approach2_nee_by_group(sm, ph_by_site[site], cross_out, cohort_label, site, "ward")
+        plot_approach2_time_by_group(sm, cross_out, cohort_label, site, "hospital")
+        plot_approach2_nee_by_group(sm, ph_by_site[site], cross_out, cohort_label, site, "hospital")
 
     # ── Covariate variance explained (Nakagawa & Schielzeth R²) ──────────────
     print("\n--- Covariate variance explained (Nakagawa & Schielzeth R²) ---")
     covar_variance: dict = compute_covariate_variance_explained(
-        ph_by_site, site_models, variance_decomp
+        ph_by_site, site_models, structural_models, me_result
     )
     for site in site_models:
         _cv_out = OUTPUT_ROOT / "output" / f"upload_to_box_{site}" / cohort_label
@@ -1950,6 +2887,29 @@ def run_for_cohort(cohort_label: str):
     # ── Location transition heatmaps ───────────────────────────────────────
     # Saved to upload_to_box so they are included in the consolidated report
     # and shared with the coordinating centre.
+    # ── DLMM aggregate statistics ─────────────────────────────────────────
+    # Federated-safe summary (X'X, X'y, y'y) for continuous practice outcomes.
+    # The coordinating script (08) will read these from the packet and run
+    # the REML optimization without any patient data leaving this site.
+    print("\n--- DLMM aggregate statistics (time-to-vaso, NEE at initiation) ---")
+    dlmm_stats = compute_dlmm_stats(cohort_by_site, features_by_site)
+
+    # ── Model variant comparison (v1 original / v2 comorbid / v3 Rhee-OD) ─────
+    print("\n--- Model variant comparison (original / +comorbid / +Rhee-OD) ---")
+    model_variants = compute_model_variants(
+        cohort_label, cohort_by_site, ph_by_site, features_by_site
+    )
+
+    # ── CVC stratification: time-to-vaso and NEE at initiation ───────────────
+    print("\n--- CVC stratification: time-to-vaso and NEE at initiation ---")
+    cvc_strat = compute_cvc_stratification(cohort_by_site, features_by_site)
+    for site, df_strat in cvc_strat.items():
+        _cvc_out = OUTPUT_ROOT / "output" / f"upload_to_box_{site}" / cohort_label
+        _cvc_out.mkdir(parents=True, exist_ok=True)
+        _cvc_path = _cvc_out / f"cvc_stratification_{cohort_label}_{site}.csv"
+        df_strat.to_csv(_cvc_path, index=False)
+        print(f"  Saved: cvc_stratification_{cohort_label}_{site}.csv")
+
     print("\n--- Location transition heatmaps ---")
     for site in site_models:
         plot_location_transition_heatmap(
@@ -1974,35 +2934,57 @@ def run_for_cohort(cohort_label: str):
     packet = {
         "site":             SITE_NAME,
         "cohort":           cohort_label,
-        "per_site_models":  site_models,          # all sites
+        "per_site_models":  site_models,          # all sites — Approach 1 shared logistic spec
         "per_site_model":   site_models.get(SITE_NAME, {}),  # back-compat
-        "mixed_effects":    me_result,
-        "ward_level":             ward_results,           # per site: group_models + tau2/icc/mor (ICU type)
-        "hospital_level":         hospital_results,       # per site: group_models + tau2/icc/mor (hospital_id)
-        "hospital_type_level":    hospital_type_results,  # per site: academic vs. community
-        "variance_decomposition": variance_decomp,        # per site: patient/ward/hospital/site % of total variance
-        "covariate_variance":     covar_variance,         # per site: R² + σ² per covariate group
+        "mixed_effects":    me_result,            # cross-site DL pooling (Approach 1)
+        "structural_models": structural_models,   # per site: expanded model with ward/hospital dummies (Approach 3)
+        "covariate_variance": covar_variance,     # per site: Nakagawa R² decomposition across all 4 levels
+        "dlmm_stats":        dlmm_stats,          # per site: DLMM aggregate stats for continuous outcomes
+        "model_variants":    model_variants,      # variant comparison: v1_original / v2_comorbid / v3_rhee_od
     }
 
-    # Write into each site's upload directory so the report can find it
-    # regardless of which site's config was active when the script ran.
+    # Write into each site's upload directory.
+    # Each packet contains only that site's per-site results (structural_models,
+    # covariate_variance, DLMM) so that upload_to_box_<SITE> never carries
+    # another site's data.  Cross-site fields (per_site_models, mixed_effects)
+    # are kept so the HTML report can show the pooled comparison when all
+    # packets are combined at the coordinating level.
     for s in site_models:
         s_out = OUTPUT_ROOT / "output" / f"upload_to_box_{s}" / cohort_label
         s_out.mkdir(parents=True, exist_ok=True)
         p = s_out / f"site_variation_packet_{cohort_label}_{s}.json"
-        pkt_s = dict(packet, site=s, per_site_model=site_models[s])
+        # Per-variant dlmm_stats: filter to this site only
+        _mv_s = {}
+        for _vk, _vd in model_variants.items():
+            _mv_s[_vk] = {
+                "bin_cols":   _vd.get("bin_cols", []),
+                "n_sites":    _vd.get("n_sites", 0),
+                "dl":         _vd.get("dl", {}),
+                "dlmm_stats": {s: _vd.get("dlmm_stats", {}).get(s, {})},
+            }
+        pkt_s = dict(
+            packet,
+            site=s,
+            per_site_model=site_models[s],
+            # Filter every per-site dict to this site only
+            structural_models={s: structural_models.get(s, {})},
+            covariate_variance={s: covar_variance.get(s, {})},
+            dlmm_stats={s: dlmm_stats.get(s, {})},
+            model_variants=_mv_s,
+        )
         with open(p, "w", encoding="utf-8") as fout:
             json.dump(pkt_s, fout, indent=2)
 
         export_coefficient_table(site_models[s]).to_csv(
             s_out / f"coefficient_table_{cohort_label}_{s}.csv", index=False
         )
-        if ward_results.get(s, {}).get("group_models"):
-            export_group_intercept_table(ward_results[s]).to_csv(
+        sm_s = structural_models.get(s, {})
+        if sm_s.get("ward_effective_intercepts"):
+            export_group_intercept_table(sm_s, "ward").to_csv(
                 s_out / f"ward_intercepts_{cohort_label}_{s}.csv", index=False
             )
-        if hospital_results.get(s, {}).get("group_models"):
-            export_group_intercept_table(hospital_results[s]).to_csv(
+        if sm_s.get("hospital_effective_intercepts"):
+            export_group_intercept_table(sm_s, "hospital").to_csv(
                 s_out / f"hospital_intercepts_{cohort_label}_{s}.csv", index=False
             )
 
@@ -2012,7 +2994,7 @@ def run_for_cohort(cohort_label: str):
 
 
 def main():
-    cohorts = ["sepsis3", "rhee"] if COHORT_ARG == "both" else [COHORT_ARG]
+    cohorts = ["sepsis3", "rhee", "rhee_clifpy"] if COHORT_ARG == "both" else [COHORT_ARG]
     for c in cohorts:
         print("\n" + "=" * 60)
         print(f"COHORT: {c.upper()}  |  SITE: {SITE_NAME}")

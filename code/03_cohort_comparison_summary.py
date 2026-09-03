@@ -102,7 +102,7 @@ TABLE3_PREHOUR_CONT = ["_n_pressors"]
 
 BOX_FEATURES = ["sepsis_onset_sofa", "initial_lactate", "age", "traj_hours"]
 
-COHORTS = ["sepsis3", "rhee"]
+COHORTS = ["sepsis3", "rhee", "rhee_clifpy"]
 
 
 # ============================================================
@@ -123,7 +123,7 @@ def _cont_stats(vals) -> dict | None:
     arr = pd.to_numeric(pd.Series(vals), errors="coerce").dropna()
     n = len(arr)
     if n < SUPPRESS_K:
-        return {"n": n}
+        return None
     return {
         "n": n, "mean": _r(arr.mean()), "sd": _r(arr.std()),
         "median": _r(arr.median()), "q25": _r(arr.quantile(0.25)), "q75": _r(arr.quantile(0.75)),
@@ -136,7 +136,7 @@ def _bin_stats(vals) -> dict | None:
     n = len(arr)
     pos = int(arr.sum())
     if n < SUPPRESS_K:
-        return {"n": n}
+        return None
     return {"n": n, "pos": pos, "pct": _r(pos / n * 100)}
 
 
@@ -146,7 +146,7 @@ def _cat_stats(vals) -> dict:
     for level, cnt in s.value_counts().items():
         n = len(s)
         out[str(level)] = ({"n": int(cnt), "pct": _r(int(cnt) / n * 100)}
-                            if cnt >= SUPPRESS_K else {"n": int(cnt)})
+                            if cnt >= SUPPRESS_K else None)
     return out
 
 
@@ -163,6 +163,22 @@ def _box_stats(vals) -> dict | None:
     whishi = float(within.max()) if len(within) else float(q3)
     return {"n": int(n), "q1": _r(q1), "median": _r(med), "q3": _r(q3),
             "whislo": _r(whislo), "whishi": _r(whishi)}
+
+
+def _mwu_stats(a, b) -> dict | None:
+    """Return {U, n1, n2} for Mann-Whitney U test (vaso group = a, no-vaso = b).
+    Stored alongside p-values so the coordinating site can compute the
+    van Elteren (stratified Wilcoxon) pooled p-value without individual data.
+    """
+    a = pd.to_numeric(pd.Series(a), errors="coerce").dropna()
+    b = pd.to_numeric(pd.Series(b), errors="coerce").dropna()
+    if len(a) < 5 or len(b) < 5:
+        return None
+    try:
+        res = mannwhitneyu(a, b, alternative="two-sided")
+        return {"U": _r(res.statistic), "n1": int(len(a)), "n2": int(len(b))}
+    except Exception:
+        return None
 
 
 def _pval_cont(a, b) -> float | None:
@@ -344,7 +360,16 @@ def build_table2(baseline_df) -> dict:
             ev = (ever_df["race"] == level).astype(int) if "race" in ever_df.columns else pd.Series(dtype=int)
             pvals[f"race:{level}"] = _pval_bin(nv, ev)
 
-    return {"never": never_block, "ever": ever_block, "pvalues": pvals}
+    # Mann-Whitney U statistics for van Elteren pooling at the coordinating site.
+    # Keys match TABLE2_CONT column names; values are {U, n1, n2} where
+    # n1 = ever-vaso size, n2 = never-vaso size.
+    mwu = {}
+    for col in TABLE2_CONT:
+        stats = _mwu_stats(_col(ever_df, col), _col(never_df, col))
+        if stats:
+            mwu[col] = stats
+
+    return {"never": never_block, "ever": ever_block, "pvalues": pvals, "mwu_stats": mwu}
 
 
 def build_table3(vaso_init_df, vaso_prehour_df) -> dict:
@@ -402,13 +427,18 @@ def main():
         sys.exit(f"No cohort parquets found under {input_dir}. Run 01/01b extract first.")
 
     # ---- Overlap (unsuppressed, CONSORT-style counts) ----
-    s3_ids = set(cohort_dfs["sepsis3"]["stay_id"]) if cohort_dfs["sepsis3"] is not None else set()
-    rhee_ids = set(cohort_dfs["rhee"]["stay_id"]) if cohort_dfs["rhee"] is not None else set()
+    s3_ids      = set(cohort_dfs["sepsis3"]["stay_id"])      if cohort_dfs["sepsis3"]      is not None else set()
+    rhee_ids    = set(cohort_dfs["rhee"]["stay_id"])         if cohort_dfs["rhee"]         is not None else set()
+    clifpy_ids  = set(cohort_dfs["rhee_clifpy"]["stay_id"])  if cohort_dfs["rhee_clifpy"]  is not None else set()
     overlap = {
-        "n_sepsis3": len(s3_ids), "n_rhee": len(rhee_ids),
-        "n_both": len(s3_ids & rhee_ids),
-        "n_sepsis3_only": len(s3_ids - rhee_ids),
-        "n_rhee_only": len(rhee_ids - s3_ids),
+        "n_sepsis3":         len(s3_ids),
+        "n_rhee":            len(rhee_ids),
+        "n_rhee_clifpy":     len(clifpy_ids),
+        "n_both":            len(s3_ids & rhee_ids),
+        "n_sepsis3_only":    len(s3_ids - rhee_ids - clifpy_ids),
+        "n_rhee_only":       len(rhee_ids - s3_ids - clifpy_ids),
+        "n_rhee_clifpy_only": len(clifpy_ids - s3_ids - rhee_ids),
+        "n_all_three":       len(s3_ids & rhee_ids & clifpy_ids),
     }
     print(f"[1/4] Cohort overlap: {overlap}")
 
@@ -453,14 +483,17 @@ def main():
         f"- Continuous summaries rounded to {ROUND_N} decimal places.\n"
         "- `table2.*.pvalues` are single floats (Mann-Whitney U / chi-square) computed locally "
         "— no raw values cross the site boundary.\n"
+        "- `table2.*.mwu_stats` contains per-variable {U, n1, n2} summary statistics only; "
+        "U is a concordance count (0 ≤ U ≤ n1·n2), not a patient-level value.\n"
         "- `overlap` counts (cohort sizes / intersection) are shared unsuppressed, matching the "
         "existing convention for cohort_filter_counts.csv (CONSORT-style flow counts).\n\n"
         "## cohort_comparison_stats.json schema\n"
-        "- `overlap`: {n_sepsis3, n_rhee, n_both, n_sepsis3_only, n_rhee_only}\n"
+        "- `overlap`: {n_sepsis3, n_rhee, n_rhee_clifpy, n_both, n_sepsis3_only, n_rhee_only, n_rhee_clifpy_only, n_all_three}\n"
         "- `table1.<cohort>`: baseline (t=0) stats — {n, enrollment_period, <variable>: {n, mean, sd, "
         "median, q25, q75, min, max} or {n, pos, pct}, race: {level: {n, pct}}}\n"
         "- `table2.<cohort>`: {never, ever} each shaped like table1's per-cohort block, plus "
-        "`pvalues`: {variable: p}\n"
+        "`pvalues`: {variable: p} and `mwu_stats`: {variable: {U, n1, n2}} "
+        "(Mann-Whitney U + group sizes for van Elteren pooling at coordinating site)\n"
         "- `table3.<cohort>`: characteristics at vasopressin initiation (ever-vaso only), same "
         "shape as table1, plus `_n_pressors` (from the hour before initiation)\n"
         "- `boxplots.<cohort>.<feature>`: {n, q1, median, q3, whislo, whishi} — standard Tukey "
