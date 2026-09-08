@@ -1,6 +1,6 @@
 # Epidemiology of Vasopressin in Septic Shock
 
-Federated multi-site analysis of vasopressin initiation patterns in ICU patients meeting septic shock criteria (Sepsis-3 + norepinephrine + lactate > 2 mmol/L).
+Federated multi-site analysis of vasopressin initiation patterns in ICU patients meeting septic shock criteria under three cohort definitions: Sepsis-3 (CMS), Rhee/CDC Adult Sepsis Event (hand-coded), and Rhee/CDC ASE (clifpy implementation).
 
 ## CLIF VERSION
 
@@ -31,15 +31,24 @@ The [clifpy](https://common-longitudinal-icu-data-format.github.io/clifpy/) pack
 
 ## Cohort identification
 
-**Inclusion:**
-- First ICU stay per patient
-- Sepsis-3 criteria: suspected infection + SOFA ≥ 2 at or near ICU admission
-- Norepinephrine started within 24 hours of ICU admission (≥ 2 administration records)
-- Lactate > 2.0 mmol/L within 24 hours of suspected infection
+All three cohorts share the same t=0 anchor: the **first norepinephrine administration** (≥`MIN_NE_RECORDS` = 2 NE records in `medication_admin_continuous`).
 
-**Exclusion:** Patients already on vasopressin in the 24 hours before trajectory start.
+Each definition first identifies an **infection anchor** from antibiotics and blood cultures, then requires **t=0 to fall within ±`NE_WINDOW_HOURS` (24 h) of that anchor**. The window is two-sided and inclusive: NE may start before or after the infection event. When a patient has several qualifying infection anchors, candidates are restricted to those inside the window and the earliest remaining one is kept — so a patient qualifies on *any* in-window anchor, not only the earliest overall.
 
-**Trajectory:** Up to 120 hours from shock onset (norepinephrine start), sampled hourly.
+| Cohort | Key criteria |
+|--------|-------------|
+| **sepsis3** | CMS qualifying IV abx + blood culture within 24 h of each other (anchor = earlier of the pair); NE start within ±24 h of the anchor; lactate > 2 mmol/L within ±24 h of the anchor |
+| **rhee** | Blood culture within ±24 h of NE start (anchor = earliest in-window culture); first qualifying IV abx within 2 calendar days of the culture; ≥4 consecutive qualifying antibiotic calendar days (≤1-day gap) or course ends ≤1 day before discharge/death; lactate ≥ 2 mmol/L within ±24 h of NE start |
+| **rhee_clifpy** | clifpy `compute_ase` (include_lactate=True, apply_rit=True); ASE episode's blood culture within ±24 h of NE start; lactate ≥ 2 is one of six optional organ-dysfunction criteria rather than a hard filter |
+
+**Shared exclusion:** patients whose ADT `location_category` at t=0 is an OR / procedure room / PACU are dropped from all three cohorts.
+
+**Not exclusions** (both are retained and flagged, so they can be analysed rather than silently dropped):
+
+- **Vasopressin before NE.** `vaso_before_traj` = 1 if vasopressin was given in the 24 h immediately before t=0; `vaso_before_ne` = 1 for any lead time; `vaso_to_ne_hours` gives the lead time in hours (positive = vasopressin first). Reported as `NOTE:` rows in the filter-count CSVs and as the `drug=NE, direction=after` rows of `vaso_timing_summary.csv`.
+- **NE = 0 at t=0.** Since t=0 *is* the first NE administration, NE should never be 0 there; any violation is a plumbing artifact, not a clinical finding. `01_clif_extract.py` verifies the invariant and attributes each violation to a cause in `ne_zero_at_t0_diagnostic.csv` (`zero_dose_at_t0` — EHR zero-rate start marker; `dose_null_at_t0`; `unit_conversion_failed`; `anchor_record_missing`; `unexplained` — a genuine bug in the interval logic, which should be zero). Affected patients stay in every cohort.
+
+**Trajectory:** from t=0 to the earliest of death, ICU discharge, or a 120-hour cap (`traj_end_reason` records which), sampled hourly.
 
 ## Detailed instructions for running the project
 
@@ -64,7 +73,7 @@ uv sync
 uv run python code/01_clif_extract.py
 ```
 
-Writes `cohort.parquet`, `features.parquet`, `cohort_filter_counts.csv` to `output/patient_level_data_<SITE>/`. **These never leave the site.**
+Writes `cohort_sepsis3.parquet`, `cohort_rhee.parquet`, `cohort_rhee_clifpy.parquet`, `features.parquet`, three `cohort_filter_counts_<cohort>.csv` files, and `ne_zero_at_t0_diagnostic.csv` to `output/patient_level_data_<SITE>/`. **These never leave the site.**
 
 ### 4. Run federated summary
 
@@ -77,16 +86,22 @@ Writes aggregate CSVs to `output/upload_to_box_<SITE>/`.
 ### 5. Run epidemiological analysis
 
 ```bash
-uv run python code/03_epi_analysis.py
+uv run python code/04_epi_analysis.py
 ```
 
-Writes figures and aggregate CSVs to `output/upload_to_box_<SITE>/epi_analysis/`, including a federated ICC return packet (`site_packet_<SITE>.json`).
+Writes figures and aggregate CSVs to `output/upload_to_box_<SITE>/<cohort>/epi_analysis/`.
 
-**UCMC runs first** (with `FEDERATED_ICC_ANCHOR = None` in config). **All other sites** uncomment the pre-filled `FEDERATED_ICC_ANCHOR` block in `config.example.py` before running. See [`config/README.md`](config/README.md) for details.
+### 6. Run eligible-but-untreated analysis
 
-### 6. Share your upload folder
+```bash
+uv run python code/06_eligible_untreated_analysis.py
+```
 
-**Share only `output/upload_to_box_<SITE>/`** with the coordinating site. This folder contains no patient-level data.
+Classifies patients who sustained high NEE without vasopressin (comfort care / too brief / MAP recovered / unexpectedly untreated). Writes figures + summary CSV to `output/upload_to_box_<SITE>/<cohort>/eligible_untreated/`. Reads `clif_code_status.parquet` (beta — skips comfort-care classification gracefully if absent).
+
+### 7. Share your upload folder
+
+**Share only `output/upload_to_box_<SITE>/`** with the coordinating site. This folder contains no patient-level data. Or use `run_pipeline.py` to run all steps (01–06) in sequence.
 
 See [`code/README.md`](code/README.md) for full script documentation.
 
@@ -97,18 +112,25 @@ output/
   patient_level_data_<SITE>/         # PHI intermediate — NEVER share
     cohort_sepsis3.parquet
     cohort_rhee.parquet
+    cohort_rhee_clifpy.parquet
+    cohort_filter_counts_sepsis3.csv
+    cohort_filter_counts_rhee.csv
+    cohort_filter_counts_rhee_clifpy.csv
+    ne_zero_at_t0_diagnostic.csv       # NE>0 at t=0 invariant audit
     features.parquet
   upload_to_box_<SITE>/              # Aggregate results — SHARE THIS FOLDER
-    cohort_comparison/                ← 02b_cohort_comparison_summary.py
+    cohort_comparison/                ← 03_cohort_comparison_summary.py
       cohort_comparison_stats.json
-    <cohort>/                         # sepsis3/ or rhee/
+    <cohort>/                         # sepsis3/ or rhee/ or rhee_clifpy/
       cohort_filter_counts.csv        ← 02_site_summary.py
       split_counts.csv                ← 02_site_summary.py
       baseline_table1.csv             ← 02_site_summary.py
       feature_at_initiation.csv       ← 02_site_summary.py
       feature_thresholds_youden.csv   ← 02_site_summary.py
       feature_roc_curves.csv          ← 02_site_summary.py
-      epi_analysis/                   ← 03_epi_analysis.py (CSVs + figures + ICC packet)
+      site_variation_packet_<cohort>_<SITE>.json  ← 05_site_variation_analysis.py
+      epi_analysis/                   ← 04_epi_analysis.py (CSVs + figures)
+      eligible_untreated/             ← 06_eligible_untreated_analysis.py (figures + summary CSV)
         km_cif_by_nee_bin.csv
         km_survival_by_nee_bin.csv
         km_survival_ever_never_vaso.csv
@@ -122,8 +144,8 @@ output/
         init_features_by_quartile.csv
         init_features_by_nee_bin.csv
         vasopressor_combinations.csv
+        vaso_timing_summary.csv
         vaso_receipt_logreg.csv
-        site_packet_<SITE>.json       ← federated ICC return packet
         <site>_analysis*.png          ← figures alongside CSVs
 ```
 
@@ -136,16 +158,19 @@ Threshold/rule-optimality outputs (`<cohort>/threshold/`, `global_rules_<cohort>
 ├── code/                              # All analysis scripts
 │   ├── 00_mimic_extract_duckdb.py     # Builds intermediate MIMIC DuckDB (optional, MIMIC only)
 │   ├── 01_clif_extract.py             # CLIF 2.1.0 cohort extraction (per CLIF site)
-│   ├── 01b_mimic_extract.py           # MIMIC-CLIF cohort extraction (per site)
+│   ├── 01b_mimic_extract.py           # MIMIC-CLIF cohort extraction (MIMIC only)
 │   ├── 02_site_summary.py             # Federated aggregate summary (per site, per cohort)
-│   ├── 02b_cohort_comparison_summary.py  # sepsis3 vs rhee cohort comparison stats (per site)
-│   ├── 03_epi_analysis.py             # Epidemiological characterization + ICC packet (per site)
-│   ├── 04_site_variation_analysis.py  # Patient/ward/hospital variance decomposition (per site)
-│   ├── 05_multisite_epi_plots.py      # Multi-site epi comparison figures (coordinating site)
-│   ├── 06_cross_site_variation_analysis.py  # Pooled GEE + DL meta-analysis (coordinating site)
-│   ├── 07_cross_site_vasopressin_analysis.py  # Cross-site epi comparison tables + plots (coordinating site)
-│   ├── 08_consolidated_report.py      # One HTML report, 4 sections (coordinating site)
-│   ├── run_coordinating_pipeline.py   # Orchestrates 07-10 at the coordinating site
+│   ├── 03_cohort_comparison_summary.py  # sepsis3 vs rhee cohort comparison stats (per site)
+│   ├── 04_epi_analysis.py             # Epidemiological characterization (per site)
+│   ├── 05_site_variation_analysis.py  # Patient/ward/hospital variance decomposition (per site)
+│   ├── 06_eligible_untreated_analysis.py  # Eligible-but-untreated classification + characterization (per site)
+│   ├── 07_multisite_epi_plots.py      # Multi-site epi comparison figures (coordinating site)
+│   ├── 08_cross_site_variation_analysis.py  # Pooled GEE + DL meta-analysis (coordinating site)
+│   ├── 09_cross_site_vasopressin_analysis.py  # Cross-site epi comparison tables + plots (coordinating site)
+│   ├── 10_consolidated_report.py      # One HTML report, 4 sections (coordinating site)
+│   ├── 11_ne_infection_timing.py      # NE/infection timing report (coordinating site)
+│   ├── run_pipeline.py                # Orchestrates 01–05 at each site
+│   ├── run_coordinating_pipeline.py   # Orchestrates 07–11 at the coordinating site
 │   └── README.md
 ├── config/                      # Configuration
 │   ├── config.example.py        # Copy to config/config.py and fill in site paths
