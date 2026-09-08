@@ -80,6 +80,7 @@ OUTPUT_ROOT = None   # REQUIRED
 SITE_NAME   = "UCMC"
 TIMEZONE = "UTC"
 TRAJECTORY_HOURS = 120
+NE_WINDOW_HOURS = 24   # NE start must fall within ±this many hours of the infection anchor
 MIN_NE_RECORDS = 2     # ≥2 NE administrations
 SOFA_THRESHOLD = 2.0   # kept for config compatibility; not used as inclusion criterion
 LACTATE_THRESHOLD = 2.0
@@ -98,6 +99,7 @@ _cfg = _load_site_config()
 if _cfg is not None:
     for _k in (
         "CLIF_DIR", "OUTPUT_ROOT", "SITE_NAME", "TIMEZONE", "TRAJECTORY_HOURS",
+        "NE_WINDOW_HOURS",
         "MIN_NE_RECORDS", "SOFA_THRESHOLD", "LACTATE_THRESHOLD", "MAP_THRESHOLD",
         "STEROID_CATEGORIES", "VASOPRESSOR_CATEGORIES",
     ):
@@ -193,15 +195,19 @@ def identify_sepsis3_cohort(
     ne_df: pd.DataFrame,
     window_hours: int = 24,
 ) -> tuple:
-    """Sepsis-3 (CMS) criteria during hospitalization (no ±window relative to NE start):
+    """Sepsis-3 (CMS) criteria, anchored on the infection event:
       1. Blood culture during hospitalization
       2. CMS qualifying IV abx during hospitalization
       3. Abx + culture within 24 h of each other (presumed infection)
-      4. Lactate > LACTATE_THRESHOLD within ±window_hours of presumed infection time
+      4. NE start within ±window_hours of the presumed infection time
+      5. Lactate > LACTATE_THRESHOLD within ±window_hours of presumed infection time
 
-    The ≥MIN_NE_RECORDS check (upstream) ensures genuine NE exposure; infection
-    criteria are evaluated across the full hospitalization so patients who receive
-    NE well outside the ±24 h window are still captured.
+    Steps 1–3 identify the infection event; step 4 then requires shock onset
+    (t=0 = first NE administration) to fall within ±window_hours of it.  When a
+    patient has several qualifying abx/culture pairs, candidates are first
+    restricted to those within ±window_hours of NE start and the earliest
+    remaining pair becomes `presumed_infection_dttm`, so a patient qualifies if
+    ANY qualifying pair sits inside the window.
 
     Returns: (result_df, step_counts)
       result_df — hospitalization_id, presumed_infection_dttm, initial_lactate
@@ -216,7 +222,8 @@ def identify_sepsis3_cohort(
     ne = ne_df[["hospitalization_id", "first_norepi_time"]].copy()
     ne["t0"] = to_naive_utc(pd.to_datetime(ne["first_norepi_time"], utc=True))
 
-    # No ±window filter: infection criteria evaluated across full hospitalization.
+    # Infection criteria are searched across the full hospitalization; the ±window
+    # constraint relative to NE start is applied to the resulting anchor below.
     abx_win = abx.merge(ne[["hospitalization_id"]], on="hospitalization_id")
     cx_win  = blood_cx.merge(ne[["hospitalization_id"]], on="hospitalization_id")
 
@@ -235,11 +242,21 @@ def identify_sepsis3_cohort(
     )
     paired = paired[paired["diff_h"] <= 24].copy()
     paired["infection_anchor"] = paired[["admin_dttm", "collect_dttm"]].min(axis=1)
+    n_paired = paired["hospitalization_id"].nunique()
+
+    # NE start (t=0) must fall within ±window_hours of the presumed infection.
+    # Restrict candidate pairs to that window first, then take the earliest
+    # remaining pair as the anchor — a patient qualifies on ANY pair in window.
+    paired = paired.merge(ne[["hospitalization_id", "t0"]], on="hospitalization_id", how="left")
+    paired["ne_to_infection_h"] = (
+        (paired["t0"] - paired["infection_anchor"]).dt.total_seconds().abs() / 3600
+    )
+    paired = paired[paired["ne_to_infection_h"] <= window_hours]
 
     infection = (paired.groupby("hospitalization_id")
                        .agg(presumed_infection_dttm=("infection_anchor", "min"))
                        .reset_index())
-    n_paired = len(infection)
+    n_ne_win = len(infection)
 
     def _build_steps(n_lactate: int) -> list:
         return [
@@ -269,10 +286,22 @@ def identify_sepsis3_cohort(
             },
             {
                 "step": (
+                    f"NE start not within ±{window_hours} h of presumed infection (excluded)"
+                ),
+                "n_hospitalizations": n_paired - n_ne_win,
+            },
+            {
+                "step": (
+                    f"Presumed infection with NE start within ±{window_hours} h"
+                ),
+                "n_hospitalizations": n_ne_win,
+            },
+            {
+                "step": (
                     f"Lactate ≤{LACTATE_THRESHOLD} or missing"
                     f" within ±{window_hours} h of presumed infection (excluded)"
                 ),
-                "n_hospitalizations": n_paired - n_lactate,
+                "n_hospitalizations": n_ne_win - n_lactate,
             },
             {
                 "step": (
@@ -331,29 +360,56 @@ def identify_rhee_cohort(
     ne_df: pd.DataFrame,
     mortality_df: pd.DataFrame,
     window_hours: int = 24,
-) -> pd.DataFrame:
-    """Rhee/CDC Adult Sepsis Event criteria during hospitalization (no ±window relative to NE start):
-      1. Blood culture during hospitalization
+) -> tuple:
+    """Rhee/CDC Adult Sepsis Event criteria, anchored on the infection event:
+      1. Blood culture drawn within ±window_hours of NE start (t=0)
       2. First qualifying IV abx within 2 calendar days of culture date
       3. ≥4 consecutive qualifying antibiotic calendar days (≤1-day gap allowed),
          OR antibiotic course runs until ≤1 day before discharge/death
 
-    The ≥MIN_NE_RECORDS check (upstream) ensures genuine NE exposure; infection
-    criteria are evaluated across the full hospitalization so patients who receive
-    NE well outside the original ±24 h window are still captured.
+    Candidate cultures are restricted to the ±window_hours window around NE start
+    before the earliest one is chosen, so a patient qualifies if ANY blood culture
+    sits within the window; the QAD logic then runs from that culture.
 
-    Returns: hospitalization_id, blood_culture_dttm
+    Returns: (result_df, step_counts)
+      result_df — hospitalization_id, blood_culture_dttm
+      step_counts — filter-cascade rows for the culture window and QAD criteria
     """
+    def _empty() -> tuple:
+        return (
+            pd.DataFrame(columns=["hospitalization_id", "blood_culture_dttm"]),
+            [{"step": (f"No blood culture within ±{window_hours} h of NE start"
+                       " (excluded)"),
+              "n_hospitalizations": len(ne_df)},
+             {"step": (f"Blood culture within ±{window_hours} h of NE start"),
+              "n_hospitalizations": 0},
+             {"step": ("Rhee/CDC ASE: <4 consecutive qualifying abx days"
+                       " and course not ended near discharge/death (excluded)"),
+              "n_hospitalizations": 0}],
+        )
+
     abx = get_abx_records(clif_dir)
     blood_cx = get_blood_cultures(clif_dir)
 
     ne = ne_df[["hospitalization_id", "first_norepi_time"]].copy()
     ne["t0"] = to_naive_utc(pd.to_datetime(ne["first_norepi_time"], utc=True))
 
-    # Step 1: Blood culture during hospitalization (no ±window relative to NE start)
-    cx_win = blood_cx.merge(ne[["hospitalization_id"]], on="hospitalization_id").copy()
+    # Step 1: Blood culture within ±window_hours of NE start (t=0)
+    cx_win = blood_cx.merge(ne[["hospitalization_id", "t0"]], on="hospitalization_id").copy()
+    cx_win["ne_to_culture_h"] = (
+        (cx_win["t0"] - cx_win["collect_dttm"]).dt.total_seconds().abs() / 3600
+    )
+    cx_win = cx_win[cx_win["ne_to_culture_h"] <= window_hours]
     if cx_win.empty:
-        return pd.DataFrame(columns=["hospitalization_id", "blood_culture_dttm"])
+        return _empty()
+
+    n_cx_win = cx_win["hospitalization_id"].nunique()
+    steps = [
+        {"step": f"No blood culture within ±{window_hours} h of NE start (excluded)",
+         "n_hospitalizations": len(ne_df) - n_cx_win},
+        {"step": f"Blood culture within ±{window_hours} h of NE start",
+         "n_hospitalizations": n_cx_win},
+    ]
 
     earliest_cx = (cx_win.sort_values("collect_dttm")
                          .groupby("hospitalization_id")
@@ -368,7 +424,12 @@ def identify_rhee_cohort(
     ).dt.days.abs()
     qualifying_abx = abx_cx[abx_cx["day_diff"] <= 2].copy()
     if qualifying_abx.empty:
-        return pd.DataFrame(columns=["hospitalization_id", "blood_culture_dttm"])
+        steps.append({
+            "step": ("Rhee/CDC ASE: <4 consecutive qualifying abx days"
+                     " and course not ended near discharge/death (excluded)"),
+            "n_hospitalizations": n_cx_win,
+        })
+        return pd.DataFrame(columns=["hospitalization_id", "blood_culture_dttm"]), steps
 
     first_abx = (qualifying_abx.sort_values("abx_date")
                                 .groupby("hospitalization_id")["abx_date"]
@@ -378,7 +439,12 @@ def identify_rhee_cohort(
 
     candidates = earliest_cx.merge(first_abx, on="hospitalization_id")
     if candidates.empty:
-        return pd.DataFrame(columns=["hospitalization_id", "blood_culture_dttm"])
+        steps.append({
+            "step": ("Rhee/CDC ASE: <4 consecutive qualifying abx days"
+                     " and course not ended near discharge/death (excluded)"),
+            "n_hospitalizations": n_cx_win,
+        })
+        return pd.DataFrame(columns=["hospitalization_id", "blood_culture_dttm"]), steps
 
     # Step 3: ≥4 consecutive antibiotic calendar days (≤1-day gap allowed)
     cand_ids = set(candidates["hospitalization_id"])
@@ -433,8 +499,16 @@ def identify_rhee_cohort(
 
     qualifying = set(rhee_check.loc[rhee_check["meets"], "hospitalization_id"])
     result = candidates[candidates["hospitalization_id"].isin(qualifying)].copy()
-    return result[["hospitalization_id", "collect_dttm"]].rename(
-        columns={"collect_dttm": "blood_culture_dttm"}
+    steps.append({
+        "step": ("Rhee/CDC ASE: <4 consecutive qualifying abx days"
+                 " and course not ended near discharge/death (excluded)"),
+        "n_hospitalizations": n_cx_win - len(result),
+    })
+    return (
+        result[["hospitalization_id", "collect_dttm"]].rename(
+            columns={"collect_dttm": "blood_culture_dttm"}
+        ),
+        steps,
     )
 
 
@@ -463,11 +537,9 @@ def identify_rhee_clifpy_cohort(
 ) -> tuple:
     """Rhee/CDC ASE cohort via clifpy.utils.ase.compute_ase.
 
-    No ±window filter relative to NE start: all ASE episodes during the
-    hospitalization are included. The ≥MIN_NE_RECORDS check (upstream) ensures
-    genuine NE exposure; infection criteria are evaluated across the full
-    hospitalization so patients who receive NE well outside the original ±24 h
-    window are still captured.
+    Qualifying ASE episodes are restricted to those whose blood culture falls
+    within ±window_hours of NE start (t=0); the earliest remaining episode is
+    kept, so a patient qualifies if ANY ASE episode sits inside the window.
 
     Lactate >= 2 mmol/L counts as one of several organ-dysfunction criteria
     (vasopressor, IMV, AKI, thrombocytopenia, hyperbilirubinemia, lactate);
@@ -507,12 +579,23 @@ def identify_rhee_clifpy_cohort(
     sepsis_rows = ase_df[ase_df["sepsis"] == 1][keep_cols].copy()
     n_all_ase = sepsis_rows["hospitalization_id"].nunique()
 
-    # No ±window filter: all ASE episodes during the hospitalization are included.
     sepsis_rows["blood_culture_dttm"] = to_naive_utc(
         pd.to_datetime(sepsis_rows["blood_culture_dttm"], utc=True)
     )
 
-    # One row per patient: earliest qualifying episode
+    # NE start (t=0) must fall within ±window_hours of the episode's blood culture.
+    ne_t0 = ne_df[["hospitalization_id", "first_norepi_time"]].copy()
+    ne_t0["t0"] = to_naive_utc(pd.to_datetime(ne_t0["first_norepi_time"], utc=True))
+    sepsis_rows = sepsis_rows.merge(
+        ne_t0[["hospitalization_id", "t0"]], on="hospitalization_id", how="left"
+    )
+    sepsis_rows["ne_to_culture_h"] = (
+        (sepsis_rows["t0"] - sepsis_rows["blood_culture_dttm"]).dt.total_seconds().abs() / 3600
+    )
+    sepsis_rows = sepsis_rows[sepsis_rows["ne_to_culture_h"] <= window_hours]
+    n_in_window = sepsis_rows["hospitalization_id"].nunique()
+
+    # One row per patient: earliest qualifying episode within the window
     final = (sepsis_rows
              .sort_values("blood_culture_dttm")
              .groupby("hospitalization_id")
@@ -527,6 +610,18 @@ def identify_rhee_clifpy_cohort(
                 " + organ dysfunction (RIT applied)"
             ),
             "n_hospitalizations": n_all_ase,
+        },
+        {
+            "step": (
+                f"NE start not within ±{window_hours} h of ASE blood culture (excluded)"
+            ),
+            "n_hospitalizations": n_all_ase - n_in_window,
+        },
+        {
+            "step": (
+                f"Rhee/CDC ASE (clifpy) with NE start within ±{window_hours} h"
+            ),
+            "n_hospitalizations": n_in_window,
         },
     ]
 
@@ -698,8 +793,30 @@ def get_demographics(clif_dir: Path, stay_ids: set) -> pd.DataFrame:
 
 
 def get_vaso_pretraj(clif_dir: Path, cohort: pd.DataFrame) -> pd.DataFrame:
-    """vaso_before_traj: 1 if vasopressin given in 24 h before trajectory_start, else 0.
-    first_vaso_time: first vasopressin admin timestamp for vaso-before-traj patients (NaT otherwise).
+    """Vasopressin timing relative to NE start (t=0 = trajectory_start).
+
+    Returns one row per stay_id with:
+      first_vaso_time     — first vasopressin administration anywhere in the
+                            hospitalization (NaT if never given).  NOT limited to
+                            the 24 h pre-trajectory window, so it supports the
+                            vasopressin-before-NE timing analysis in
+                            04_epi_analysis.py.
+      first_vaso_time_pretraj
+                          — first vasopressin administration inside the 24 h
+                            pre-trajectory window only (NaT otherwise).  This is
+                            the vasopressin episode adjacent to NE start, which
+                            is what the prior-vaso timing plots want; it differs
+                            from first_vaso_time when a patient had an earlier,
+                            separate vasopressin course.
+      vaso_before_traj    — 1 if vasopressin was given in the 24 h immediately
+                            before trajectory_start ("prior-vaso" group used for
+                            group assignment downstream).
+      vaso_before_ne      — 1 if first_vaso_time is strictly before
+                            trajectory_start, at any lead time.  Superset of
+                            vaso_before_traj (which caps the lead time at 24 h).
+      vaso_to_ne_hours    — trajectory_start − first_vaso_time, in hours.
+                            Positive = vasopressin started BEFORE NE;
+                            negative = vasopressin started after NE.
     """
     meds = pd.read_parquet(clif_dir / "clif_medication_admin_continuous.parquet")
     vaso = meds[meds["med_category"] == "vasopressin"][
@@ -712,22 +829,38 @@ def get_vaso_pretraj(clif_dir: Path, cohort: pd.DataFrame) -> pd.DataFrame:
     bounds["traj_start"] = pd.to_datetime(bounds["trajectory_start"], utc=True).dt.tz_localize(None)
     vaso = vaso.merge(bounds[["stay_id", "traj_start"]], on="stay_id", how="inner")
 
+    # Prior-vaso group: vasopressin in the 24 h immediately before t=0
     in_window = (
         (vaso["admin_dttm"] >= vaso["traj_start"] - pd.Timedelta(hours=24)) &
         (vaso["admin_dttm"] <  vaso["traj_start"])
     )
     pretraj_ids = set(vaso.loc[in_window, "stay_id"])
-    first_vaso_time = (
+    first_vaso_pretraj = (
         vaso.loc[in_window]
         .groupby("stay_id")["admin_dttm"].min()
+        .rename("first_vaso_time_pretraj")
+        .reset_index()
+    )
+
+    # First vasopressin at any point in the hospitalization
+    first_vaso_time = (
+        vaso.groupby("stay_id")["admin_dttm"].min()
         .rename("first_vaso_time")
         .reset_index()
     )
+
     result = pd.DataFrame({
         "stay_id": cohort["stay_id"],
         "vaso_before_traj": cohort["stay_id"].isin(pretraj_ids).astype(int),
     })
-    return result.merge(first_vaso_time, on="stay_id", how="left")
+    result = result.merge(first_vaso_time, on="stay_id", how="left")
+    result = result.merge(first_vaso_pretraj, on="stay_id", how="left")
+    result = result.merge(bounds[["stay_id", "traj_start"]], on="stay_id", how="left")
+    result["vaso_to_ne_hours"] = (
+        (result["traj_start"] - result["first_vaso_time"]).dt.total_seconds() / 3600
+    )
+    result["vaso_before_ne"] = (result["vaso_to_ne_hours"] > 0).astype(int)
+    return result.drop(columns=["traj_start"])
 
 
 def get_weight_at_onset(clif_dir: Path, cohort: pd.DataFrame) -> pd.DataFrame:
@@ -1115,9 +1248,9 @@ def build_cohort(clif_dir: Path, co: ClifOrchestrator) -> tuple:
     print("\nStep 2: Mortality/discharge info...")
     mortality = get_mortality(clif_dir)
 
-    print("\nStep 3a: Sepsis-3 (CMS) criteria within ±24 h of NE start...")
+    print(f"\nStep 3a: Sepsis-3 (CMS), NE start within ±{NE_WINDOW_HOURS} h of presumed infection...")
     print("         [abx + blood culture within 24 h of each other + lactate > 2 mmol/L]")
-    sepsis3_df, s3_steps = identify_sepsis3_cohort(clif_dir, ne_df, window_hours=24)
+    sepsis3_df, s3_steps = identify_sepsis3_cohort(clif_dir, ne_df, window_hours=NE_WINDOW_HOURS)
     filter_s3.extend(s3_steps)
     n_s3_final = s3_steps[-1]["n_hospitalizations"]   # last step = Sepsis-3 retained count
     print(f"  Sub-steps (Sepsis-3):")
@@ -1125,24 +1258,34 @@ def build_cohort(clif_dir: Path, co: ClifOrchestrator) -> tuple:
         print(f"    {_s['step']}: {_s['n_hospitalizations']:,}")
     print(f"  {n_s3_final:,} meet Sepsis-3 (CMS) criteria")
 
-    print("\nStep 3b: Rhee/CDC ASE criteria (hand-coded, blood culture + QAD within ±24 h of NE start)...")
+    print(f"\nStep 3b: Rhee/CDC ASE (hand-coded), blood culture within ±{NE_WINDOW_HOURS} h of NE start...")
     print("         [blood culture + ≥4 consecutive antibiotic days + lactate >= 2 mmol/L]")
-    rhee_df = identify_rhee_cohort(clif_dir, ne_df, mortality)
+    rhee_df, rhee_steps = identify_rhee_cohort(
+        clif_dir, ne_df, mortality, window_hours=NE_WINDOW_HOURS
+    )
+    filter_rhee.extend(rhee_steps)
     filter_rhee.append({
-        "step": "Rhee/CDC ASE: blood culture + ≥4 consecutive abx days (within ±24 h of NE start)",
+        "step": ("Rhee/CDC ASE: blood culture within ±"
+                 f"{NE_WINDOW_HOURS} h of NE start + ≥4 consecutive abx days"),
         "n_hospitalizations": len(rhee_df),
     })
+    print("  Sub-steps (Rhee):")
+    for _s in rhee_steps:
+        print(f"    {_s['step']}: {_s['n_hospitalizations']:,}")
     print(f"  {len(rhee_df):,} meet Rhee/CDC ASE blood-culture + abx criteria")
 
-    print("\nStep 3c: Rhee/CDC ASE criteria (via clifpy compute_ase, ±24 h window)...")
+    print(f"\nStep 3c: Rhee/CDC ASE (clifpy compute_ase), ±{NE_WINDOW_HOURS} h NE window...")
     print("         [blood culture + QAD + organ dysfunction incl. lactate >= 2; RIT applied]")
-    print("         [blood culture restricted to ±24 h of NE start — t=0 anchoring]")
-    rhee_clifpy_df, clifpy_steps = identify_rhee_clifpy_cohort(clif_dir, ne_df, window_hours=24)
+    print("         [ASE episodes restricted to those with NE start within the window]")
+    rhee_clifpy_df, clifpy_steps = identify_rhee_clifpy_cohort(
+        clif_dir, ne_df, window_hours=NE_WINDOW_HOURS
+    )
     filter_rhee_clifpy.extend(clifpy_steps)
     print(f"  Sub-steps (Rhee-clifpy):")
     for _s in clifpy_steps:
         print(f"    {_s['step']}: {_s['n_hospitalizations']:,}")
-    print(f"  {len(rhee_clifpy_df):,} meet Rhee/CDC ASE criteria (clifpy, ±24 h window)")
+    print(f"  {len(rhee_clifpy_df):,} meet Rhee/CDC ASE criteria "
+          f"(clifpy, ±{NE_WINDOW_HOURS} h window)")
 
     union_ids = (set(sepsis3_df["hospitalization_id"]) |
                  set(rhee_df["hospitalization_id"]) |
@@ -1261,6 +1404,7 @@ def build_cohort(clif_dir: Path, co: ClifOrchestrator) -> tuple:
     _comorbid_cols = list(_COMORBIDITY_DEFS.keys()) + ["comorbid_liver_nocirrh"]
     for _c in [cohort_s3, cohort_rhee, cohort_rhee_clifpy]:
         _c["vaso_before_traj"]  = _c["vaso_before_traj"].fillna(0).astype(int)
+        _c["vaso_before_ne"]    = _c["vaso_before_ne"].fillna(0).astype(int)
         _c["cvc_during_hosp"]   = _c["cvc_during_hosp"].fillna(0).astype(int)
         for _col in _comorbid_cols:
             _c[_col] = _c[_col].fillna(0).astype(int)
@@ -1280,6 +1424,9 @@ def build_cohort(clif_dir: Path, co: ClifOrchestrator) -> tuple:
         n_vaso = int((cohort["vaso_before_traj"] == 1).sum())
         fl.append({"step": "NOTE: Vasopressin in 24 h before trajectory start (retained — prior-vaso group)",
                    "n_hospitalizations": n_vaso})
+        n_vaso_any = int((cohort["vaso_before_ne"] == 1).sum())
+        fl.append({"step": "NOTE: Vasopressin before NE start at any lead time (retained)",
+                   "n_hospitalizations": n_vaso_any})
 
     # cohort_s3 = cohort_s3[cohort_s3["vaso_before_traj"] == 0].copy()
     # cohort_rhee = cohort_rhee[cohort_rhee["vaso_before_traj"] == 0].copy()
@@ -1941,7 +2088,118 @@ def add_hourly_sofa(grid: pd.DataFrame, co: ClifOrchestrator) -> pd.DataFrame:
     return grid
 
 
-def build_features(cohort: pd.DataFrame, co: ClifOrchestrator, clif_dir: Path) -> pd.DataFrame:
+def diagnose_ne_zero_at_t0(
+    features: pd.DataFrame,
+    cohort: pd.DataFrame,
+    meds: pd.DataFrame,
+    clif_dir: Path,
+) -> pd.DataFrame:
+    """Verify the invariant that NE dose > 0 at t=0, and attribute any violations.
+
+    t=0 is defined as the first norepinephrine administration, so
+    `features.norepinephrine` at time_hour == 0 should never be zero.  Any
+    violation is a data-plumbing artifact, not a clinical finding.  This
+    function classifies each affected patient by cause so the invariant can be
+    audited rather than silently tolerated:
+
+      zero_dose_at_t0        The anchoring MAR record itself carries dose 0 —
+                             an EHR "start" marker written before the actual
+                             rate is entered.  Zero-dose records are given a
+                             zero-length interval by add_ne_dose, so nothing
+                             overlaps hour 0.
+      dose_null_at_t0        The anchoring record has a null med_dose, so it is
+                             dropped before dose intervals are built.
+      unit_conversion_failed The anchoring record has a real dose but clifpy
+                             could not convert its unit to mcg/kg/min (usually a
+                             missing weight or an unrecognised med_dose_unit).
+      anchor_record_missing  No raw NE row at first_norepi_time — indicates the
+                             anchor and the feature build disagree about the
+                             source table, and should never occur.
+      unexplained            A convertible, non-zero NE record exists at t=0 but
+                             the hourly mean is still 0 — a genuine bug in the
+                             interval overlap logic.  Investigate.
+
+    Returns a one-row-per-cause aggregate DataFrame (safe to share).
+    """
+    ne_t0 = features[features["time_hour"] == 0].set_index("stay_id")["norepinephrine"]
+    zero_ids = list(ne_t0[ne_t0 == 0].index)
+
+    n_total = int(features["stay_id"].nunique())
+    if not zero_ids:
+        print(f"  NE>0 at t=0 verified for all {n_total:,} patients.")
+        return pd.DataFrame([{"cause": "none — invariant holds",
+                              "n_patients": 0,
+                              "n_total_patients": n_total}])
+
+    anchors = (cohort[["stay_id", "first_norepi_time"]]
+               .drop_duplicates(subset=["stay_id"])
+               .copy())
+    anchors["t0"] = to_naive_utc(pd.to_datetime(anchors["first_norepi_time"], utc=True))
+    anchors = anchors[anchors["stay_id"].isin(zero_ids)]
+
+    # Raw NE records (pre-conversion) at the anchoring timestamp
+    raw = pd.read_parquet(
+        clif_dir / "clif_medication_admin_continuous.parquet",
+        columns=["hospitalization_id", "admin_dttm", "med_category",
+                 "med_dose", "med_dose_unit"],
+    )
+    raw = raw[(raw["med_category"] == "norepinephrine") &
+              raw["hospitalization_id"].isin(zero_ids)].copy()
+    raw = raw.rename(columns={"hospitalization_id": "stay_id"})
+    raw["admin_dttm"] = to_naive_utc(raw["admin_dttm"])
+    raw_t0 = raw.merge(anchors[["stay_id", "t0"]], on="stay_id")
+    raw_t0 = raw_t0[raw_t0["admin_dttm"] == raw_t0["t0"]]
+
+    # Converted NE records at the anchoring timestamp
+    conv = meds[(meds["med_category"] == "norepinephrine") &
+                meds["stay_id"].isin(zero_ids)].copy()
+    conv_t0 = conv.merge(anchors[["stay_id", "t0"]], on="stay_id")
+    conv_t0 = conv_t0[conv_t0["admin_dttm"] == conv_t0["t0"]]
+
+    ids_with_raw       = set(raw_t0["stay_id"])
+    ids_all_dose_null  = set(raw_t0.groupby("stay_id")["med_dose"]
+                                   .apply(lambda s: s.isna().all())
+                                   .loc[lambda s: s].index)
+    ids_all_dose_zero  = set(raw_t0.groupby("stay_id")["med_dose"]
+                                   .apply(lambda s: (s.fillna(-1) == 0).all())
+                                   .loc[lambda s: s].index)
+    ids_convert_ok     = set(
+        conv_t0.loc[(conv_t0["_convert_status"] == "success") &
+                    conv_t0["med_dose_converted"].notna() &
+                    (conv_t0["med_dose_converted"] > 0), "stay_id"]
+    )
+
+    rows = []
+    assigned: set = set()
+
+    def _claim(cause: str, ids: set) -> None:
+        ids = set(ids) - assigned
+        assigned.update(ids)
+        rows.append({"cause": cause, "n_patients": len(ids)})
+
+    _claim("anchor_record_missing", set(zero_ids) - ids_with_raw)
+    _claim("dose_null_at_t0",       ids_all_dose_null)
+    _claim("zero_dose_at_t0",       ids_all_dose_zero)
+    _claim("unit_conversion_failed", ids_with_raw - ids_convert_ok)
+    _claim("unexplained",            set(zero_ids))
+
+    out = pd.DataFrame(rows)
+    out["n_total_patients"] = n_total
+    out["pct_of_patients"] = (out["n_patients"] / n_total * 100).round(2) if n_total else np.nan
+
+    print(f"  NE=0 at t=0 in {len(zero_ids):,} / {n_total:,} patients "
+          f"({len(zero_ids)/n_total*100:.2f}%) — cause breakdown:")
+    for _, r in out.iterrows():
+        if r["n_patients"]:
+            print(f"    {r['cause']}: {int(r['n_patients']):,}")
+    _unexpl = int(out.loc[out["cause"] == "unexplained", "n_patients"].sum())
+    if _unexpl:
+        print(f"  WARNING: {_unexpl:,} patients have a valid non-zero NE record at t=0 "
+              "but an hourly mean of 0 — this is a bug in add_ne_dose, not a data artifact.")
+    return out
+
+
+def build_features(cohort: pd.DataFrame, co: ClifOrchestrator, clif_dir: Path) -> tuple:
     print("\nBuilding hourly grid...")
     grid = build_hourly_grid(cohort)
     print(f"  {len(grid):,} patient-hours across {cohort['stay_id'].nunique()} patients")
@@ -2012,7 +2270,9 @@ def build_features(cohort: pd.DataFrame, co: ClifOrchestrator, clif_dir: Path) -
     grid = grid.drop(columns=["start_time", "end_time"])
     grid = grid.sort_values(["stay_id", "time_hour"]).reset_index(drop=True)
 
-    return grid
+    # meds is returned so diagnose_ne_zero_at_t0 can inspect conversion status
+    # without paying for a second clifpy unit conversion.
+    return grid, meds
 
 
 # ---------------------------------------------------------------------------
@@ -2023,7 +2283,13 @@ _COHORT_COLS = [
     "traj_hours", "death_hour", "first_norepi_time", "trajectory_start",
     "age", "gender", "race", "weight",
     "sepsis_onset_sofa", "initial_lactate", "cci_score",
-    "vaso_before_traj", "first_vaso_time", "infection_dttm",
+    # Vasopressin timing relative to NE start (t=0)
+    "vaso_before_traj",   # 1 if vasopressin in the 24 h immediately before t=0
+    "vaso_before_ne",     # 1 if first vasopressin precedes t=0 at any lead time
+    "vaso_to_ne_hours",   # t=0 − first_vaso_time, hours (positive = vaso first)
+    "first_vaso_time",    # first vasopressin admin anywhere in the hospitalization
+    "first_vaso_time_pretraj",  # first vasopressin admin inside the 24 h pre-t=0 window
+    "infection_dttm",
     "location_category", "location_type",
     "hospital_id", "hospital_type",
     "location_category_end", "location_type_end",
@@ -2076,14 +2342,15 @@ def main():
                     .drop_duplicates(subset=["stay_id"])
                     .reset_index(drop=True))
 
-    features = build_features(union_cohort, co, CLIF_DIR)
+    features, meds_converted = build_features(union_cohort, co, CLIF_DIR)
 
-    # Diagnostic: flag patients with NE=0 at t=0 but DO NOT exclude them.
-    # t=0 is definitionally when NE starts (anchored to first_norepi_time).
-    # A zero dose at t=0 is a data-recording artifact — e.g. the EHR writes
-    # a zero-dose "start" marker before the actual rate is entered, so the
-    # hourly mean for that partial first hour rounds to zero.  These patients
-    # ARE NE patients and must remain in every cohort.
+    # Verify the invariant NE > 0 at t=0 (t=0 IS the first NE administration) and
+    # attribute any violation to its cause.  Affected patients are NOT excluded —
+    # they are genuine NE patients whose first hourly mean is a plumbing artifact.
+    print("\nVerifying NE > 0 at t=0...")
+    ne_zero_diag = diagnose_ne_zero_at_t0(features, union_cohort, meds_converted, CLIF_DIR)
+    ne_zero_diag.to_csv(PATIENT_LEVEL_DIR / "ne_zero_at_t0_diagnostic.csv", index=False)
+
     ne_at_t0 = features[features["time_hour"] == 0].set_index("stay_id")["norepinephrine"]
     no_ne_ids = set(ne_at_t0[ne_at_t0 == 0].index)
     if no_ne_ids:
@@ -2091,9 +2358,8 @@ def main():
         n_rh  = int(cohort_rhee["stay_id"].isin(no_ne_ids).sum())
         n_rc  = int(cohort_rhee_clifpy["stay_id"].isin(no_ne_ids).sum())
         print(
-            f"\n  NOTE: {len(no_ne_ids)} patients have NE=0 at t=0 "
-            f"(Sepsis-3: {n_s3}, Rhee: {n_rh}, Rhee-clifpy: {n_rc}) — "
-            "kept in cohort (t=0 is NE start; zero is a recording artifact)."
+            f"  Affected per cohort — Sepsis-3: {n_s3}, Rhee: {n_rh}, "
+            f"Rhee-clifpy: {n_rc} (all retained)."
         )
 
     # Update "Final" rows to reflect post-validation counts, then write CSVs
@@ -2137,6 +2403,7 @@ def main():
     print("  cohort_rhee.parquet")
     print("  cohort_rhee_clifpy.parquet")
     print("  features.parquet  (union — filter to cohort IDs in downstream scripts)")
+    print("  ne_zero_at_t0_diagnostic.csv")
 
 
 if __name__ == "__main__":

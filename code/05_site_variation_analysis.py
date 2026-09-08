@@ -1761,8 +1761,9 @@ def _compute_cell_outcomes(
         return None
 
     # ever_vaso and first_vaso_hour come from features (action_vaso column).
-    # The cohort's first_vaso_time is only populated for the prior-vaso group
-    # (vaso_before_traj == 1) and cannot be used here.
+    # The cohort's first_vaso_time covers the whole hospitalization, including
+    # vasopressin that started before t=0, so it is not interchangeable with an
+    # on-grid initiation hour; the grid is the right source here.
     df["_ever_vaso"] = 0
     df["_time_to_vaso_h"] = np.nan
     df["_ne_at_init"] = np.nan

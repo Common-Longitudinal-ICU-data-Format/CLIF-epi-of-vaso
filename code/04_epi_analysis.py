@@ -287,7 +287,8 @@ pat = pat.merge(first_vaso, on="stay_id", how="left")
 _cohort_cols = ["stay_id", "hospital_death", "traj_hours",
                 "age", "gender", "race", "weight",
                 "sepsis_onset_sofa", "initial_lactate", "first_norepi_time"]
-for _c in ["trajectory_start", "vaso_before_traj", "first_vaso_time", "infection_dttm",
+for _c in ["trajectory_start", "vaso_before_traj", "vaso_before_ne", "vaso_to_ne_hours",
+           "first_vaso_time", "first_vaso_time_pretraj", "infection_dttm",
            "icu_los_days", "hospital_los_days", "traj_end_reason",
            "hospital_id", "hospital_type"]:   # hospital columns for vaso-category KM
     if _c in cohort.columns:
@@ -620,9 +621,15 @@ if _has_timing:
         pat.loc[_nfv_mask, "_h_ne_inf"] + pat.loc[_nfv_mask, "first_vaso_hour"]
     )
 
-    # Vaso-first: use saved first_vaso_time timestamp
-    if "first_vaso_time" in pat.columns:
-        _fvt = pd.to_datetime(pat["first_vaso_time"], utc=True, errors="coerce").dt.tz_localize(None)
+    # Vaso-first: use the saved vasopressin timestamp.  Prefer
+    # first_vaso_time_pretraj — the episode inside the 24 h window adjacent to
+    # NE start — over first_vaso_time, which is the first vasopressin anywhere
+    # in the hospitalization and may belong to an earlier, separate course.
+    _fvt_col = ("first_vaso_time_pretraj"
+                if "first_vaso_time_pretraj" in pat.columns
+                else "first_vaso_time")
+    if _fvt_col in pat.columns:
+        _fvt = pd.to_datetime(pat[_fvt_col], utc=True, errors="coerce").dt.tz_localize(None)
         _vf_mask = pat["vaso_group"] == "vaso_first"
         pat.loc[_vf_mask, "_h_vaso_inf"] = (
             _fvt.loc[_vf_mask] - _inf_dt.loc[_vf_mask]
@@ -3200,13 +3207,38 @@ if _avail_drugs_13:
     # ── 13b. vaso_timing_summary.csv ─────────────────────────────────────────
     # Federated-safe aggregate: for vasopressin recipients, per-drug summary of
     # timing difference (first co-drug dose − first vasopressin dose).
-    # Negative = co-drug started before vasopressin.
+    # Negative = co-drug started before vasopressin;
+    # positive = co-drug started after vasopressin.
+    #
+    # NE is handled separately from the other co-drugs.  Every other drug is
+    # timed off the hourly grid, which begins at t=0 = NE start, so a grid-based
+    # NE row is degenerate (first NE hour is 0 for essentially everyone) and
+    # structurally cannot see vasopressin that started BEFORE NE.  The NE rows
+    # below instead use the cohort timestamps (first_norepi_time,
+    # first_vaso_time), which cover the whole hospitalization, so:
+    #   direction == "before" → NE first, then vasopressin (the usual order)
+    #   direction == "after"  → VASOPRESSIN GIVEN BEFORE NE; n is the count of
+    #                           such patients and median_h/IQR the lead time
     _TIMING_SUPPRESS_K = 11
+
+    def _timing_row(drug, direction, series, basis):
+        _n = len(series)
+        if _n < _TIMING_SUPPRESS_K:
+            return {"drug": drug, "direction": direction, "n": _n,
+                    "suppressed": True, "median_h": None,
+                    "q25_h": None, "q75_h": None, "basis": basis}
+        return {"drug": drug, "direction": direction, "n": _n,
+                "suppressed": False,
+                "median_h": round(float(series.median()), 2),
+                "q25_h":   round(float(series.quantile(0.25)), 2),
+                "q75_h":   round(float(series.quantile(0.75)), 2),
+                "basis": basis}
+
     if "VASO" in _first13.columns:
         _vaso_mask13 = _combo13["any_VASO"]
         _timing_sum_rows = []
         for _, _name13 in _avail_drugs_13:
-            if _name13 == "VASO":
+            if _name13 in ("VASO", "NE"):
                 continue
             _ac_j13 = f"any_{_name13}"
             if _ac_j13 not in _combo13.columns:
@@ -3222,21 +3254,39 @@ if _avail_drugs_13:
                 ("after",  _diff13[_diff13 > 0]),
                 ("all",    _diff13),
             ]:
-                _n = len(_sub)
-                if _n < _TIMING_SUPPRESS_K:
-                    _timing_sum_rows.append({
-                        "drug": _name13, "direction": _direction,
-                        "n": _n, "suppressed": True,
-                        "median_h": None, "q25_h": None, "q75_h": None,
-                    })
-                else:
-                    _timing_sum_rows.append({
-                        "drug": _name13, "direction": _direction,
-                        "n": _n, "suppressed": False,
-                        "median_h": round(float(_sub.median()), 2),
-                        "q25_h":   round(float(_sub.quantile(0.25)), 2),
-                        "q75_h":   round(float(_sub.quantile(0.75)), 2),
-                    })
+                _timing_sum_rows.append(
+                    _timing_row(_name13, _direction, _sub, "hourly_grid")
+                )
+
+        # ── NE vs vasopressin from cohort timestamps ─────────────────────────
+        if {"first_norepi_time", "first_vaso_time"} <= set(pat.columns):
+            _ne_ts13 = pd.to_datetime(
+                pat["first_norepi_time"], utc=True, errors="coerce"
+            ).dt.tz_localize(None)
+            _vs_ts13 = pd.to_datetime(
+                pat["first_vaso_time"], utc=True, errors="coerce"
+            ).dt.tz_localize(None)
+            # Same sign convention as the grid-based rows above:
+            # negative = NE before vasopressin, positive = vasopressin first.
+            _ne_diff13 = ((_ne_ts13 - _vs_ts13).dt.total_seconds() / 3600).dropna()
+
+            if len(_ne_diff13):
+                for _direction, _sub in [
+                    ("before", _ne_diff13[_ne_diff13 < 0]),
+                    ("after",  _ne_diff13[_ne_diff13 > 0]),
+                    ("all",    _ne_diff13),
+                ]:
+                    _timing_sum_rows.append(
+                        _timing_row("NE", _direction, _sub, "cohort_timestamps")
+                    )
+                _n_vf13 = int((_ne_diff13 > 0).sum())
+                _n_sim13 = int((_ne_diff13 == 0).sum())
+                print(f"  13b vasopressin before NE: {_n_vf13:,} / {len(_ne_diff13):,} "
+                      f"vasopressin recipients ({_n_vf13/len(_ne_diff13)*100:.1f}%)"
+                      + (f"; {_n_sim13:,} simultaneous" if _n_sim13 else ""))
+        else:
+            print("  13b NE timing rows skipped (first_vaso_time not in cohort)")
+
         if _timing_sum_rows:
             pd.DataFrame(_timing_sum_rows).to_csv(AGG_DIR / "vaso_timing_summary.csv", index=False)
             print("  13b vaso_timing_summary.csv")

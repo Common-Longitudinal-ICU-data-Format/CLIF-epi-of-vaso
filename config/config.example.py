@@ -30,10 +30,11 @@ OUTPUT_ROOT = Path("/path/to/your/project")
 
 TIMEZONE = "UTC"          # Timezone for all datetime parsing
 TRAJECTORY_HOURS = 120    # Max hours of trajectory per patient
-NE_WINDOW_HOURS = 24      # NE must start within this many hours of ICU admit
+NE_WINDOW_HOURS = 24      # NE start (t=0) must fall within ±this many hours of
+                          #   the infection anchor (abx/blood-culture event)
 MIN_NE_RECORDS = 2        # Min NE administration records required
-SOFA_THRESHOLD = 2.0      # Min SOFA score at sepsis onset
-LACTATE_THRESHOLD = 2.0   # Min lactate (mmol/L) within 24h of infection
+SOFA_THRESHOLD = 2.0      # Retained for compatibility; NOT an inclusion criterion
+LACTATE_THRESHOLD = 2.0   # Min lactate (mmol/L); Sepsis-3 requires >, Rhee >=
 MAP_THRESHOLD = 65.0      # MAP threshold (mmHg) for vasopressor indication
 
 # Medication categories — must match your site's CLIF med_category values exactly
