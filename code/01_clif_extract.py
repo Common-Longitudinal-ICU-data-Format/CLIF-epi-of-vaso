@@ -1724,7 +1724,7 @@ def _load_and_convert_meds(co: ClifOrchestrator, stay_ids: list) -> pd.DataFrame
         )
         if not w_df.empty:
             med_df = co.medication_admin_continuous.df.copy().sort_values("admin_dttm")
-            med_keys = med_df[["hospitalization_id", "admin_dttm"]].drop_duplicates()
+            med_keys = med_df[["hospitalization_id", "admin_dttm"]].dropna(subset=["admin_dttm"]).drop_duplicates()
 
             wt_bwd = pd.merge_asof(
                 med_keys, w_df,
