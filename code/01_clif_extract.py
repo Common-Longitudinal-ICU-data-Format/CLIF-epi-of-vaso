@@ -1726,6 +1726,12 @@ def _load_and_convert_meds(co: ClifOrchestrator, stay_ids: list) -> pd.DataFrame
             med_df = co.medication_admin_continuous.df.copy().sort_values("admin_dttm")
             med_keys = med_df[["hospitalization_id", "admin_dttm"]].dropna(subset=["admin_dttm"]).drop_duplicates()
 
+            # Normalize datetime precision — clifpy returns us, raw parquet returns ns;
+            # pandas 2.0+ merge_asof requires identical dtypes.
+            med_keys = med_keys.copy()
+            med_keys["admin_dttm"] = med_keys["admin_dttm"].astype("datetime64[us, UTC]")
+            w_df["recorded_dttm"] = w_df["recorded_dttm"].astype("datetime64[us, UTC]")
+
             wt_bwd = pd.merge_asof(
                 med_keys, w_df,
                 left_on="admin_dttm", right_on="recorded_dttm",
