@@ -83,7 +83,15 @@ uv run python code/02_site_summary.py
 
 Writes aggregate CSVs to `output/upload_to_box_<SITE>/`.
 
-### 5. Run epidemiological analysis
+### 5. Run cohort comparison summary
+
+```bash
+uv run python code/03_cohort_comparison_summary.py
+```
+
+Compares the three cohort definitions (Sepsis-3, Rhee, Rhee-clifpy). Writes `output/upload_to_box_<SITE>/cohort_comparison/cohort_comparison_stats.json`.
+
+### 6. Run epidemiological analysis
 
 ```bash
 uv run python code/04_epi_analysis.py
@@ -91,17 +99,17 @@ uv run python code/04_epi_analysis.py
 
 Writes figures and aggregate CSVs to `output/upload_to_box_<SITE>/<cohort>/epi_analysis/`.
 
-### 6. Run eligible-but-untreated analysis
+### 7. Run site variation analysis
 
 ```bash
-uv run python code/06_eligible_untreated_analysis.py
+uv run python code/05_site_variation_analysis.py
 ```
 
-Classifies patients who sustained high NEE without vasopressin (comfort care / too brief / MAP recovered / unexpectedly untreated). Writes figures + summary CSV to `output/upload_to_box_<SITE>/<cohort>/eligible_untreated/`. Reads `clif_code_status.parquet` (beta — skips comfort-care classification gracefully if absent).
+Fits logistic models to decompose between-site variation in vasopressin initiation into patient case-mix, ward, hospital, and site-level components. Writes `output/upload_to_box_<SITE>/<cohort>/site_variation_packet_<cohort>_<SITE>.json`.
 
-### 7. Share your upload folder
+### 8. Share your upload folder
 
-**Share only `output/upload_to_box_<SITE>/`** with the coordinating site. This folder contains no patient-level data. Or use `run_pipeline.py` to run all steps (01–06) in sequence.
+**Share only `output/upload_to_box_<SITE>/`** with the coordinating site. This folder contains no patient-level data.
 
 See [`code/README.md`](code/README.md) for full script documentation.
 
