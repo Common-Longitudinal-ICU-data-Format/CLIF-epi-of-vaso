@@ -193,7 +193,10 @@ _DEVICE_REF = REF_DEVICE
 # comorbid_cirrhosis.  comorbid_liver_nocirrh (non-cirrhotic liver disease) is used
 # instead to form a mutually exclusive pair.
 # Must stay in sync with _BIN_COLS_MODELS in 08_cross_site_variation_analysis.py.
-_BIN_COLS_MODELS = [
+_BIN_COLS_MODELS = []
+
+# Original comorbidity list preserved here for compute_model_variants (v2_comorbid variant)
+_COMORBID_COLS = [
     "comorbid_cirrhosis",
     "comorbid_liver_nocirrh",
     "comorbid_cad",
@@ -369,6 +372,15 @@ def _prep_person_hours(cohort: pd.DataFrame, features: pd.DataFrame) -> pd.DataF
             ph[c] = ph[c].fillna(0).astype(int)
 
     ph = ph.dropna(subset=["nee", "age", "rrt", "device_category"] + _LOCF_COLS).copy()
+
+    # For the vaso_start (initiation) outcome analysis:
+    # vaso_start = 1 only at the first hour vasopressin is on, 0 otherwise.
+    # _at_risk_start = 1 for all hours before (and including) the first vaso hour.
+    # After initiation the patient exits the risk set and those rows should be excluded.
+    cum_before = ph.groupby("stay_id")["vaso_on"].cumsum() - ph["vaso_on"]
+    ph["vaso_start"] = ((ph["vaso_on"] == 1) & (cum_before == 0)).astype(int)
+    ph["_at_risk_start"] = (cum_before == 0).astype(int)
+
     return ph
 
 
@@ -465,6 +477,24 @@ def _build_design_matrix(
     ).astype(np.float64)
 
     return X, col_names, means, sds, nee_knots, time_knots, device_categories, present_bin_cols
+
+
+# ── Outcome selector ──────────────────────────────────────────────────────────
+def _filter_ph_for_outcome(ph: pd.DataFrame, outcome: str) -> pd.DataFrame:
+    """Return person-hours appropriate for the given outcome model.
+
+    outcome="on":    all person-hours; outcome = vaso_on (vasopressin being administered).
+    outcome="start": only at-risk hours (before or at first vasopressin hour);
+                     outcome = vaso_start (first hour of initiation, at most 1 per patient).
+
+    In both cases the returned df has a column named "vaso_on" so downstream
+    fitting functions (fit_site_logistic, fit_site_logistic_with_structure) work
+    without modification.
+    """
+    if outcome == "start":
+        ph = ph[ph["_at_risk_start"] == 1].copy()
+        ph["vaso_on"] = ph["vaso_start"]
+    return ph
 
 
 # ── Approach 1 & 2: Per-site logistic GLM ─────────────────────────────────────
@@ -2656,7 +2686,7 @@ def compute_model_variants(
     # ── Variant definitions ──────────────────────────────────────────────────
     _variants: dict = {
         "v1_original": [],
-        "v2_comorbid": list(_BIN_COLS_MODELS),
+        "v2_comorbid": list(_COMORBID_COLS),
     }
 
     # ── Derive Rhee OD criterion flags for v3 (Rhee cohorts only) ────────────
@@ -2753,6 +2783,73 @@ def compute_model_variants(
         }
 
     return variant_results
+
+
+def plot_outcome_comparison(
+    on_models: dict,
+    start_models: dict,
+    out_dir: Path,
+    cohort_label: str,
+    pal: dict,
+) -> None:
+    """Side-by-side forest plot comparing vaso_on vs vaso_start intercepts per site.
+
+    Left panel: per-site logit intercepts for vaso_on (administered).
+    Right panel: per-site logit intercepts for vaso_start (initiated).
+    Footer: DL tau², ICC, MOR for each outcome.
+    """
+    sites = sorted(set(on_models) & set(start_models))
+    if not sites:
+        return
+
+    def _dl(models):
+        alphas   = np.array([models[s]["coefficients"]["intercept"]["beta"] for s in sites])
+        alpha_se = np.array([models[s]["coefficients"]["intercept"]["se"]   for s in sites])
+        return _dl_pool(alphas, alpha_se ** 2)
+
+    dl_on    = _dl(on_models)    if len(sites) >= 2 else {}
+    dl_start = _dl(start_models) if len(sites) >= 2 else {}
+
+    fig, axes = plt.subplots(1, 2, figsize=(13, max(4, len(sites) * 0.9 + 3)),
+                             sharey=True)
+    y_pos = np.arange(len(sites))
+
+    for ax, models, label, dl in [
+        (axes[0], on_models,    "vaso ON\n(any administration hour)", dl_on),
+        (axes[1], start_models, "vaso START\n(initiation hour only)", dl_start),
+    ]:
+        for yi, s in enumerate(sites):
+            col = pal.get(s, "#888888")
+            alpha = models[s]["coefficients"]["intercept"]["beta"]
+            se    = models[s]["coefficients"]["intercept"]["se"]
+            ax.errorbar(alpha, yi, xerr=1.96 * se, fmt="D", color=col,
+                        capsize=5, markersize=8, linewidth=2, zorder=3)
+            ax.text(alpha + 1.96 * se + 0.03, yi,
+                    f"α={alpha:+.3f}", va="center", fontsize=8, color=col)
+        ax.axvline(0, color="#cccccc", linestyle="--", linewidth=1)
+        if dl:
+            ax.axvline(dl["pooled_alpha"], color="#222222", linewidth=1.5, alpha=0.8,
+                       linestyle=":")
+            ax.axvspan(dl["pooled_alpha"] - 1.96 * dl["se"],
+                       dl["pooled_alpha"] + 1.96 * dl["se"],
+                       alpha=0.10, color="grey")
+        tau_str = f"τ²={dl['tau2']:.4f}  ICC={dl['icc']:.3f}  MOR={dl['mor']:.3f}" if dl else "n/a"
+        ax.set_xlabel(f"Logit intercept ± 95% CI\n{tau_str}", fontsize=9)
+        ax.set_title(label, fontsize=10, fontweight="bold")
+
+    axes[0].set_yticks(y_pos)
+    axes[0].set_yticklabels(sites, fontsize=10)
+    fig.suptitle(
+        f"Outcome comparison: vasopressin ON vs. START  "
+        f"[{_COHORT_LABELS.get(cohort_label, cohort_label)}]",
+        fontsize=11, fontweight="bold",
+    )
+    fig.tight_layout()
+    out_dir.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_dir / f"outcome_comparison_{cohort_label}.png",
+                dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  Saved: outcome_comparison_{cohort_label}.png")
 
 
 def _discover_sites(output_root: Path) -> list:
@@ -2927,6 +3024,30 @@ def run_for_cohort(cohort_label: str):
             per_site_out,
             cohort_label,
             site,
+        )
+
+    # ── Outcome comparison: vasopressin ON vs. START ──────────────────────
+    print("\n--- Outcome comparison: vasopressin ON vs. START (initiation) ---")
+    start_site_models: dict = {}
+    for site in ph_by_site:
+        ph_start = _filter_ph_for_outcome(ph_by_site[site], "start")
+        print(f"  [{site}] at-risk rows: {len(ph_start):,}  "
+              f"events (vaso_start=1): {int(ph_start['vaso_on'].sum()):,}")
+        try:
+            start_site_models[site] = fit_site_logistic(ph_start, cohort_label, site)
+            m = start_site_models[site]
+            print(f"    α={m['coefficients']['intercept']['beta']:+.4f}  "
+                  f"P_ref={m['ref_patient_p_t5']:.1%}")
+        except Exception as _e:
+            print(f"    WARNING: START model failed for {site}: {_e}")
+
+    if start_site_models:
+        plot_outcome_comparison(
+            on_models=site_models,
+            start_models=start_site_models,
+            out_dir=cross_out,
+            cohort_label=cohort_label,
+            pal=pal,
         )
 
     # ── Save variation packets ────────────────────────────────────────────
