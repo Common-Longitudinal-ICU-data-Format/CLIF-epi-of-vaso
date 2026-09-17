@@ -88,7 +88,7 @@ _PRESSOR_COLS = ["norepinephrine", "epinephrine", "dopamine", "phenylephrine", "
 TABLE1_CONT = ["age", "weight", "cci_score", "norepinephrine", "nee", "heart_rate", "mbp",
                "respiratory_rate", "temperature", "gcs", "sepsis_onset_sofa", "wbc",
                "initial_lactate", "creatinine", "bun", "hemoglobin", "platelet", "bilirubin",
-               "icu_los_days", "hospital_los_days"]
+               "icu_los_days", "hospital_los_days", "vaso_init_hour"]
 TABLE1_BIN = ["_male", "ventil", "rrt"]
 
 TABLE2_CONT = TABLE1_CONT
@@ -259,7 +259,7 @@ def build_baseline_with_vaso(cohort_df, features_df):
     extra_cols = [c for c in hr0.columns if c not in ("stay_id", "time_hour")]
     base = cohort_df.merge(hr0[["stay_id"] + extra_cols], on="stay_id", how="left")
     flags = compute_vaso_flags(features_df)  # ever_vaso includes prior-vaso patients intentionally
-    base = base.merge(flags[["stay_id", "ever_vaso"]], on="stay_id", how="left")
+    base = base.merge(flags[["stay_id", "ever_vaso", "vaso_init_hour"]], on="stay_id", how="left")
     base["ever_vaso"] = base["ever_vaso"].fillna(0).astype(int)
     base["_male"] = (base["gender"] == "M").astype(int) if "gender" in base.columns else np.nan
     return base
