@@ -45,6 +45,23 @@ import pandas as pd
 sys.stdout.reconfigure(encoding="utf-8")
 warnings.filterwarnings("ignore")
 
+
+def savefig_robust(fig, path, retries: int = 5, delay: float = 2.0, **kwargs) -> None:
+    """Wrapper around fig.savefig that retries on transient OSError (e.g. Box Drive locks)."""
+    import time
+    path = Path(path)
+    for attempt in range(retries):
+        try:
+            fig.savefig(path, **kwargs)
+            return
+        except OSError as exc:
+            if attempt < retries - 1:
+                print(f"  savefig retry {attempt + 1}/{retries - 1} for {path.name}: {exc}")
+                time.sleep(delay)
+            else:
+                raise
+
+
 # ── configuration ─────────────────────────────────────────────────────────────
 BASE_DIR = Path(__file__).parent.parent
 
@@ -866,7 +883,7 @@ ax.legend(title="Pre-vaso max NEE", bbox_to_anchor=(1.02, 1), loc="upper left", 
 _add_risk_table(ax_risk, _risk0, _KM_TICK_TIMES, ax.get_xlim())
 fig.tight_layout()
 fig.subplots_adjust(left=0.18)
-fig.savefig(OUT_DIR / f"{SITE_LOWER}_analysis0_time_to_vaso_by_nee.png",
+savefig_robust(fig,OUT_DIR / f"{SITE_LOWER}_analysis0_time_to_vaso_by_nee.png",
             dpi=500, bbox_inches="tight")
 plt.close(fig)
 print("  Saved analysis0")
@@ -909,7 +926,7 @@ ax.legend(title="Pre-vaso max NEE bin", bbox_to_anchor=(1.02, 1), loc="upper lef
 _add_risk_table(ax_risk, _risk1, _KM_TICK_TIMES, ax.get_xlim())
 fig.tight_layout()
 fig.subplots_adjust(left=0.18)
-fig.savefig(OUT_DIR / f"{SITE_LOWER}_analysis1_km_nee_dose.png", dpi=500, bbox_inches="tight")
+savefig_robust(fig,OUT_DIR / f"{SITE_LOWER}_analysis1_km_nee_dose.png", dpi=500, bbox_inches="tight")
 plt.close(fig)
 print("  Saved analysis1")
 
@@ -955,7 +972,7 @@ ax.legend(fontsize=11)
 _add_risk_table(ax_risk, _risk15, _KM_TICK_TIMES, ax.get_xlim())
 fig.tight_layout()
 fig.subplots_adjust(left=0.18)
-fig.savefig(OUT_DIR / f"{SITE_LOWER}_analysis1_5_km_evervaso.png", dpi=500, bbox_inches="tight")
+savefig_robust(fig,OUT_DIR / f"{SITE_LOWER}_analysis1_5_km_evervaso.png", dpi=500, bbox_inches="tight")
 plt.close(fig)
 print("  Saved analysis1_5")
 
@@ -998,7 +1015,7 @@ ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda y, _: f"{y:.0%}"))
 ax.set_xlim(left=0)
 ax.set_ylim(bottom=0)
 fig.tight_layout()
-fig.savefig(OUT_DIR / f"{SITE_LOWER}_analysis2_B.png", dpi=500)
+savefig_robust(fig,OUT_DIR / f"{SITE_LOWER}_analysis2_B.png", dpi=500)
 plt.close(fig)
 print("  Saved analysis2_B")
 
@@ -1043,7 +1060,7 @@ ax.set_title(
     fontsize=12,
 )
 fig.tight_layout()
-fig.savefig(OUT_DIR / f"{SITE_LOWER}_analysis2_A.png", dpi=500)
+savefig_robust(fig,OUT_DIR / f"{SITE_LOWER}_analysis2_A.png", dpi=500)
 plt.close(fig)
 print("  Saved analysis2_A")
 
@@ -1072,7 +1089,7 @@ ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda y, _: f"{y:.0%}"))
 ax.set_xlim(left=0)
 ax.set_ylim(bottom=0)
 fig.tight_layout()
-fig.savefig(OUT_DIR / f"{SITE_LOWER}_analysis2_B_annotated.png", dpi=500)
+savefig_robust(fig,OUT_DIR / f"{SITE_LOWER}_analysis2_B_annotated.png", dpi=500)
 plt.close(fig)
 print("  Saved analysis2_B_annotated")
 
@@ -1129,7 +1146,7 @@ if _loc_col is not None:
         fontsize=12,
     )
     fig.tight_layout()
-    fig.savefig(OUT_DIR / f"{SITE_LOWER}_analysis2B_stratified.png",
+    savefig_robust(fig,OUT_DIR / f"{SITE_LOWER}_analysis2B_stratified.png",
                 dpi=500, bbox_inches="tight")
     plt.close(fig)
     print("  Saved analysis2B_stratified")
@@ -1198,7 +1215,7 @@ ax.set_title(
     fontsize=12,
 )
 fig.tight_layout()
-fig.savefig(OUT_DIR / f"{SITE_LOWER}_analysis2_C.png", dpi=500)
+savefig_robust(fig,OUT_DIR / f"{SITE_LOWER}_analysis2_C.png", dpi=500)
 plt.close(fig)
 print("  Saved analysis2_C")
 
@@ -1265,7 +1282,7 @@ if _comp_avail and len(ever_vaso_ids) > 0:
             fontsize=12,
         )
         fig.tight_layout()
-        fig.savefig(OUT_DIR / f"{SITE_LOWER}_analysis2D_nee_components_prevaso.png",
+        savefig_robust(fig,OUT_DIR / f"{SITE_LOWER}_analysis2D_nee_components_prevaso.png",
                     dpi=500, bbox_inches="tight")
         plt.close(fig)
         print("  Saved analysis2D_nee_components_prevaso")
@@ -1303,7 +1320,7 @@ if _comp_avail and len(ever_vaso_ids) > 0:
                 fontsize=12,
             )
             fig.tight_layout()
-            fig.savefig(OUT_DIR / f"{SITE_LOWER}_analysis2D_dose_prevaso.png",
+            savefig_robust(fig,OUT_DIR / f"{SITE_LOWER}_analysis2D_dose_prevaso.png",
                         dpi=500, bbox_inches="tight")
             plt.close(fig)
             print("  Saved analysis2D_dose_prevaso")
@@ -1870,7 +1887,7 @@ if _comp_avail:
             fontsize=12,
         )
         fig.tight_layout()
-        fig.savefig(OUT_DIR / f"{SITE_LOWER}_analysis2D_dose_by_nee.png",
+        savefig_robust(fig,OUT_DIR / f"{SITE_LOWER}_analysis2D_dose_by_nee.png",
                     dpi=500, bbox_inches="tight")
         plt.close(fig)
         print("  Saved analysis2D_dose_by_nee")
@@ -1902,7 +1919,7 @@ if _comp_avail:
             fontsize=12,
         )
         fig.tight_layout()
-        fig.savefig(OUT_DIR / f"{SITE_LOWER}_analysis2D_prop_by_nee.png",
+        savefig_robust(fig,OUT_DIR / f"{SITE_LOWER}_analysis2D_prop_by_nee.png",
                     dpi=500, bbox_inches="tight")
         plt.close(fig)
         print("  Saved analysis2D_prop_by_nee")
@@ -2036,7 +2053,7 @@ fig.suptitle(
     fontsize=13,
 )
 fig.tight_layout()
-fig.savefig(OUT_DIR / f"{SITE_LOWER}_analysis3.png", dpi=500, bbox_inches="tight")
+savefig_robust(fig,OUT_DIR / f"{SITE_LOWER}_analysis3.png", dpi=500, bbox_inches="tight")
 plt.close(fig)
 print("  Saved analysis3")
 
@@ -2148,7 +2165,7 @@ fig.suptitle(
     fontsize=12,
 )
 fig.tight_layout()
-fig.savefig(OUT_DIR / f"{SITE_LOWER}_analysis3_TOD.png", dpi=500, bbox_inches="tight")
+savefig_robust(fig,OUT_DIR / f"{SITE_LOWER}_analysis3_TOD.png", dpi=500, bbox_inches="tight")
 plt.close(fig)
 print("  Saved analysis3_TOD")
 
@@ -2173,7 +2190,7 @@ ax.set_ylabel("Number of patients", fontsize=11)
 ax.set_title(f"{SITE_NAME}: When is vasopressin started? (n={len(vaso_timing):,} patients)", fontsize=12)
 ax.legend(fontsize=11)
 fig.tight_layout()
-fig.savefig(OUT_DIR / f"{SITE_LOWER}_analysis4a_time_to_vaso.png", dpi=500)
+savefig_robust(fig,OUT_DIR / f"{SITE_LOWER}_analysis4a_time_to_vaso.png", dpi=500)
 plt.close(fig)
 print("  Saved analysis4a")
 
@@ -2290,7 +2307,7 @@ fig.suptitle(
     fontsize=12,
 )
 fig.tight_layout()
-fig.savefig(OUT_DIR / f"{SITE_LOWER}_analysis4d_nee_thresholds.png",
+savefig_robust(fig,OUT_DIR / f"{SITE_LOWER}_analysis4d_nee_thresholds.png",
             dpi=500, bbox_inches="tight")
 plt.close(fig)
 print("  Saved analysis4d_nee_thresholds")
@@ -2335,7 +2352,7 @@ fig.suptitle(
     fontsize=13,
 )
 fig.tight_layout()
-fig.savefig(OUT_DIR / f"{SITE_LOWER}_analysis4d_wait_time.png", dpi=500, bbox_inches="tight")
+savefig_robust(fig,OUT_DIR / f"{SITE_LOWER}_analysis4d_wait_time.png", dpi=500, bbox_inches="tight")
 plt.close(fig)
 print("  Saved analysis4d")
 
@@ -2383,7 +2400,7 @@ ax.set_xlim(0)
 ax.set_ylim(0, 1.02)
 ax.legend(title="TOD of vaso start", bbox_to_anchor=(1.02, 1), loc="upper left", fontsize=9)
 fig.tight_layout()
-fig.savefig(OUT_DIR / f"{SITE_LOWER}_analysis4d_tod_km.png", dpi=500, bbox_inches="tight")
+savefig_robust(fig,OUT_DIR / f"{SITE_LOWER}_analysis4d_tod_km.png", dpi=500, bbox_inches="tight")
 plt.close(fig)
 print("  Saved analysis4d_tod_km")
 
@@ -2538,7 +2555,7 @@ fig.suptitle(
     fontsize=12,
 )
 fig.tight_layout()
-fig.savefig(OUT_DIR / f"{SITE_LOWER}_analysis5_A.png", dpi=500, bbox_inches="tight")
+savefig_robust(fig,OUT_DIR / f"{SITE_LOWER}_analysis5_A.png", dpi=500, bbox_inches="tight")
 plt.close(fig)
 print("  Saved analysis5_A")
 
@@ -2603,7 +2620,7 @@ fig.suptitle(
     fontsize=13,
 )
 fig.tight_layout()
-fig.savefig(OUT_DIR / f"{SITE_LOWER}_analysis5_B.png", dpi=500, bbox_inches="tight")
+savefig_robust(fig,OUT_DIR / f"{SITE_LOWER}_analysis5_B.png", dpi=500, bbox_inches="tight")
 plt.close(fig)
 print("  Saved analysis5_B")
 
@@ -2703,7 +2720,7 @@ if len(_slope_df) > 0:
         fontsize=12,
     )
     fig.tight_layout()
-    fig.savefig(OUT_DIR / f"{SITE_LOWER}_analysis5_D_rate_of_change.png",
+    savefig_robust(fig,OUT_DIR / f"{SITE_LOWER}_analysis5_D_rate_of_change.png",
                 dpi=500, bbox_inches="tight")
     plt.close(fig)
     print("  Saved analysis5_D")
@@ -2738,7 +2755,7 @@ if len(_tod_sofa) >= 10:
     )
     ax.legend(fontsize=10)
     fig.tight_layout()
-    fig.savefig(OUT_DIR / f"{SITE_LOWER}_analysis5_E_tod_vs_sofa.png",
+    savefig_robust(fig,OUT_DIR / f"{SITE_LOWER}_analysis5_E_tod_vs_sofa.png",
                 dpi=500, bbox_inches="tight")
     plt.close(fig)
     print("  Saved analysis5_E")
@@ -2833,7 +2850,7 @@ if _DWELL_DOSE_COL is not None:
             fontsize=11,
         )
         fig.tight_layout()
-        fig.savefig(OUT_DIR / f"{SITE_LOWER}_analysis_dwell_time_by_dose.png",
+        savefig_robust(fig,OUT_DIR / f"{SITE_LOWER}_analysis_dwell_time_by_dose.png",
                     dpi=500, bbox_inches="tight")
         plt.close(fig)
         print("  Saved analysis_dwell_time_by_dose")
@@ -2893,7 +2910,7 @@ if _DWELL_DOSE_COL is not None:
                 fontsize=12,
             )
             fig.tight_layout()
-            fig.savefig(OUT_DIR / f"{SITE_LOWER}_analysis_dwell_vs_map.png",
+            savefig_robust(fig,OUT_DIR / f"{SITE_LOWER}_analysis_dwell_vs_map.png",
                         dpi=500, bbox_inches="tight")
             plt.close(fig)
             print("  Saved analysis_dwell_vs_map")
@@ -3314,13 +3331,17 @@ try:
     ).astype(str)
     _lr14["female"] = (_lr14["gender"].astype(str).str.upper().str.startswith("F")).astype(int)
     _RACE_MAP_14 = {
-        "White": "White",                                        "WHITE": "White",
-        "Black or African American": "Black or African American",
-        "BLACK/AFRICAN AMERICAN": "Black or African American",  "BLACK/AFRICAN": "Black or African American",
-        "Hispanic": "Hispanic",                                  "HISPANIC OR LATINO": "Hispanic",
-        "Asian": "Asian",                                        "ASIAN": "Asian",
+        "white": "White",
+        "black or african american": "Black or African American",
+        "black/african american": "Black or African American",
+        "black/african": "Black or African American",
+        "hispanic": "Hispanic",
+        "hispanic or latino": "Hispanic",
+        "asian": "Asian",
     }
-    _lr14["race_cat"] = _lr14["race"].map(_RACE_MAP_14).fillna("Other/Unknown")
+    _lr14["race_cat"] = (
+        _lr14["race"].str.strip().str.lower().map(_RACE_MAP_14).fillna("Other/Unknown")
+    )
     _lr14 = _lr14.dropna(subset=["age", "ever_vaso"])
     _lr14 = _lr14[_lr14["age_cat"] != "nan"].copy()
     _yr_vals14 = sorted(_lr14["anchor_year_group"].dropna().unique().tolist())
@@ -3389,13 +3410,17 @@ try:
     ).astype(float)
 
     _RACE_MAP_15 = {
-        "White": "White",                                    "WHITE": "White",
-        "Black or African American": "Black",
-        "BLACK/AFRICAN AMERICAN": "Black",                  "BLACK/AFRICAN": "Black",
-        "Hispanic": "Hispanic",                             "HISPANIC OR LATINO": "Hispanic",
-        "Asian": "Asian",                                   "ASIAN": "Asian",
+        "white": "White",
+        "black or african american": "Black",
+        "black/african american": "Black",
+        "black/african": "Black",
+        "hispanic": "Hispanic",
+        "hispanic or latino": "Hispanic",
+        "asian": "Asian",
     }
-    _lm15["race_cat"] = _lm15["race"].map(_RACE_MAP_15).fillna("Other/Unknown")
+    _lm15["race_cat"] = (
+        _lm15["race"].str.strip().str.lower().map(_RACE_MAP_15).fillna("Other/Unknown")
+    )
 
     _lm15_mu_sd = {}
     for _c15 in ["age", "sofa_at_init", "lac_at_init", "mbp_at_init"]:

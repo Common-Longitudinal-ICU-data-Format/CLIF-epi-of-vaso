@@ -786,7 +786,9 @@ def get_demographics(clif_dir: Path, stay_ids: set) -> pd.DataFrame:
     demo = demo.rename(columns={"hospitalization_id": "stay_id"})
     demo["gender"] = demo["sex_category"].map({"Male": "M", "Female": "F"})
     demo["race"] = demo.apply(
-        lambda r: "Hispanic" if r["ethnicity_category"] == "Hispanic" else r["race_category"],
+        lambda r: "Hispanic"
+        if str(r["ethnicity_category"]).strip().lower() == "hispanic"
+        else r["race_category"],
         axis=1,
     )
     return demo[["stay_id", "gender", "race"]]
