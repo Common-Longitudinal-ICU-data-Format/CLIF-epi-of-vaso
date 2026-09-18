@@ -166,7 +166,7 @@ def get_all_ne_starts(clif_dir: Path) -> pd.DataFrame:
 def get_abx_records(clif_dir: Path) -> pd.DataFrame:
     """CMS qualifying IV antibiotics with UTC timestamp and calendar date."""
     meds_i = pd.read_parquet(clif_dir / "clif_medication_admin_intermittent.parquet")
-    abx = meds_i[meds_i["med_group"] == "CMS_sepsis_qualifying_antibiotics"][
+    abx = meds_i[meds_i["med_group"].str.lower() == "cms_sepsis_qualifying_antibiotics"][
         ["hospitalization_id", "admin_dttm"]
     ].copy()
     abx["admin_dttm"] = to_naive_utc(abx["admin_dttm"])
