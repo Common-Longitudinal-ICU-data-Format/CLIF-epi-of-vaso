@@ -154,7 +154,7 @@ if _args.cohort == "both":
             _kmf = _KMF()
             _kmf.fit(_sub["traj_hours"], event_observed=_sub["death_in_window"],
                      label=f"{_KM_LABEL[(_cn, _ev)]} (n={len(_sub):,})")
-            _kmf.plot_survival_function(_ax_km, ci_show=True, color=_col,
+            _kmf.plot_survival_function(ax=_ax_km, ci_show=True, color=_col,
                                         linestyle=_ls, linewidth=2)
             _lr_data[(_cn, _ev)] = (_sub["traj_hours"].values,
                                     _sub["death_in_window"].values)
