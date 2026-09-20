@@ -2896,6 +2896,13 @@ def run_for_cohort(cohort_label: str):
             site_features = site_features[site_features["stay_id"].isin(site_ids)].copy()
             features_by_site[site] = site_features
             ph = _prep_person_hours(site_cohort, site_features)
+            print(f"    ph.shape after prep: {ph.shape}")
+            if ph.empty:
+                _diag_cols = ["nee", "age", "rrt", "device_category"] + _LOCF_COLS
+                _raw = site_features[site_features["stay_id"].isin(site_ids)]
+                _nan_counts = _raw[[c for c in _diag_cols if c in _raw.columns]].isnull().sum()
+                print(f"    NaN counts in raw features (before dropna):\n{_nan_counts.to_string()}")
+                print(f"    Total raw rows: {len(_raw)}")
             site_models[site] = fit_site_logistic(ph, cohort_label, site)
             ph_by_site[site]  = ph
             cohort_by_site[site] = site_cohort
