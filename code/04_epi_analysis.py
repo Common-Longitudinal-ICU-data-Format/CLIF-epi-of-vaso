@@ -8,10 +8,11 @@ Reads (PHI, local only):
   output/patient_level_data_<SITE>/cohort_<cohort>.parquet   (sepsis3 or rhee)
   output/patient_level_data_<SITE>/features.parquet          (union; filtered to cohort here)
 
-Writes figures to:
-  output/upload_to_box_<SITE>/<cohort>/epi_analysis/
+Writes (site-specific, aggregate-only data leaves the site):
+  output/upload_to_box_<SITE>/<cohort>/epi_analysis/   aggregate CSVs read by 07/12
+  output/upload_to_box_<SITE>/<cohort>/plots/          every PNG/HTML figure (one folder)
 
-ICC/hazard/effects models → run 05_site_variation_analysis.py separately.
+GLM / ICU-type variation models → run 05_site_variation_analysis.py separately.
 
 Analyses:
   1    KM survival curves by max NEE dose bin (0, 0.1, 0.2, 0.3, 0.5, 0.7, 1.0 μg/kg/min)
@@ -95,7 +96,7 @@ if _args.cohort == "both":
     _site_name = _args.site if _args.site else getattr(_cfg_mod, "SITE_NAME", "UCMC")
     _out_root  = Path(getattr(_cfg_mod, "OUTPUT_ROOT", "."))
     _pl_dir    = _out_root / "output" / f"patient_level_data_{_site_name}"
-    _cc_dir    = _out_root / "output" / f"upload_to_box_{_site_name}" / "cohort_comparison"
+    _cc_dir    = _out_root / "output" / f"upload_to_box_{_site_name}" / "plots"
     _cc_dir.mkdir(parents=True, exist_ok=True)
 
     import matplotlib; matplotlib.use("Agg")
@@ -212,8 +213,10 @@ COHORT_NAME = _args.cohort
 OUTPUT_ROOT = Path(getattr(_cfg, "OUTPUT_ROOT", "."))
 
 PATIENT_LEVEL_DIR = OUTPUT_ROOT / "output" / f"patient_level_data_{SITE_NAME}"
-OUT_DIR = OUTPUT_ROOT / "output" / f"upload_to_box_{SITE_NAME}" / COHORT_NAME / "epi_analysis"
+OUT_DIR  = OUTPUT_ROOT / "output" / f"upload_to_box_{SITE_NAME}" / COHORT_NAME / "epi_analysis"
+PLOT_DIR = OUT_DIR.parent / "plots"          # all figures for this site/cohort
 OUT_DIR.mkdir(parents=True, exist_ok=True)
+PLOT_DIR.mkdir(parents=True, exist_ok=True)
 
 SITE_LOWER = SITE_NAME.lower()
 
@@ -451,6 +454,18 @@ ever_vaso_ids  = set(pat.loc[pat["ever_vaso"] == 1, "stay_id"])
 never_vaso_ids = set(pat.loc[pat["ever_vaso"] == 0, "stay_id"])
 print(f"  {len(ever_vaso_ids):,} ever-vaso ({len(ever_vaso_ids)/len(cohort):.1%}), "
       f"{len(never_vaso_ids):,} never-vaso")
+
+# ── Never-vaso mortality summary (for pressor strategy figure) ─────────────
+_nv = pat[pat["ever_vaso"] == 0]
+_nv_n    = len(_nv)
+_nv_died = int(_nv["hospital_death"].sum()) if "hospital_death" in _nv.columns else 0
+pd.DataFrame([{
+    "n_never_vaso": _nv_n,
+    "n_died":       _nv_died,
+    "n_survived":   _nv_n - _nv_died,
+}]).to_csv(OUT_DIR / "never_vaso_mortality.csv", index=False)
+print(f"  Saved never_vaso_mortality.csv "
+      f"({_nv_n:,} never-vaso: {_nv_n - _nv_died:,} survived, {_nv_died:,} died)")
 
 
 # ── helpers ───────────────────────────────────────────────────────────────────
@@ -693,7 +708,7 @@ if _has_timing:
         fontsize=12,
     )
     fig05.tight_layout()
-    _timing_png = OUT_DIR / f"{SITE_LOWER}_analysis05_ne_vaso_timing_infection.png"
+    _timing_png = PLOT_DIR / f"{SITE_LOWER}_analysis05_ne_vaso_timing_infection.png"
     fig05.savefig(_timing_png, dpi=300, bbox_inches="tight")
     plt.close(fig05)
     print("  Saved timing plot")
@@ -792,7 +807,7 @@ if _has_timing:
 {_sw_section}
 </body></html>"""
 
-    _html_path_05 = OUT_DIR / f"{SITE_LOWER}_analysis05_prior_vaso.html"
+    _html_path_05 = PLOT_DIR / f"{SITE_LOWER}_analysis05_prior_vaso.html"
     _html_path_05.write_text(_html_05, encoding="utf-8")
     print(f"  Saved {_html_path_05.name}")
 
@@ -883,7 +898,7 @@ ax.legend(title="Pre-vaso max NEE", bbox_to_anchor=(1.02, 1), loc="upper left", 
 _add_risk_table(ax_risk, _risk0, _KM_TICK_TIMES, ax.get_xlim())
 fig.tight_layout()
 fig.subplots_adjust(left=0.18)
-savefig_robust(fig,OUT_DIR / f"{SITE_LOWER}_analysis0_time_to_vaso_by_nee.png",
+savefig_robust(fig,PLOT_DIR / f"{SITE_LOWER}_analysis0_time_to_vaso_by_nee.png",
             dpi=500, bbox_inches="tight")
 plt.close(fig)
 print("  Saved analysis0")
@@ -926,7 +941,7 @@ ax.legend(title="Pre-vaso max NEE bin", bbox_to_anchor=(1.02, 1), loc="upper lef
 _add_risk_table(ax_risk, _risk1, _KM_TICK_TIMES, ax.get_xlim())
 fig.tight_layout()
 fig.subplots_adjust(left=0.18)
-savefig_robust(fig,OUT_DIR / f"{SITE_LOWER}_analysis1_km_nee_dose.png", dpi=500, bbox_inches="tight")
+savefig_robust(fig,PLOT_DIR / f"{SITE_LOWER}_analysis1_km_nee_dose.png", dpi=500, bbox_inches="tight")
 plt.close(fig)
 print("  Saved analysis1")
 
@@ -972,7 +987,7 @@ ax.legend(fontsize=11)
 _add_risk_table(ax_risk, _risk15, _KM_TICK_TIMES, ax.get_xlim())
 fig.tight_layout()
 fig.subplots_adjust(left=0.18)
-savefig_robust(fig,OUT_DIR / f"{SITE_LOWER}_analysis1_5_km_evervaso.png", dpi=500, bbox_inches="tight")
+savefig_robust(fig,PLOT_DIR / f"{SITE_LOWER}_analysis1_5_km_evervaso.png", dpi=500, bbox_inches="tight")
 plt.close(fig)
 print("  Saved analysis1_5")
 
@@ -1015,7 +1030,7 @@ ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda y, _: f"{y:.0%}"))
 ax.set_xlim(left=0)
 ax.set_ylim(bottom=0)
 fig.tight_layout()
-savefig_robust(fig,OUT_DIR / f"{SITE_LOWER}_analysis2_B.png", dpi=500)
+savefig_robust(fig,PLOT_DIR / f"{SITE_LOWER}_analysis2_B.png", dpi=500)
 plt.close(fig)
 print("  Saved analysis2_B")
 
@@ -1060,7 +1075,7 @@ ax.set_title(
     fontsize=12,
 )
 fig.tight_layout()
-savefig_robust(fig,OUT_DIR / f"{SITE_LOWER}_analysis2_A.png", dpi=500)
+savefig_robust(fig,PLOT_DIR / f"{SITE_LOWER}_analysis2_A.png", dpi=500)
 plt.close(fig)
 print("  Saved analysis2_A")
 
@@ -1089,7 +1104,7 @@ ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda y, _: f"{y:.0%}"))
 ax.set_xlim(left=0)
 ax.set_ylim(bottom=0)
 fig.tight_layout()
-savefig_robust(fig,OUT_DIR / f"{SITE_LOWER}_analysis2_B_annotated.png", dpi=500)
+savefig_robust(fig,PLOT_DIR / f"{SITE_LOWER}_analysis2_B_annotated.png", dpi=500)
 plt.close(fig)
 print("  Saved analysis2_B_annotated")
 
@@ -1146,7 +1161,7 @@ if _loc_col is not None:
         fontsize=12,
     )
     fig.tight_layout()
-    savefig_robust(fig,OUT_DIR / f"{SITE_LOWER}_analysis2B_stratified.png",
+    savefig_robust(fig,PLOT_DIR / f"{SITE_LOWER}_analysis2B_stratified.png",
                 dpi=500, bbox_inches="tight")
     plt.close(fig)
     print("  Saved analysis2B_stratified")
@@ -1215,7 +1230,7 @@ ax.set_title(
     fontsize=12,
 )
 fig.tight_layout()
-savefig_robust(fig,OUT_DIR / f"{SITE_LOWER}_analysis2_C.png", dpi=500)
+savefig_robust(fig,PLOT_DIR / f"{SITE_LOWER}_analysis2_C.png", dpi=500)
 plt.close(fig)
 print("  Saved analysis2_C")
 
@@ -1282,7 +1297,7 @@ if _comp_avail and len(ever_vaso_ids) > 0:
             fontsize=12,
         )
         fig.tight_layout()
-        savefig_robust(fig,OUT_DIR / f"{SITE_LOWER}_analysis2D_nee_components_prevaso.png",
+        savefig_robust(fig,PLOT_DIR / f"{SITE_LOWER}_analysis2D_nee_components_prevaso.png",
                     dpi=500, bbox_inches="tight")
         plt.close(fig)
         print("  Saved analysis2D_nee_components_prevaso")
@@ -1320,7 +1335,7 @@ if _comp_avail and len(ever_vaso_ids) > 0:
                 fontsize=12,
             )
             fig.tight_layout()
-            savefig_robust(fig,OUT_DIR / f"{SITE_LOWER}_analysis2D_dose_prevaso.png",
+            savefig_robust(fig,PLOT_DIR / f"{SITE_LOWER}_analysis2D_dose_prevaso.png",
                         dpi=500, bbox_inches="tight")
             plt.close(fig)
             print("  Saved analysis2D_dose_prevaso")
@@ -1607,10 +1622,18 @@ if _comp_avail and len(ever_vaso_ids) > 0:
                             _adf = pd.concat([_adf, _dums], axis=1)
                             _cat_dummy_cols += list(_dums.columns)
 
-                    _all_cov = _adf_cont + _cat_dummy_cols
                     _adf_clean = _adf.dropna(
                         subset=["other_pressor", "hospital_death"] + _adf_cont
                     ).reset_index(drop=True)
+
+                    # Drop dummy columns that are near-constant in the analytic sample
+                    # (fewer than _MIN_CELL positives or negatives) — these cause
+                    # quasi-complete separation and a PerfectSeparationError in statsmodels.
+                    _safe_dummies = [
+                        c for c in _cat_dummy_cols
+                        if _MIN_CELL <= int(_adf_clean[c].fillna(0).sum()) <= len(_adf_clean) - _MIN_CELL
+                    ]
+                    _all_cov = _adf_cont + _safe_dummies
                     _ok_var = _adf_clean["other_pressor"].nunique() == 2
                     _ok_n   = len(_adf_clean) >= 2 * _MIN_CELL
 
@@ -1642,11 +1665,12 @@ if _comp_avail and len(ever_vaso_ids) > 0:
 
                     # ── Propensity score matching ───────────────────────────
                     if _ok_var and _ok_n:
-                        # PS model uses continuous severity only (not hospital_type)
+                        # PS model uses continuous severity only (not hospital_type);
+                        # also exclude near-constant ICU dummies (same rule as logreg).
                         _ps_cov = [c for c in _adf_cont
                                    if _adf_clean[c].notna().mean() > 0.8]
                         _ps_X_cols = _ps_cov + [
-                            c for c in _cat_dummy_cols if c.startswith("icu_")
+                            c for c in _safe_dummies if c.startswith("icu_")
                         ]
                         _ps_df = _adf_clean.dropna(subset=_ps_X_cols).copy()
 
@@ -1741,7 +1765,9 @@ if _comp_avail and len(ever_vaso_ids) > 0:
                             print(f"  PSM: {_n_pairs} pairs within caliper — skipping")
 
                 except Exception as _e_psm_lr:
+                    import traceback as _tb
                     print(f"  pressor_strategy logreg/PSM failed: {_e_psm_lr}")
+                    print(_tb.format_exc())
 
                 # ── Pressor-strategy survival table (federated-safe) ──────────
                 # Produces KM summary at fixed time points — no patient IDs,
@@ -1818,31 +1844,6 @@ if _comp_avail and len(ever_vaso_ids) > 0:
 else:
     print("  Skipped analysis2D (NEE component columns not in features)")
 
-# ── Mortality by hospital type (all patients) ──────────────────────────────
-print("Mortality by hospital type...")
-_SUPPRESS_K = 11
-_ht_src_mort = (
-    pat[["stay_id", "hospital_type"]] if "hospital_type" in pat.columns
-    else cohort[["stay_id", "hospital_type"]] if "hospital_type" in cohort.columns
-    else None
-)
-if _ht_src_mort is not None and "hospital_death" in pat.columns:
-    _pat_ht = pat[["stay_id", "hospital_death"]].merge(_ht_src_mort, on="stay_id", how="left")
-    _mort_ht_rows = []
-    for _ht, _g in _pat_ht.groupby("hospital_type", dropna=True):
-        _n, _nd = len(_g), int(_g["hospital_death"].sum())
-        _ok = _n >= _SUPPRESS_K
-        _mort_ht_rows.append({
-            "hospital_type": _ht,
-            "n_patients": _n if _ok else None,
-            "n_deaths": _nd if _ok else None,
-            "mortality_pct": round(_nd / _n * 100, 1) if (_ok and _n > 0) else None,
-        })
-    pd.DataFrame(_mort_ht_rows).to_csv(OUT_DIR / "mortality_by_hospital_type.csv", index=False)
-    print("  Saved mortality_by_hospital_type.csv")
-else:
-    print("  Skipped mortality_by_hospital_type (hospital_type or hospital_death not in cohort)")
-
 # ── 2D_dose_by_nee / 2D_prop_by_nee: drug mix by NEE dose bin (all hours) ────
 print("Analysis 2D by NEE dose bin: dose contribution and proportion per bin...")
 if _comp_avail:
@@ -1887,7 +1888,7 @@ if _comp_avail:
             fontsize=12,
         )
         fig.tight_layout()
-        savefig_robust(fig,OUT_DIR / f"{SITE_LOWER}_analysis2D_dose_by_nee.png",
+        savefig_robust(fig,PLOT_DIR / f"{SITE_LOWER}_analysis2D_dose_by_nee.png",
                     dpi=500, bbox_inches="tight")
         plt.close(fig)
         print("  Saved analysis2D_dose_by_nee")
@@ -1919,7 +1920,7 @@ if _comp_avail:
             fontsize=12,
         )
         fig.tight_layout()
-        savefig_robust(fig,OUT_DIR / f"{SITE_LOWER}_analysis2D_prop_by_nee.png",
+        savefig_robust(fig,PLOT_DIR / f"{SITE_LOWER}_analysis2D_prop_by_nee.png",
                     dpi=500, bbox_inches="tight")
         plt.close(fig)
         print("  Saved analysis2D_prop_by_nee")
@@ -2053,7 +2054,7 @@ fig.suptitle(
     fontsize=13,
 )
 fig.tight_layout()
-savefig_robust(fig,OUT_DIR / f"{SITE_LOWER}_analysis3.png", dpi=500, bbox_inches="tight")
+savefig_robust(fig,PLOT_DIR / f"{SITE_LOWER}_analysis3.png", dpi=500, bbox_inches="tight")
 plt.close(fig)
 print("  Saved analysis3")
 
@@ -2165,7 +2166,7 @@ fig.suptitle(
     fontsize=12,
 )
 fig.tight_layout()
-savefig_robust(fig,OUT_DIR / f"{SITE_LOWER}_analysis3_TOD.png", dpi=500, bbox_inches="tight")
+savefig_robust(fig,PLOT_DIR / f"{SITE_LOWER}_analysis3_TOD.png", dpi=500, bbox_inches="tight")
 plt.close(fig)
 print("  Saved analysis3_TOD")
 
@@ -2190,7 +2191,7 @@ ax.set_ylabel("Number of patients", fontsize=11)
 ax.set_title(f"{SITE_NAME}: When is vasopressin started? (n={len(vaso_timing):,} patients)", fontsize=12)
 ax.legend(fontsize=11)
 fig.tight_layout()
-savefig_robust(fig,OUT_DIR / f"{SITE_LOWER}_analysis4a_time_to_vaso.png", dpi=500)
+savefig_robust(fig,PLOT_DIR / f"{SITE_LOWER}_analysis4a_time_to_vaso.png", dpi=500)
 plt.close(fig)
 print("  Saved analysis4a")
 
@@ -2307,7 +2308,7 @@ fig.suptitle(
     fontsize=12,
 )
 fig.tight_layout()
-savefig_robust(fig,OUT_DIR / f"{SITE_LOWER}_analysis4d_nee_thresholds.png",
+savefig_robust(fig,PLOT_DIR / f"{SITE_LOWER}_analysis4d_nee_thresholds.png",
             dpi=500, bbox_inches="tight")
 plt.close(fig)
 print("  Saved analysis4d_nee_thresholds")
@@ -2352,7 +2353,7 @@ fig.suptitle(
     fontsize=13,
 )
 fig.tight_layout()
-savefig_robust(fig,OUT_DIR / f"{SITE_LOWER}_analysis4d_wait_time.png", dpi=500, bbox_inches="tight")
+savefig_robust(fig,PLOT_DIR / f"{SITE_LOWER}_analysis4d_wait_time.png", dpi=500, bbox_inches="tight")
 plt.close(fig)
 print("  Saved analysis4d")
 
@@ -2400,7 +2401,7 @@ ax.set_xlim(0)
 ax.set_ylim(0, 1.02)
 ax.legend(title="TOD of vaso start", bbox_to_anchor=(1.02, 1), loc="upper left", fontsize=9)
 fig.tight_layout()
-savefig_robust(fig,OUT_DIR / f"{SITE_LOWER}_analysis4d_tod_km.png", dpi=500, bbox_inches="tight")
+savefig_robust(fig,PLOT_DIR / f"{SITE_LOWER}_analysis4d_tod_km.png", dpi=500, bbox_inches="tight")
 plt.close(fig)
 print("  Saved analysis4d_tod_km")
 
@@ -2555,7 +2556,7 @@ fig.suptitle(
     fontsize=12,
 )
 fig.tight_layout()
-savefig_robust(fig,OUT_DIR / f"{SITE_LOWER}_analysis5_A.png", dpi=500, bbox_inches="tight")
+savefig_robust(fig,PLOT_DIR / f"{SITE_LOWER}_analysis5_A.png", dpi=500, bbox_inches="tight")
 plt.close(fig)
 print("  Saved analysis5_A")
 
@@ -2620,7 +2621,7 @@ fig.suptitle(
     fontsize=13,
 )
 fig.tight_layout()
-savefig_robust(fig,OUT_DIR / f"{SITE_LOWER}_analysis5_B.png", dpi=500, bbox_inches="tight")
+savefig_robust(fig,PLOT_DIR / f"{SITE_LOWER}_analysis5_B.png", dpi=500, bbox_inches="tight")
 plt.close(fig)
 print("  Saved analysis5_B")
 
@@ -2720,7 +2721,7 @@ if len(_slope_df) > 0:
         fontsize=12,
     )
     fig.tight_layout()
-    savefig_robust(fig,OUT_DIR / f"{SITE_LOWER}_analysis5_D_rate_of_change.png",
+    savefig_robust(fig,PLOT_DIR / f"{SITE_LOWER}_analysis5_D_rate_of_change.png",
                 dpi=500, bbox_inches="tight")
     plt.close(fig)
     print("  Saved analysis5_D")
@@ -2755,7 +2756,7 @@ if len(_tod_sofa) >= 10:
     )
     ax.legend(fontsize=10)
     fig.tight_layout()
-    savefig_robust(fig,OUT_DIR / f"{SITE_LOWER}_analysis5_E_tod_vs_sofa.png",
+    savefig_robust(fig,PLOT_DIR / f"{SITE_LOWER}_analysis5_E_tod_vs_sofa.png",
                 dpi=500, bbox_inches="tight")
     plt.close(fig)
     print("  Saved analysis5_E")
@@ -2850,7 +2851,7 @@ if _DWELL_DOSE_COL is not None:
             fontsize=11,
         )
         fig.tight_layout()
-        savefig_robust(fig,OUT_DIR / f"{SITE_LOWER}_analysis_dwell_time_by_dose.png",
+        savefig_robust(fig,PLOT_DIR / f"{SITE_LOWER}_analysis_dwell_time_by_dose.png",
                     dpi=500, bbox_inches="tight")
         plt.close(fig)
         print("  Saved analysis_dwell_time_by_dose")
@@ -2910,7 +2911,7 @@ if _DWELL_DOSE_COL is not None:
                 fontsize=12,
             )
             fig.tight_layout()
-            savefig_robust(fig,OUT_DIR / f"{SITE_LOWER}_analysis_dwell_vs_map.png",
+            savefig_robust(fig,PLOT_DIR / f"{SITE_LOWER}_analysis_dwell_vs_map.png",
                         dpi=500, bbox_inches="tight")
             plt.close(fig)
             print("  Saved analysis_dwell_vs_map")
@@ -2921,7 +2922,7 @@ if _DWELL_DOSE_COL is not None:
 else:
     print("  Skipped dwell-time analysis (norepinephrine column not in features)")
 
-print(f"\nAll figures written to: {OUT_DIR}")
+print(f"\nAll figures written to: {PLOT_DIR}")
 
 # =============================================================================
 # Save aggregates — federated-safe CSVs + plot copies for upload_to_box_{SITE}
@@ -3313,79 +3314,6 @@ if _avail_drugs_13:
         print("  13b skipped vaso_timing_summary (no VASO feature column)")
 else:
     print("  13/14 skipped vasopressor_combinations (no drug columns in features)")
-
-# ── 14. vaso_receipt_logreg.csv ───────────────────────────────────────────────
-try:
-    import re as _re14
-    import statsmodels.formula.api as _smf14
-    _lr14 = pat[["stay_id", "ever_vaso", "age", "gender", "race"]].copy()
-    if "anchor_year_group" in cohort.columns:
-        _lr14 = _lr14.merge(cohort[["stay_id", "anchor_year_group"]], on="stay_id", how="left")
-    else:
-        _lr14["anchor_year_group"] = "unknown"
-    _lr14["age_cat"] = pd.cut(
-        _lr14["age"],
-        bins=[0, 50, 65, 75, 85, np.inf],
-        labels=["<50", "50-64", "65-74", "75-84", ">=85"],
-        right=False,
-    ).astype(str)
-    _lr14["female"] = (_lr14["gender"].astype(str).str.upper().str.startswith("F")).astype(int)
-    _RACE_MAP_14 = {
-        "white": "White",
-        "black or african american": "Black or African American",
-        "black/african american": "Black or African American",
-        "black/african": "Black or African American",
-        "hispanic": "Hispanic",
-        "hispanic or latino": "Hispanic",
-        "asian": "Asian",
-    }
-    _lr14["race_cat"] = (
-        _lr14["race"].str.strip().str.lower().map(_RACE_MAP_14).fillna("Other/Unknown")
-    )
-    _lr14 = _lr14.dropna(subset=["age", "ever_vaso"])
-    _lr14 = _lr14[_lr14["age_cat"] != "nan"].copy()
-    _yr_vals14 = sorted(_lr14["anchor_year_group"].dropna().unique().tolist())
-    _has_year14 = len(_yr_vals14) > 1 and "unknown" not in _yr_vals14
-    _formula14 = (
-        "ever_vaso ~ C(age_cat, Treatment('<50')) + female"
-        " + C(race_cat, Treatment('White'))"
-        + (" + C(anchor_year_group)" if _has_year14 else "")
-    )
-    _mod14 = _smf14.logit(_formula14, data=_lr14).fit(disp=0)
-    _ci14  = _mod14.conf_int()
-    _ci14.columns = ["ci_lo", "ci_hi"]
-
-    def _param_label_14(p):
-        m = _re14.search(r"age_cat.*\[T\.(.+?)\]", p)
-        if m: return f"Age: {m.group(1)} vs <50"
-        if p == "female": return "Female vs Male"
-        m = _re14.search(r"race_cat.*\[T\.(.+?)\]", p)
-        if m: return f"Race: {m.group(1)} vs White"
-        m = _re14.search(r"anchor_year_group.*\[T\.(.+?)\]", p)
-        if m: return f"Year: {m.group(1)}"
-        return p
-
-    _lr_rows14 = []
-    for _p, _coef, _cilo, _cihi, _pv in zip(
-        _mod14.params.index, _mod14.params.values,
-        _ci14["ci_lo"].values, _ci14["ci_hi"].values,
-        _mod14.pvalues.values,
-    ):
-        if _p == "Intercept":
-            continue
-        _lr_rows14.append(dict(
-            param=_p,
-            label=_param_label_14(_p),
-            or_est=round(float(np.exp(_coef)), 3),
-            or_lo=round(float(np.exp(_cilo)), 3),
-            or_hi=round(float(np.exp(_cihi)), 3),
-            pval=round(float(_pv), 4),
-            n_obs=int(_mod14.nobs),
-        ))
-    pd.DataFrame(_lr_rows14).to_csv(AGG_DIR / "vaso_receipt_logreg.csv", index=False)
-    print("  14/14 vaso_receipt_logreg.csv")
-except Exception as _e14:
-    print(f"  14/14 skipped vaso_receipt_logreg: {_e14}")
 
 print(f"\nAggregate CSVs written to: {AGG_DIR}")
 

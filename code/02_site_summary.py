@@ -9,19 +9,15 @@ Reads (PHI, local only):
   output/patient_level_data_<SITE>/features.parquet          (union; filtered here to cohort)
   output/patient_level_data_<SITE>/cohort_filter_counts_<cohort>.csv
 
-Writes only aggregate CSVs to output/upload_to_box_<SITE>/<cohort>/ — no patient-level data leaves the site.
+Writes only aggregates (CSV + one JSON) to output/upload_to_box_<SITE>/<cohort>/ — no
+patient-level data leaves the site. cohort_tables.json carries the per-cohort Table 1
+(baseline at t=0), Table 2 (never- vs ever-vasopressin, incl. Mann-Whitney U for van Elteren
+pooling) and Table 3 (at vasopressin initiation) statistics (formerly 03_cohort_comparison_summary.py).
 
 Privacy guarantees
   - No row-level values, identifiers, free text, or exact dates in any output.
   - Cell suppression: n < K=11 → count shown as "<11", derived stats blank.
   - Continuous summaries rounded to 3 decimal places.
-  - ROC/threshold curves evaluated on a fixed 100-point grid derived from
-    rounded [p5, p95] of training data — NOT one point per observation.
-
-Outcome for analyses 4 and 5
-  Per-timestep imminent initiation: at each "at-risk" hour (patient not yet on
-  vasopressin, i.e. previous action_vaso = 0), outcome = action_vaso at that hour.
-  Threshold selected by max Youden's J on TRAIN split; carried unchanged to val/test.
 
 Usage:
     uv run python code/02_site_summary.py                     # runs both sepsis3 and rhee
@@ -29,12 +25,15 @@ Usage:
     uv run python code/02_site_summary.py --cohort sepsis3 --site MIMIC
 """
 
+import json
+import re
 import sys
 import shutil
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
+from scipy.stats import mannwhitneyu, chi2_contingency
 
 # ============================================================
 # CONFIGURATION
@@ -96,9 +95,8 @@ VAL_FRAC         = 0.15
 
 SUPPRESS_K       = 11       # suppress cells derived from fewer than K patients
 ROUND_N          = 3        # decimal places for continuous statistics
-N_THRESH_GRID    = 100      # grid points per continuous feature
 
-# Clinical features for analyses 4 and 5
+# Clinical features summarised at vasopressin initiation
 # urine_output excluded: all zero in CLIF 2.1.0
 ANALYSIS_FEATURES_CONT = [
     "time_hour", "norepinephrine", "nee", "mbp", "sofa",
@@ -276,7 +274,7 @@ def load_and_split():
     coh["split"] = coh["stay_id"].map(_split_label)
     feat = feat.merge(coh[["stay_id", "split", "ever_vaso"]], on="stay_id", how="left")
 
-    return coh, feat
+    return coh, feat, coh_all, feat_all
 
 
 # ============================================================
@@ -554,167 +552,312 @@ def write_feature_at_initiation_by_group(coh, feat):
 
 
 # ============================================================
-# OUTPUT 5a+5b: feature_thresholds_youden.csv + feature_roc_curves.csv
+# OUTPUT 5: cohort_tables.json  (Table 1 / 2 / 3 aggregates; formerly 03)
 # ============================================================
 
-def _threshold_grid(train_vals, is_binary):
-    """Fixed grid that cannot reconstruct individual observations."""
-    if is_binary:
-        # Three points give proper ROC corners for a binary predictor
-        return np.array([-0.5, 0.5, 1.5])
+_PRESSOR_COLS = ["norepinephrine", "epinephrine", "dopamine", "phenylephrine", "angiotensin ii"]
 
-    p5  = float(np.nanpercentile(train_vals[np.isfinite(train_vals)], 5))
-    p95 = float(np.nanpercentile(train_vals[np.isfinite(train_vals)], 95))
+# variable -> (label unused here; kept only as column name) for each table.
+TABLE1_CONT = ["age", "weight", "cci_score", "norepinephrine", "nee", "heart_rate", "mbp",
+               "respiratory_rate", "temperature", "gcs", "sepsis_onset_sofa", "wbc",
+               "initial_lactate", "creatinine", "bun", "hemoglobin", "platelet", "bilirubin",
+               "icu_los_days", "hospital_los_days", "vaso_init_hour"]
+TABLE1_BIN = ["_male", "ventil", "rrt"]
 
-    # Round to 2 significant figures so thresholds don't reveal individual values
-    def _sig2(x):
-        if x == 0:
-            return 0.0
-        mag = int(np.floor(np.log10(abs(x))))
-        return round(x, -(mag - 1))
+TABLE2_CONT = TABLE1_CONT
+TABLE2_BIN = TABLE1_BIN + ["hospital_death"]
 
-    lo, hi = _sig2(p5), _sig2(p95)
-    if lo >= hi:
-        hi = lo + abs(lo * 0.1) + 1e-9
-    return np.linspace(lo, hi, N_THRESH_GRID)
+TABLE3_CONT = ["vaso_init_hour", "norepinephrine", "nee", "heart_rate", "mbp",
+               "respiratory_rate", "temperature", "gcs", "sofa", "wbc", "lactate",
+               "creatinine", "bun", "hemoglobin", "platelet", "bilirubin"]
+TABLE3_BIN = ["ventil", "rrt"]
+TABLE3_PREHOUR_CONT = ["_n_pressors"]
 
 
-def _eval_thresh(y_true, y_score, threshold, direction):
-    pred = (y_score > threshold if direction == "gt" else y_score < threshold).astype(int)
-    tp = int(((pred == 1) & (y_true == 1)).sum())
-    tn = int(((pred == 0) & (y_true == 0)).sum())
-    fp = int(((pred == 1) & (y_true == 0)).sum())
-    fn = int(((pred == 0) & (y_true == 1)).sum())
-    sens = tp / (tp + fn) if (tp + fn) > 0 else 0.0
-    spec = tn / (tn + fp) if (tn + fp) > 0 else 0.0
-    ppv  = tp / (tp + fp) if (tp + fp) > 0 else 0.0
-    npv  = tn / (tn + fn) if (tn + fn) > 0 else 0.0
-    return {"tpr": sens, "fpr": 1 - spec,
-            "sens": sens, "spec": spec, "ppv": ppv, "npv": npv,
-            "youden_j": sens + spec - 1.0}
+def _cont_stats(vals) -> dict | None:
+    arr = pd.to_numeric(pd.Series(vals), errors="coerce").dropna()
+    n = len(arr)
+    if n < SUPPRESS_K:
+        return None
+    return {
+        "n": n, "mean": _r(arr.mean()), "sd": _r(arr.std()),
+        "median": _r(arr.median()), "q25": _r(arr.quantile(0.25)), "q75": _r(arr.quantile(0.75)),
+        "min": _r(arr.min()), "max": _r(arr.max()),
+    }
 
 
-_integrate = getattr(np, "trapezoid", None) or getattr(np, "trapz")
+def _bin_stats(vals) -> dict | None:
+    arr = pd.to_numeric(pd.Series(vals), errors="coerce").dropna()
+    n = len(arr)
+    pos = int(arr.sum())
+    if n < SUPPRESS_K:
+        return None
+    return {"n": n, "pos": pos, "pct": _r(pos / n * 100)}
 
 
-def _auc(fprs, tprs):
-    """Trapezoidal AUC with (0,0) and (1,1) corner anchors added.
+def _cat_stats(vals) -> dict:
+    s = pd.Series(vals).dropna()
+    out = {}
+    for level, cnt in s.value_counts().items():
+        n = len(s)
+        out[str(level)] = ({"n": int(cnt), "pct": _r(int(cnt) / n * 100)}
+                            if cnt >= SUPPRESS_K else None)
+    return out
 
-    The threshold grid covers only [p5, p95] of training values, so without
-    explicit corners the computed area misses the tails.  Adding (0,0) and
-    (1,1) gives the correct AUROC under the assumption that the threshold can
-    extend to ±∞ (standard convention).
+
+def _box_stats(vals) -> dict | None:
+    arr = pd.to_numeric(pd.Series(vals), errors="coerce").dropna().values
+    n = len(arr)
+    if n < SUPPRESS_K:
+        return None
+    q1, med, q3 = np.percentile(arr, [25, 50, 75])
+    iqr = q3 - q1
+    lo_fence, hi_fence = q1 - 1.5 * iqr, q3 + 1.5 * iqr
+    within = arr[(arr >= lo_fence) & (arr <= hi_fence)]
+    whislo = float(within.min()) if len(within) else float(q1)
+    whishi = float(within.max()) if len(within) else float(q3)
+    return {"n": int(n), "q1": _r(q1), "median": _r(med), "q3": _r(q3),
+            "whislo": _r(whislo), "whishi": _r(whishi)}
+
+
+def _mwu_stats(a, b) -> dict | None:
+    """Return {U, n1, n2} for Mann-Whitney U test (vaso group = a, no-vaso = b).
+    Stored alongside p-values so the coordinating site can compute the
+    van Elteren (stratified Wilcoxon) pooled p-value without individual data.
     """
-    fprs_ext = list(fprs) + [0.0, 1.0]
-    tprs_ext = list(tprs) + [0.0, 1.0]
-    idx = np.argsort(fprs_ext)
-    f   = np.array(fprs_ext)[idx]
-    t   = np.array(tprs_ext)[idx]
-    return float(_integrate(t, f))
+    a = pd.to_numeric(pd.Series(a), errors="coerce").dropna()
+    b = pd.to_numeric(pd.Series(b), errors="coerce").dropna()
+    if len(a) < 5 or len(b) < 5:
+        return None
+    try:
+        res = mannwhitneyu(a, b, alternative="two-sided")
+        return {"U": _r(res.statistic), "n1": int(len(a)), "n2": int(len(b))}
+    except Exception:
+        return None
 
 
-def write_roc_outputs(feat):
-    # Per-timestep "at-risk" dataset: hours where patient was not yet on vasopressin
-    fs = feat.sort_values(["stay_id", "time_hour"]).copy()
-    fs["prev_vaso"] = fs.groupby("stay_id")["action_vaso"].shift(1).fillna(0)
-    pred = fs[fs["prev_vaso"] == 0].copy()
-    pred["outcome"] = pred["action_vaso"].astype(int)
+def _pval_cont(a, b) -> float | None:
+    a = pd.to_numeric(pd.Series(a), errors="coerce").dropna()
+    b = pd.to_numeric(pd.Series(b), errors="coerce").dropna()
+    if len(a) < 5 or len(b) < 5:
+        return None
+    try:
+        _, p = mannwhitneyu(a, b, alternative="two-sided")
+        return _r(p)
+    except Exception:
+        return None
 
-    thresh_rows = []
-    roc_rows    = []
 
-    for col in ANALYSIS_FEATURES:
-        if col not in pred.columns:
-            continue
-        is_bin = col in ANALYSIS_FEATURES_BIN
+def _pval_bin(a, b) -> float | None:
+    a = pd.to_numeric(pd.Series(a), errors="coerce").dropna().astype(int)
+    b = pd.to_numeric(pd.Series(b), errors="coerce").dropna().astype(int)
+    if len(a) < SUPPRESS_K or len(b) < SUPPRESS_K:
+        return None
+    try:
+        table = [[int(a.sum()), len(a) - int(a.sum())], [int(b.sum()), len(b) - int(b.sum())]]
+        _, p, _, _ = chi2_contingency(table)
+        return _r(p)
+    except Exception:
+        return None
 
-        tr      = pred[pred["split"] == "train"]
-        tr_vals = pd.to_numeric(tr[col], errors="coerce").fillna(0).values
-        tr_y    = tr["outcome"].values.astype(int)
 
-        grid = _threshold_grid(tr_vals, is_bin)
+def _year_range(vals) -> dict | None:
+    years = []
+    for v in pd.Series(vals).dropna():
+        years.extend(int(y) for y in re.findall(r"\d{4}", str(v)))
+    if not years:
+        return None
+    return {"min_year": min(years), "max_year": max(years)}
 
-        # Evaluate all grid points on train; determine direction
-        gt_fprs, gt_tprs = [], []
-        for tau in grid:
-            m = _eval_thresh(tr_y, tr_vals, tau, "gt")
-            gt_fprs.append(m["fpr"])
-            gt_tprs.append(m["tpr"])
 
-        auc_gt = _auc(gt_fprs, gt_tprs)
-        direction = "gt" if auc_gt >= 0.5 else "lt"
+def _col(df, col):
+    if df is None or col not in df.columns:
+        return pd.Series(dtype=float)
+    return df[col]
 
-        if direction == "lt":
-            lt_fprs, lt_tprs = [], []
-            for tau in grid:
-                m = _eval_thresh(tr_y, tr_vals, tau, "lt")
-                lt_fprs.append(m["fpr"])
-                lt_tprs.append(m["tpr"])
-            fprs_for_j, tprs_for_j = lt_fprs, lt_tprs
-        else:
-            fprs_for_j, tprs_for_j = gt_fprs, gt_tprs
 
-        # Optimal threshold by Youden's J on train
-        j_vals  = [t - f for t, f in zip(tprs_for_j, fprs_for_j)]
-        opt_i   = int(np.argmax(j_vals))
-        opt_tau = float(grid[opt_i])
+def hour0_features(features_df):
+    if features_df is None:
+        return pd.DataFrame(columns=["stay_id"])
+    return features_df[features_df["time_hour"] == 0]
 
-        # Report on each split
-        for split in ("train", "val", "test"):
-            sp      = pred[pred["split"] == split]
-            sv      = pd.to_numeric(sp[col], errors="coerce").fillna(0).values
-            sy      = sp["outcome"].values.astype(int)
-            n       = len(sy)
-            n_pos   = int(sy.sum())
-            n_neg   = n - n_pos
 
-            if n < SUPPRESS_K or n_pos < SUPPRESS_K or n_neg < SUPPRESS_K:
-                thresh_rows.append({
-                    "feature": col, "split": split,
-                    "optimal_threshold": _r(opt_tau), "direction": direction,
-                    "auc": None, "sensitivity": None, "specificity": None,
-                    "youden_j": None, "ppv": None, "npv": None,
-                    "n": _n_str(n), "n_pos": _n_str(n_pos), "n_neg": _n_str(n_neg),
-                })
-                continue
+def _prior_vaso_ids_from(cohort_df):
+    """Return set of stay_ids with vasopressin before NE start, if the column exists."""
+    if cohort_df is not None and "vaso_before_traj" in cohort_df.columns:
+        return set(cohort_df.loc[cohort_df["vaso_before_traj"] == 1, "stay_id"])
+    return set()
 
-            # ROC curve on grid
-            sp_fprs, sp_tprs = [], []
-            for tau in grid:
-                m = _eval_thresh(sy, sv, tau, direction)
-                sp_fprs.append(m["fpr"])
-                sp_tprs.append(m["tpr"])
-                roc_rows.append({
-                    "feature": col, "split": split,
-                    "threshold":   _r(float(tau)),
-                    "tpr":         _r(m["tpr"]),
-                    "fpr":         _r(m["fpr"]),
-                    "sensitivity": _r(m["sens"]),
-                    "specificity": _r(m["spec"]),
-                })
 
-            auc = _auc(sp_fprs, sp_tprs)
+def compute_vaso_flags(features_df, exclude_ids=None):
+    if features_df is None or len(features_df) == 0:
+        return pd.DataFrame(columns=["stay_id", "ever_vaso", "vaso_init_hour"])
+    _feat = features_df
+    if exclude_ids:
+        _feat = features_df[~features_df["stay_id"].isin(exclude_ids)]
+    ever = (_feat.groupby("stay_id")["action_vaso"].max()
+            .rename("ever_vaso").reset_index())
+    first_hr = (_feat[_feat["action_vaso"] == 1]
+                .groupby("stay_id")["time_hour"].min()
+                .rename("vaso_init_hour").reset_index())
+    return ever.merge(first_hr, on="stay_id", how="left")
 
-            # Apply train-derived threshold
-            m_opt = _eval_thresh(sy, sv, opt_tau, direction)
-            thresh_rows.append({
-                "feature": col, "split": split,
-                "optimal_threshold": _r(opt_tau), "direction": direction,
-                "auc":         _r(auc),
-                "sensitivity": _r(m_opt["sens"]),
-                "specificity": _r(m_opt["spec"]),
-                "youden_j":    _r(m_opt["youden_j"]),
-                "ppv":         _r(m_opt["ppv"]),
-                "npv":         _r(m_opt["npv"]),
-                "n": n, "n_pos": n_pos, "n_neg": n_neg,
-            })
 
-    out1 = OUTPUT_DIR / "feature_thresholds_youden.csv"
-    out2 = OUTPUT_DIR / "feature_roc_curves.csv"
-    pd.DataFrame(thresh_rows).to_csv(out1, index=False)
-    pd.DataFrame(roc_rows).to_csv(out2, index=False)
-    print(f"  Wrote   {out1.name}")
-    print(f"  Wrote   {out2.name}")
+def build_baseline_with_vaso(cohort_df, features_df):
+    if cohort_df is None or len(cohort_df) == 0:
+        return None
+    hr0 = hour0_features(features_df)
+    extra_cols = [c for c in hr0.columns if c not in ("stay_id", "time_hour")]
+    base = cohort_df.merge(hr0[["stay_id"] + extra_cols], on="stay_id", how="left")
+    flags = compute_vaso_flags(features_df)  # ever_vaso includes prior-vaso patients intentionally
+    base = base.merge(flags[["stay_id", "ever_vaso", "vaso_init_hour"]], on="stay_id", how="left")
+    base["ever_vaso"] = base["ever_vaso"].fillna(0).astype(int)
+    base["_male"] = (base["gender"] == "M").astype(int) if "gender" in base.columns else np.nan
+    return base
+
+
+def add_pressor_count(df):
+    if df is None:
+        return None
+    df = df.copy()
+    active = pd.DataFrame({
+        c: (pd.to_numeric(df[c], errors="coerce").fillna(0) > 0).astype(int) if c in df.columns else 0
+        for c in _PRESSOR_COLS
+    })
+    df["_n_pressors"] = active.sum(axis=1)
+    return df
+
+
+def build_vaso_init_df(cohort_df, features_df):
+    if cohort_df is None or len(cohort_df) == 0 or features_df is None:
+        return None
+    # Exclude prior-vaso patients: their vaso started before NE, so vaso_init_hour=0
+    # reflects NE-start physiology rather than the true vasopressin-initiation state.
+    _excl = _prior_vaso_ids_from(cohort_df)
+    flags = compute_vaso_flags(features_df, exclude_ids=_excl)
+    ever = flags[flags["ever_vaso"] == 1].dropna(subset=["vaso_init_hour"])
+    ever_ids = set(cohort_df["stay_id"]) & set(ever["stay_id"])
+    if not ever_ids:
+        return None
+    ever = ever[ever["stay_id"].isin(ever_ids)]
+    at_init = features_df.merge(ever[["stay_id", "vaso_init_hour"]], on="stay_id")
+    at_init = at_init[at_init["time_hour"] == at_init["vaso_init_hour"]]
+    cohort_sub = cohort_df[cohort_df["stay_id"].isin(ever_ids)]
+    return cohort_sub.merge(at_init, on="stay_id", how="inner")
+
+
+def build_vaso_init_prehour_df(cohort_df, features_df):
+    if cohort_df is None or len(cohort_df) == 0 or features_df is None:
+        return None
+    _excl = _prior_vaso_ids_from(cohort_df)
+    flags = compute_vaso_flags(features_df, exclude_ids=_excl)
+    ever = flags[flags["ever_vaso"] == 1].dropna(subset=["vaso_init_hour"]).copy()
+    ever["prehour"] = ever["vaso_init_hour"] - 1
+    ever = ever[ever["prehour"] >= 0]
+    ever_ids = set(cohort_df["stay_id"]) & set(ever["stay_id"])
+    if not ever_ids:
+        return None
+    ever = ever[ever["stay_id"].isin(ever_ids)]
+    pre = features_df.merge(ever[["stay_id", "prehour"]], on="stay_id")
+    pre = pre[pre["time_hour"] == pre["prehour"]]
+    cohort_sub = cohort_df[cohort_df["stay_id"].isin(ever_ids)]
+    merged = cohort_sub.merge(pre, on="stay_id", how="inner")
+    return add_pressor_count(merged)
+
+
+# ============================================================
+# AGGREGATE ASSEMBLY
+# ============================================================
+
+def build_variable_block(df, cont_vars, bin_vars) -> dict:
+    out = {}
+    for col in cont_vars:
+        out[col] = _cont_stats(_col(df, col))
+    for col in bin_vars:
+        out[col] = _bin_stats(_col(df, col))
+    if df is not None and "race" in df.columns:
+        out["race"] = _cat_stats(df["race"])
+    return out
+
+
+def build_table1(baseline_df) -> dict:
+    if baseline_df is None:
+        return {"n": 0}
+    block = build_variable_block(baseline_df, TABLE1_CONT, TABLE1_BIN)
+    block["n"] = len(baseline_df)
+    block["enrollment_period"] = _year_range(_col(baseline_df, "anchor_year_group"))
+    return block
+
+
+def build_table2(baseline_df) -> dict:
+    if baseline_df is None:
+        return {"never": {"n": 0}, "ever": {"n": 0}, "pvalues": {}}
+    never_df = baseline_df[baseline_df["ever_vaso"] == 0]
+    ever_df = baseline_df[baseline_df["ever_vaso"] == 1]
+
+    never_block = build_variable_block(never_df, TABLE2_CONT, TABLE2_BIN)
+    never_block["n"] = len(never_df)
+    ever_block = build_variable_block(ever_df, TABLE2_CONT, TABLE2_BIN)
+    ever_block["n"] = len(ever_df)
+
+    pvals = {}
+    for col in TABLE2_CONT:
+        pvals[col] = _pval_cont(_col(never_df, col), _col(ever_df, col))
+    for col in TABLE2_BIN:
+        pvals[col] = _pval_bin(_col(never_df, col), _col(ever_df, col))
+    if "race" in baseline_df.columns:
+        for level in sorted(set(baseline_df["race"].dropna().unique().tolist())):
+            nv = (never_df["race"] == level).astype(int) if "race" in never_df.columns else pd.Series(dtype=int)
+            ev = (ever_df["race"] == level).astype(int) if "race" in ever_df.columns else pd.Series(dtype=int)
+            pvals[f"race:{level}"] = _pval_bin(nv, ev)
+
+    # Mann-Whitney U statistics for van Elteren pooling at the coordinating site.
+    # Keys match TABLE2_CONT column names; values are {U, n1, n2} where
+    # n1 = ever-vaso size, n2 = never-vaso size.
+    mwu = {}
+    for col in TABLE2_CONT:
+        stats = _mwu_stats(_col(ever_df, col), _col(never_df, col))
+        if stats:
+            mwu[col] = stats
+
+    return {"never": never_block, "ever": ever_block, "pvalues": pvals, "mwu_stats": mwu}
+
+
+def build_table3(vaso_init_df, vaso_prehour_df) -> dict:
+    if vaso_init_df is None:
+        return {"n": 0}
+    block = build_variable_block(vaso_init_df, TABLE3_CONT, TABLE3_BIN)
+    block["n"] = len(vaso_init_df)
+    if vaso_prehour_df is not None:
+        for col in TABLE3_PREHOUR_CONT:
+            block[col] = _cont_stats(_col(vaso_prehour_df, col))
+    else:
+        for col in TABLE3_PREHOUR_CONT:
+            block[col] = {"n": 0}
+    return block
+
+
+def write_cohort_tables(coh_raw, feat_raw):
+    """Table 1 (baseline at t=0), Table 2 (never vs ever vasopressin; p-values and
+    Mann-Whitney U for van Elteren pooling) and Table 3 (at vasopressin initiation).
+
+    Uses the raw cohort + features (before 02's vaso-at-t0 exclusion and LOCF) so the
+    numbers are identical to the previous 03_cohort_comparison_summary.py output.
+    Cells with fewer than SUPPRESS_K patients are omitted."""
+    baseline  = build_baseline_with_vaso(coh_raw, feat_raw)
+    vaso_init = build_vaso_init_df(coh_raw, feat_raw)
+    prehour   = build_vaso_init_prehour_df(coh_raw, feat_raw)
+
+    payload = {
+        "site":   SITE_NAME,
+        "cohort": COHORT_NAME,
+        "table1": build_table1(baseline),
+        "table2": build_table2(baseline),
+        "table3": build_table3(vaso_init, prehour),
+    }
+    out = OUTPUT_DIR / "cohort_tables.json"
+    out.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    print(f"  Wrote   {out.name}")
 
 
 # ============================================================
@@ -723,24 +866,17 @@ def write_roc_outputs(feat):
 
 README = f"""# Site Summary Outputs — Federated Privacy Manifest
 
-Generated by: analysis/site_summary.py
+Generated by: code/02_site_summary.py
 
 ## Privacy guarantees
 - No patient-level records, identifiers, free text, or exact dates.
 - Cell suppression: any statistic derived from fewer than {SUPPRESS_K} patients is
   reported as "<{SUPPRESS_K}"; all derived statistics for that cell are blank.
 - Continuous summaries rounded to {ROUND_N} decimal places.
-- ROC/threshold curves evaluated on a fixed {N_THRESH_GRID}-point grid derived from
-  2-significant-figure rounded [p5, p95] of training data — NOT one per observation.
-  AUC is computed with standard (0,0) and (1,1) corner anchors added to the grid-based
-  curve, so it reflects the full AUROC rather than only the [p5, p95] excerpt.
 
 ## Analysis design
-- Patient-level 70/15/15 train/val/test split, seed={RANDOM_SEED}.
-- Outcome (analyses 4-5): per-timestep imminent vasopressin initiation.
-  At-risk set = patient-hours where vasopressin was NOT active in previous hour.
-  Outcome = action_vaso at current hour. Threshold selected on TRAIN only.
-- Features (analyses 4-5): {", ".join(ANALYSIS_FEATURES)}.
+- Patient-level 70/15/15 train/val/test split, seed={RANDOM_SEED} (split_counts.csv).
+- Features summarised at vasopressin initiation: {", ".join(ANALYSIS_FEATURES)}.
 
 ## File schemas
 
@@ -777,15 +913,16 @@ The hospital file also carries a hospital_type column (academic/community/unknow
 canonicalized) alongside each hospital_id group.
 Columns: group_column, group, hospital_type, feature, n, n_missing, mean, sd, median, q25, q75, min, max.
 
-### feature_thresholds_youden.csv
-Per-feature (× split) threshold performance for imminent initiation.
-Optimal threshold fixed from TRAIN; applied unchanged to val and test.
-Columns: feature, split, optimal_threshold, direction (gt/lt),
-  auc, sensitivity, specificity, youden_j, ppv, npv, n, n_pos, n_neg.
-
-### feature_roc_curves.csv
-Full ROC curve for coordinating site to replot. No patient-level data.
-Columns: feature, split, threshold, tpr, fpr, sensitivity, specificity.
+### cohort_tables.json
+Per-cohort aggregates for the paper tables (no patient-level data; any per-variable
+statistic from fewer than {SUPPRESS_K} patients is omitted).
+- `table1`: baseline (t=0) stats — {{n, enrollment_period, <variable>: {{n, mean, sd, median, q25,
+  q75, min, max}} or {{n, pos, pct}}, race: {{level: {{n, pct}}}}}}
+- `table2`: {{never, ever}} blocks shaped like table1, plus `pvalues` {{variable: p}} and
+  `mwu_stats` {{variable: {{U, n1, n2}}}} (Mann-Whitney U + group sizes for van Elteren pooling
+  at the coordinating site)
+- `table3`: characteristics at vasopressin initiation (ever-vaso only), shaped like table1, plus
+  `_n_pressors` (from the hour before initiation)
 """
 
 
@@ -816,7 +953,7 @@ def main():
     write_filter_counts()
 
     print("[2/7] Loading + splitting")
-    coh, feat = load_and_split()
+    coh, feat, coh_raw, feat_raw = load_and_split()
     tr, va, te = [(coh["split"] == s).sum() for s in ("train", "val", "test")]
     print(f"  {len(coh):,} patients  train={tr}  val={va}  test={te}")
     print(f"  Ever-vaso: {coh['ever_vaso'].sum():,}  "
@@ -842,8 +979,8 @@ def main():
     print("[6/7] Feature at initiation, by ICU type / by hospital")
     write_feature_at_initiation_by_group(coh, feat_ne_first)
 
-    print("[7/7] ROC / threshold analysis")
-    write_roc_outputs(feat)
+    print("[7/7] Cohort tables (Table 1 / 2 / 3 aggregates)")
+    write_cohort_tables(coh_raw, feat_raw)
 
     write_readme()
 
