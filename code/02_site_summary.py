@@ -552,6 +552,60 @@ def write_feature_at_initiation_by_group(coh, feat):
 
 
 # ============================================================
+# OUTPUT 4c: initiation_profile_by_icu.csv
+# ============================================================
+# Who is where when vasopressin starts? One row per (ICU type x feature) plus an
+# "All ICU types" group, for the cross-site location heatmap (09). Population =
+# vasopressin initiators (prior-vasopressin patients excluded, as in the other
+# at-initiation outputs). ICU type = location at NE start.
+INITIATION_PROFILE_FEATURES = [
+    # (column, label)                                 source
+    ("mbp",                "MAP at initiation (mmHg)"),                # features, initiation hour
+    ("bun",                "BUN at initiation (mg/dL)"),
+    ("creatinine",         "Creatinine at initiation (mg/dL)"),
+    ("gcs",                "GCS at initiation"),
+    ("sofa",               "SOFA at initiation"),
+    ("age",                "Age (years)"),                             # cohort
+    ("heart_rate",         "Heart rate at initiation (/min)"),
+    ("temperature",        "Temperature at initiation (C)"),
+    ("hosp_to_ne_hours",   "Hospital admission to NE start (h)"),      # cohort (01 / 01b)
+    ("hosp_to_vaso_hours", "Hospital admission to vasopressin start (h)"),
+]
+
+
+def write_initiation_profile_by_icu(coh, feat):
+    init = _initiation_rows(feat)
+    c = coh.copy()
+    eff = c["location_type"].copy() if "location_type" in c.columns else pd.Series(pd.NA, index=c.index)
+    if "location_category" in c.columns:
+        miss = eff.isna() | eff.astype(str).str.lower().str.strip().isin(["none", "nan", ""])
+        eff[miss] = c.loc[miss, "location_category"]
+    c["_effective_location"] = _canon_icu_series(eff)
+    keep = ["stay_id", "_effective_location"] + [k for k in ("age", "hosp_to_ne_hours") if k in c.columns]
+    merged = init.drop(columns=[k for k in ("age",) if k in init.columns]).merge(
+        c[keep].dropna(subset=["_effective_location"]), on="stay_id", how="inner")
+    if merged.empty:
+        print("  SKIP initiation_profile_by_icu.csv: no initiating patients with a known ICU type")
+        return
+    if "hosp_to_ne_hours" in merged.columns:
+        merged["hosp_to_vaso_hours"] = merged["hosp_to_ne_hours"] + merged["time_hour"]
+    else:
+        print("  NOTE: hosp_to_ne_hours not in cohort (re-run 01 / 01b) - admission-timing rows omitted")
+
+    rows = []
+    groups = [("All ICU types", merged)] + [(g, sub) for g, sub in merged.groupby("_effective_location")]
+    for grp, sub in groups:
+        for col, label in INITIATION_PROFILE_FEATURES:
+            if col not in sub.columns:
+                continue
+            arr = pd.to_numeric(sub[col], errors="coerce").dropna()
+            rows.append(_feature_stats_row(arr, len(sub), extra={"group": grp, "feature": col, "label": label}))
+    out = OUTPUT_DIR / "initiation_profile_by_icu.csv"
+    pd.DataFrame(rows).to_csv(out, index=False)
+    print(f"  Wrote   {out.name}")
+
+
+# ============================================================
 # OUTPUT 5: cohort_tables.json  (Table 1 / 2 / 3 aggregates; formerly 03)
 # ============================================================
 
@@ -978,6 +1032,7 @@ def main():
 
     print("[6/7] Feature at initiation, by ICU type / by hospital")
     write_feature_at_initiation_by_group(coh, feat_ne_first)
+    write_initiation_profile_by_icu(coh, feat_ne_first)
 
     print("[7/7] Cohort tables (Table 1 / 2 / 3 aggregates)")
     write_cohort_tables(coh_raw, feat_raw)

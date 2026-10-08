@@ -1180,6 +1180,11 @@ def _assemble_cohort_df(
     cohort["hospital_los_days"] = (
         (cohort["discharge_dttm"] - cohort["admission_dttm"]).dt.total_seconds() / 86400
     )
+    # Hours from hospital admission to NE start (t=0). Time from admission to vasopressin
+    # initiation = hosp_to_ne_hours + (hours from NE start to vasopressin, from features).
+    cohort["hosp_to_ne_hours"] = (
+        (cohort["first_norepi_time"] - cohort["admission_dttm"]).dt.total_seconds() / 3600
+    )
 
     cohort["trajectory_start"] = cohort["first_norepi_time"]
     traj_cap = cohort["trajectory_start"] + pd.Timedelta(hours=TRAJECTORY_HOURS)
@@ -2302,6 +2307,7 @@ _COHORT_COLS = [
     "hospital_id", "hospital_type",
     "location_category_end", "location_type_end",
     "icu_los_days", "hospital_los_days", "traj_end_reason",
+    "hosp_to_ne_hours",   # hours from hospital admission to NE start
     # CVC placement
     "cvc_during_hosp",      # 1 if CVC (CPT 36556 / ICD-10-PCS 02HV33Z) placed any time during hosp
     "first_cvc_dttm",       # UTC datetime of first qualifying CVC procedure (NaT if none)
