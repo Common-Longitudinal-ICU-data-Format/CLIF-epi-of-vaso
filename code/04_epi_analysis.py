@@ -279,16 +279,19 @@ pat = features.groupby("stay_id").agg(
     steroid_ever  = ("steroid",     "max"),
 ).reset_index()
 
+# "At initiation" = the clinical state in the HOUR BEFORE vasopressin started (hour t-1, where t is the first
+# vasopressin hour): the information the clinician was looking at before acting. The first vasopressin hour
+# itself already contains the vasopressin contribution to NEE and same-hour titration. first_vaso_hour stays t.
+# Patients whose vasopressin starts in the first hour have no earlier hour (their *_at_init are missing).
+_fv_hour = (features[features["action_vaso"] == 1].groupby("stay_id")["time_hour"].min()
+            .rename("first_vaso_hour").reset_index())
+_snap = features[["stay_id", "time_hour", "nee", "norepinephrine", "mbp", "sofa", "lactate",
+                  "creatinine", "bun", "fluids", "ventil", "rrt", "steroid"]].copy()
+_snap["first_vaso_hour"] = _snap["time_hour"] + 1          # the row of hour t-1, keyed to t
+_snap = _snap.drop(columns=["time_hour"])
 first_vaso = (
-    features[features["action_vaso"] == 1]
-    .sort_values("time_hour")
-    .groupby("stay_id")
-    .first()
-    .reset_index()
-    [["stay_id", "time_hour", "nee", "norepinephrine", "mbp", "sofa", "lactate",
-      "creatinine", "bun", "fluids", "ventil", "rrt", "steroid"]]
+    _fv_hour.merge(_snap, on=["stay_id", "first_vaso_hour"], how="left")
     .rename(columns={
-        "time_hour":      "first_vaso_hour",
         "nee":            "nee_at_init",
         "norepinephrine": "ne_at_init",
         "mbp":            "mbp_at_init",
@@ -2227,10 +2230,10 @@ for stay_id, row in vaso_pat_df.iterrows():
     _row["hrs_lac_gt2"]  = int((pre["lactate"] > 2.0).sum())
     _row["hrs_sofa_gt5"] = int((pre["sofa"]    > 5.0).sum())
 
-    # Delta SOFA: sofa at vaso start − sofa at earliest hour in final 6h window
+    # Delta SOFA: sofa in the hour before vaso start − sofa at earliest hour in final 6h window
     _sofa_init_vals = feat_vaso_only[
         (feat_vaso_only["stay_id"] == stay_id) &
-        (feat_vaso_only["time_hour"] == fvh)
+        (feat_vaso_only["time_hour"] == fvh - 1)       # hour before initiation
     ]["sofa"].dropna().values
     _sofa_at_init = float(_sofa_init_vals[0]) if len(_sofa_init_vals) > 0 else np.nan
 
@@ -2426,7 +2429,7 @@ gcs_init = (
     features[features["stay_id"].isin(ever_vaso_ids)]
     .merge(pat[["stay_id", "first_vaso_hour"]], on="stay_id")
 )
-gcs_init = gcs_init[gcs_init["time_hour"] == gcs_init["first_vaso_hour"]]
+gcs_init = gcs_init[gcs_init["time_hour"] == gcs_init["first_vaso_hour"] - 1]     # hour before initiation
 gcs_init = (
     gcs_init.groupby("stay_id")["gcs"].first()
     .reset_index().rename(columns={"gcs": "gcs_at_init"})
@@ -3316,6 +3319,13 @@ else:
     print("  13/14 skipped vasopressor_combinations (no drug columns in features)")
 
 print(f"\nAggregate CSVs written to: {AGG_DIR}")
+
+# which definition of "at initiation" these CSVs use (read by 07 / 12 / 09 so sites are never mixed)
+import json as _json
+_mk = OUT_DIR.parent / "definitions.json"
+_cur = _json.loads(_mk.read_text(encoding="utf-8")) if _mk.exists() else {}
+_cur["initiation_snapshot"] = "hour_before_initiation"
+_mk.write_text(_json.dumps(_cur, indent=2), encoding="utf-8")
 
 # ── 15. log_nee_at_init_lm.csv + log_nee_at_init_lm_std.csv ─────────────────
 # OLS of log(NEE at vasopressin initiation) on demographics + clinical covariates.

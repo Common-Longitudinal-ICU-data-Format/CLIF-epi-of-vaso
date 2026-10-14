@@ -1714,6 +1714,167 @@ _PREFERRED_UNITS_CONT = {
 }
 
 
+# ── Vasoactive dose unit repair ───────────────────────────────────────────────
+# Some sites chart a minority of continuous-vasoactive records with a WEIGHT-INDEXED unit
+# while the value is actually the non-indexed rate. At NU, 2,470 of 2,091,394 norepinephrine
+# records (0.12%) carry "mcg/kg/min" while 99.88% carry "mcg/min", and the mislabelled subset
+# is demonstrably the same quantity as the rest:
+#   * for the 366 patients charted under BOTH labels, the two sets of doses have the same
+#     distribution (Mann-Whitney p = 0.12) and a paired per-patient median ratio of 1.03 --
+#     a genuinely weight-indexed value would sit near 1/70 = 0.014;
+#   * taken at face value the mislabelled p90 of 18 mcg/kg/min is ~1,260 mcg/min for a 70 kg
+#     patient, roughly 25x the maximum reported in the literature.
+# Left alone those records pass through conversion untouched (they are already in the
+# preferred unit) and produce norepinephrine doses of 20-30 mcg/kg/min in the features.
+#
+# Two rules, applied before conversion. Neither changes a dose or drops a row: only a unit
+# label that cannot be right is corrected, and clifpy then divides by the patient's weight
+# like any other non-indexed record.
+#
+#   1. GROUP rule. If a drug's weight-indexed label is a small minority at this site, the
+#      matching non-indexed label is the dominant one, and the minority group's MEDIAN dose
+#      is too high to be a weight-indexed dose, then the whole minority group is relabelled.
+#      This is the NU norepinephrine case, and it is the rule the paired evidence supports:
+#      the population is mislabelled, not just its extreme tail.
+#   2. RECORD backstop. Any individual record above an absolute ceiling for its weight-
+#      indexed unit is relabelled even when the group rule does not fire -- this catches
+#      stray errors inside a unit that IS dominant and correct at the site (NU dopamine is
+#      99.97% mcg/kg/min, with 5 records at 508-999).
+#
+# A site whose units are consistent and plausible is left completely untouched: NU's 10
+# epinephrine mcg/kg/min records (median 0.05) are correctly weight-indexed and survive both
+# rules. Thresholds are clinical maxima set well above any dose actually given (published
+# refractory-shock norepinephrine tops out around 3-5 mcg/kg/min).
+_UNIT_REPAIR = {
+    # med_category:   (weight-indexed unit, non-indexed unit,
+    #                  max plausible MEDIAN for the group rule, absolute per-record ceiling)
+    "norepinephrine": ("mcg/kg/min",   "mcg/min",   0.5,  5.0),
+    "epinephrine":    ("mcg/kg/min",   "mcg/min",   0.5,  5.0),
+    "phenylephrine":  ("mcg/kg/min",   "mcg/min",   2.0,  10.0),
+    "dopamine":       ("mcg/kg/min",   "mcg/min",   20.0, 50.0),
+    "vasopressin":    ("units/kg/min", "units/min", 0.01, 0.05),
+}
+# A weight-indexed label is treated as a suspect minority below this share of the drug's
+# records at the site. Above it, the label is in routine use and only the record-level
+# ceiling applies.
+_UNIT_MINORITY_FRAC = 0.05
+
+
+# Maximum physiologically possible dose in the PREFERRED (converted) unit. Relabelling a
+# unit cannot rescue a value that is wrong whatever the unit -- UCMC has 10 dopamine records
+# at 6e5-8e5 and 131 norepinephrine records up to 1,220 that are data-entry errors, not unit
+# errors. After conversion, anything above these ceilings has its dose set to NaN, which
+# removes it from NEE and from the dose features (both require a non-null converted dose)
+# while leaving the record in place -- cohort entry keys off the NE admin timestamps only
+# (get_ne_records), never the dose, so nulling a dose cannot change who is in the cohort.
+_CONVERTED_DOSE_CEILING = {
+    "norepinephrine": 5.0,     # mcg/kg/min; published refractory-shock maxima are 3-5
+    "epinephrine":    5.0,     # mcg/kg/min
+    "phenylephrine":  20.0,    # mcg/kg/min
+    "dopamine":       50.0,    # mcg/kg/min; max clinical rate is 20
+    "angiotensin ii": 0.1,     # mcg/kg/min; max labelled rate is 0.08
+    "vasopressin":    0.2,     # units/min; usual fixed rate is 0.03-0.04
+}
+
+
+def drop_implausible_converted_doses(df: pd.DataFrame, verbose: bool = True) -> pd.DataFrame:
+    """Set `med_dose_converted` to NaN where it exceeds _CONVERTED_DOSE_CEILING.
+
+    Applied after unit conversion, so it catches values that are impossible on any reading
+    (data-entry errors) rather than unit mislabelling, which repair_vasoactive_dose_units
+    handles. Rows are kept; only the implausible dose is dropped.
+    """
+    if df.empty or "med_dose_converted" not in df.columns:
+        return df
+    out = df.copy()
+    cat = out["med_category"].astype("string").str.strip().str.lower()
+    # .copy() matters: pd.to_numeric hands back a view when the column is already float,
+    # so without it the assignment below would blank the values we are about to report on.
+    dose = pd.to_numeric(out["med_dose_converted"], errors="coerce").copy()
+    key = "stay_id" if "stay_id" in out.columns else "hospitalization_id"
+    # Only rows that actually converted are of interest. A FAILED conversion keeps the raw
+    # value in med_dose_converted -- at NU, patients with no recorded weight (4.9% of
+    # hospitalizations) cannot have mcg/min divided, so those rows carry raw mcg/min
+    # magnitudes. add_nee / add_ne_dose already drop them on _convert_status, so counting
+    # them here would report thousands of "implausible" doses that were never in use.
+    ok_status = (out["_convert_status"].astype("string").str.lower() == "success"
+                 if "_convert_status" in out.columns else pd.Series(True, index=out.index))
+    total = 0
+    for med, ceiling in _CONVERTED_DOSE_CEILING.items():
+        bad = ok_status & (cat == med) & dose.notna() & (dose > ceiling)
+        n = int(bad.sum())
+        if not n:
+            continue
+        if verbose:
+            d = dose[bad]
+            print(f"    {med}: dropped {n:,} converted dose(s) above {ceiling:g} "
+                  f"({out.loc[bad, key].nunique():,} hospitalizations; "
+                  f"median {d.median():.3g}, max {d.max():.3g})")
+        out.loc[bad, "med_dose_converted"] = np.nan
+        total += n
+    if verbose and not total:
+        print("    all converted doses within physiological range")
+    return out
+
+
+def repair_vasoactive_dose_units(med_df: pd.DataFrame, verbose: bool = True) -> pd.DataFrame:
+    """Relabel weight-indexed vasoactive doses whose value cannot be weight-indexed.
+
+    See the note above _UNIT_REPAIR for the two rules and the evidence behind them.
+    Returns the DataFrame with `med_dose_unit` corrected for the offending rows. Doses are
+    never modified and no row is dropped.
+    """
+    if med_df.empty or "med_dose_unit" not in med_df.columns:
+        return med_df
+    df = med_df.copy()
+    unit = df["med_dose_unit"].astype("string").str.strip().str.lower()
+    cat = df["med_category"].astype("string").str.strip().str.lower()
+    dose = pd.to_numeric(df["med_dose"], errors="coerce")
+    pos = dose.notna() & (dose > 0)        # zeros carry no scale information
+
+    total = 0
+    for med, (wu, flat_unit, med_ceiling, rec_ceiling) in _UNIT_REPAIR.items():
+        in_cat = cat == med
+        n_cat = int(in_cat.sum())
+        if not n_cat:
+            continue
+        is_wu = in_cat & (unit == wu)
+        n_wu = int(is_wu.sum())
+        if not n_wu:
+            continue
+        share = n_wu / n_cat
+        dominant_is_flat = int((in_cat & (unit == flat_unit)).sum()) > n_wu
+        grp_median = dose[is_wu & pos].median()
+
+        reason, bad = None, None
+        if (share < _UNIT_MINORITY_FRAC and dominant_is_flat
+                and pd.notna(grp_median) and grp_median > med_ceiling):
+            reason = (f"minority label ({100 * share:.2f}% of records) with median "
+                      f"{grp_median:.3g} > {med_ceiling:g}, site charts {flat_unit} otherwise")
+            bad = is_wu
+        else:
+            over = is_wu & pos & (dose > rec_ceiling)
+            if int(over.sum()):
+                reason = f"{int(over.sum())} record(s) above the {rec_ceiling:g} ceiling for {wu}"
+                bad = over
+        if bad is None:
+            continue
+
+        n = int(bad.sum())
+        df.loc[bad, "med_dose_unit"] = flat_unit
+        total += n
+        if verbose:
+            d = dose[bad & pos]
+            n_pat = df.loc[bad, "hospitalization_id"].nunique()
+            print(f"    {med}: relabelled {n:,} of {n_cat:,} records {wu} -> {flat_unit} "
+                  f"({n_pat:,} hospitalizations; median {d.median():.3g}, max {d.max():.3g})")
+            print(f"        reason: {reason}")
+    if verbose:
+        print(f"    total relabelled: {total:,}" if total else
+              "    dose units look consistent - nothing relabelled")
+    return df
+
+
 def _load_and_convert_meds(co: ClifOrchestrator, stay_ids: list) -> pd.DataFrame:
     co.load_table("medication_admin_continuous", filters={"hospitalization_id": stay_ids})
     co.load_table("vitals", filters={
@@ -1761,6 +1922,12 @@ def _load_and_convert_meds(co: ClifOrchestrator, stay_ids: list) -> pd.DataFrame
                 wt, on=["hospitalization_id", "admin_dttm"], how="left"
             )
 
+    # Correct impossible weight-indexed unit labels BEFORE conversion, so clifpy applies
+    # the patient's weight to the records that need it (see repair_vasoactive_dose_units).
+    print("  Checking continuous vasoactive dose units...")
+    co.medication_admin_continuous.df = repair_vasoactive_dose_units(
+        co.medication_admin_continuous.df)
+
     co.convert_dose_units_for_continuous_meds(
         preferred_units=_PREFERRED_UNITS_CONT,
         save_to_table=True,
@@ -1769,6 +1936,8 @@ def _load_and_convert_meds(co: ClifOrchestrator, stay_ids: list) -> pd.DataFrame
     df = co.medication_admin_continuous.df_converted.copy()
     df = df.rename(columns={"hospitalization_id": "stay_id"})
     df["admin_dttm"] = to_naive_utc(df["admin_dttm"])
+    print("  Checking converted vasoactive doses for physiological plausibility...")
+    df = drop_implausible_converted_doses(df)
     return df
 
 
@@ -1805,8 +1974,16 @@ def add_nee(grid: pd.DataFrame, meds: pd.DataFrame) -> pd.DataFrame:
     c_g = contrib.merge(g, on="stay_id")
     c_hr = c_g[(c_g["admin_dttm"] < c_g["end_time"]) &
                (c_g["end_dttm"]   > c_g["start_time"])]
-    nee_agg = (c_hr.groupby(["stay_id", "time_hour"])["nee_contrib"]
-                   .sum().reset_index()
+    # Mean WITHIN a drug for the hour, then sum ACROSS drugs. Summing straight over
+    # (stay_id, time_hour) also adds up every separate admin record of the SAME drug inside
+    # the hour, so a site that re-charts a running infusion several times an hour gets an
+    # NEE inflated by exactly that record count (NU: an NE dose of 20 charted 4x became an
+    # NEE of 80). add_ne_dose / add_vaso_dose / add_nee_components already average per hour;
+    # this is the one place that did not.
+    nee_agg = (c_hr.groupby(["stay_id", "time_hour", "med_category"])["nee_contrib"]
+                   .mean()
+                   .groupby(level=["stay_id", "time_hour"]).sum()
+                   .reset_index()
                    .rename(columns={"nee_contrib": "nee"}))
     grid = grid.merge(nee_agg, on=["stay_id", "time_hour"], how="left")
     grid["nee"] = grid["nee"].fillna(0.0)

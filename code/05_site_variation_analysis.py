@@ -10,11 +10,24 @@ from the per-site packets this script writes).
 Terminology: "site" = CLIF site / data pool (SITE_NAME). "ICU type" = canonical
 location_type of the patient's ICU at NE start.
 
-The ONE site-specific GLM (person-hours, logit link):
+The ONE site-specific GLM (person-hours, complementary log-log link):
 
-  vaso_on ~ intercept + age_c + p_f_ratio_c + device_category (Room Air ref)
+  vaso_start ~ intercept + age_c + p_f_ratio_c + device_category (Room Air ref)
           + creatinine_c + rrt + platelet_c + bilirubin_c + gcs_c + ICU type
           + rcs(NEE, 4) + rcs(time, 4)
+
+  OUTCOME: the discrete-time hazard of INITIATING vasopressin. Rows are the hours from NE start up to and
+  including the first vasopressin hour (hours before vasopressin starts); vaso_start = 1 only in that first
+  vasopressin hour. Hours after vasopressin has started are not in the risk set.
+  NEE is the PREVIOUS hour's NEE (0 at the first hour): the dose the clinician was looking at before acting.
+  This also keeps the vasopressin contribution out of NEE, because the hour before the first vasopressin hour
+  contains none. Other covariates are last-observed values at the current hour. `time` is the hour (from NE start) being modelled.
+
+  LINK: complementary log-log, log(-log(1 - h)) = eta, not logit. Because the outcome is a discrete-time
+  hazard, cloglog makes this the grouped-time analogue of a Cox proportional-hazards model: exp(beta) is a
+  HAZARD ratio (not an odds ratio) and the coefficients do not depend on the width of the hourly interval.
+  Everything derived on the latent scale uses the cloglog residual variance pi^2/6 (standard Gumbel), where
+  a logit model would use pi^2/3, and the between-group spread is summarised as a median HAZARD ratio (MHR).
 
   Individual SOFA organ-system components (respiratory: P/F ratio + respiratory
   device category; renal: creatinine + RRT; coagulation: platelets; liver:
@@ -27,7 +40,7 @@ The ONE site-specific GLM (person-hours, logit link):
 
 Derived from that single fit (no additional models):
   - ICU-type effective intercepts  alpha_j = b0 + b_icu_j  (delta-method SE), and their
-    within-site DL tau^2 / ICC / MOR across ICU types
+    within-site DL tau^2 / ICC / MHR across ICU types
   - reference-patient P(vasopressin) vs. time and vs. NEE (per site, and by ICU type)
   - per-covariate-group variance of the linear predictor (Nakagawa & Schielzeth);
     the site-level component (sigma2_site) needs other sites and is left at 0 here
@@ -93,6 +106,261 @@ _GROUP_TYPE_COLOR_MAP: dict = {
     "Academic":          "#2c5f8a",
     "Community":         "#e07b39",
 }
+
+# ── GLM link: complementary log-log ──────────────────────────────────────────
+# The outcome is a discrete-time hazard (did vasopressin start in THIS hour?), so the
+# site GLM uses a complementary log-log link instead of logit:
+#
+#     cloglog(h) = log(-log(1 - h)) = eta        h = 1 - exp(-exp(eta))
+#
+# That makes the fit the grouped-time analogue of a Cox proportional-hazards model:
+# exp(beta) is a HAZARD ratio, and the coefficients are invariant to the width of the
+# hourly interval (a logit coefficient is not).  On the latent scale the cloglog
+# residual is a standard Gumbel (extreme-value) draw with variance pi^2/6; a logit
+# model would use pi^2/3.  Every ICC / variance-decomposition / median-ratio quantity
+# below therefore uses RESID_VAR, and "MHR" is a median hazard ratio.
+LINK_NAME = "cloglog"
+RESID_VAR = float(np.pi ** 2 / 6)      # Gumbel latent variance (logit would be pi^2/3)
+
+
+def new_family():
+    """Binomial family with the complementary log-log link (one place to change it)."""
+    from statsmodels.genmod import families as fam
+    return fam.Binomial(link=fam.links.CLogLog())
+
+
+# Divergence guard. A cloglog IRLS that walks into the exp-overflow region comes back with
+# |beta| ~ 1e14-1e17 and a NaN log-likelihood; a legitimate but near-collinear spline term
+# sits far below that (NU reaches 2.3e3 at its optimum). So OVERFLOW_BETA only has to
+# separate those two regimes, and SEPARATION_BETA is a softer warning threshold.
+OVERFLOW_BETA = 1e6
+# Only terms outside the spline bases are checked for separation. The un-normalized Harrell
+# basis in _rcs_basis() leaves the NEE spline coefficients around 1e3 at EVERY site (UCMC
+# 1.3e3, RUSH 2.8e3, NU 2.3e3): its near-collinear columns carry large offsetting values
+# that cancel to a well-behaved eta. That is a property of the basis rather than separation,
+# so including those terms would make the warning fire everywhere and mean nothing.
+SEPARATION_BETA = 20.0
+SEPARATION_SKIP_PREFIXES = ("rcs_",)
+# Relative-gradient tolerance: max |score_j| x se_j at the returned coefficients. Zero at a
+# true optimum and scale-free, so it is comparable across fitting routes. Newton on the QR
+# basis scores ~1e-13; IRLS stops at its own looser working precision (~1e-3) even when it
+# reports success; a diverged IRLS scores 1e10+ and an optimizer stalled on its starting
+# values scores 1e4. The threshold sits below IRLS's precision deliberately, so that the
+# strictly-better Newton optimum is the one used rather than merely a nearby point.
+REL_GRAD_TOL = 1e-4
+
+
+def fisher_cov(X, beta):
+    """Expected-information covariance of a binomial cloglog GLM: (X' W X)^-1, with
+    W = diag( (dmu/deta)^2 / (mu (1 - mu)) ) and dmu/deta = exp(eta - exp(eta)).
+
+    This is the covariance IRLS reports, and it reproduces statsmodels' IRLS standard
+    errors to ~1e-8. It is computed explicitly because the generic Newton path returns an
+    OBSERVED-information covariance instead: cloglog is not a canonical link, so the two
+    differ by a few tenths of a percent in these samples, and using this one keeps the
+    standard errors the same whichever route converged.
+    """
+    Xa = np.asarray(X, dtype=float)
+    eta = np.clip(Xa @ np.asarray(beta, dtype=float), -500.0, 30.0)
+    ex = np.exp(eta)
+    mu = 1.0 - np.exp(-ex)
+    dmu = np.exp(eta - ex)
+    v = np.clip(mu * (1.0 - mu), 1e-12, None)
+    w = dmu ** 2 / v
+    return np.linalg.pinv(Xa.T @ (Xa * w[:, None]))
+
+
+class _CloglogFit:
+    """View over an accepted cloglog fit, in the original design parameterization.
+
+    Two things are fixed up here. The fit may have been performed on a reparameterized
+    design X @ T (eta = (X T) b = X (T b)), so the coefficients are mapped back as
+    beta = T b. And the covariance is recomputed from the expected information at the
+    optimum by fisher_cov(), the standard GLM convention, rather than taken from whichever
+    optimizer happened to run. Everything else -- log-likelihood, AIC / BIC, deviance,
+    residuals, fitted values -- depends only on eta, which the reparameterization leaves
+    unchanged, so it is delegated to the underlying fit untouched.
+    """
+
+    def __init__(self, fit, beta, cov, names=None):
+        self._fit = fit
+        beta = np.asarray(beta, dtype=float)
+        cov = np.asarray(cov, dtype=float)
+        se = np.sqrt(np.clip(np.diag(cov), 0.0, None))
+        self._cov = pd.DataFrame(cov, index=names, columns=names) if names is not None else cov
+        self.params = pd.Series(beta, index=names) if names is not None else beta
+        self.bse = pd.Series(se, index=names) if names is not None else se
+
+    def cov_params(self):
+        return self._cov
+
+    def __getattr__(self, name):      # llf / aic / bic / deviance / resid_* / fittedvalues / ...
+        if name.startswith("_"):
+            raise AttributeError(name)
+        return getattr(self._fit, name)
+
+
+def fit_cloglog(Y, X, maxiter: int = 200, col_names: list = None):
+    """Fit the binomial cloglog GLM for design matrix X, robustly.
+
+    cloglog is far less forgiving than logit: eta enters the likelihood through
+    exp(exp(eta)), so an IRLS step that overshoots lands in the overflow region and the
+    iteration never recovers -- the fit returns |beta| ~ 1e14 with a NaN log-likelihood.
+    That happens on real site data (NU and MIMIC-all; UCMC / RUSH / MIMIC-anchoryears are
+    fine under plain IRLS), and three things were ruled out as the cause:
+
+      * not an ill-posed optimum -- at NU the fitted eta stays within [-10.7, 2.5], so no
+        person-hour has a hazard anywhere near 1;
+      * not mere ill-conditioning -- column-scaling the design (cond 3e9 -> 1e5) and full
+        QR orthonormalization (cond = 1) both still diverge under IRLS;
+      * not fixable by warm-starting IRLS from the logit coefficients.
+
+    The cause is that statsmodels IRLS has no step-halving or line search. The fix is Newton
+    on the QR-orthonormalized design (X = Q R; fit on Q, then map back with beta = R^-1 b, a
+    pure reparameterization). At NU that reaches a genuine optimum from a cold start --
+    relative gradient ~1e-12 and the highest log-likelihood of every route tried -- where
+    Newton on the raw design scores 279 and lbfgs on the raw design stalls on its starting
+    values. Both ingredients matter: IRLS still diverges in the QR basis, and Newton still
+    fails in the raw one. This is the primary route for every site, so that one algorithm
+    fits them all; plain IRLS, warm-started IRLS and lbfgs remain as fallbacks for a design
+    where the QR is unavailable (rank deficiency) or Newton fails.
+
+    Every candidate must be converged, finite, outside the overflow region and *stationary*
+    by the relative-gradient test: lbfgs in particular reports success without having moved
+    off its starting values, and fit.converged does not catch that.
+
+    col_names labels the columns of X when X is a plain array; it is only used to keep the
+    spline terms out of the separation warning.
+
+    Standard errors always come from the expected information at the optimum (fisher_cov),
+    the usual GLM convention, so they do not depend on which route converged.
+
+    Returns a fit whose params / bse / cov_params() are in the original X parameterization.
+    Prints the route used when it was not the first; if nothing is usable the last attempt
+    is returned with a warning and the caller's `diagnostics.converged` stays False.
+    """
+    from statsmodels.genmod.generalized_linear_model import GLM
+    from statsmodels.genmod import families as fam
+
+    names = list(X.columns) if hasattr(X, "columns") else None
+    labels = names if names is not None else (list(col_names) if col_names is not None else None)
+    Xa = np.asarray(X, dtype=float)
+
+    # QR of the design, skipped if X is rank deficient (R would not be invertible).
+    QR = None
+    try:
+        q_, r_ = np.linalg.qr(Xa)
+        d_ = np.abs(np.diag(r_))
+        if d_.size and d_.min() > 1e-10 * max(d_.max(), 1.0):
+            QR = (q_, np.linalg.inv(r_))
+    except np.linalg.LinAlgError:
+        pass
+
+    _warm: dict = {}
+
+    def warm_params():
+        """Logit coefficients on the raw design: cheap, stable, and a good start point."""
+        if "raw" not in _warm:
+            _warm["raw"] = np.asarray(
+                GLM(Y, Xa, family=fam.Binomial()).fit(maxiter=maxiter).params, dtype=float)
+        return _warm["raw"]
+
+    def rel_gradient(model, fit):
+        """max |score_j| x se_j in the space the fit was performed in; ~0 at an optimum."""
+        try:
+            g = np.asarray(model.score(np.asarray(fit.params, dtype=float)), dtype=float)
+            se = np.asarray(fit.bse, dtype=float)
+            return float(np.max(np.abs(g) * se))
+        except Exception:
+            return float("nan")
+
+    # QR-Newton leads: it is the only route that reaches a stationary point at every site,
+    # so trying the cheaper ones first would just pay for two discarded IRLS fits before
+    # landing here anyway, and fitting every site with one algorithm is worth more than the
+    # runtime. The rest remain as fallbacks for a design where the QR is unavailable
+    # (rank deficiency) or Newton fails.
+    routes = []
+    if QR is not None:
+        routes.append(("Newton on the QR-orthonormalized design", "qr_newton"))
+    routes += [("IRLS", "irls"), ("IRLS, logit warm start", "irls_warm")]
+    if QR is not None:
+        routes.append(("lbfgs on the QR-orthonormalized design", "qr_lbfgs"))
+    routes.append(("lbfgs, logit warm start", "lbfgs_warm"))
+
+    last = None
+    for i, (label, kind) in enumerate(routes):
+        if kind == "qr_newton":
+            design, T, kw = QR[0], QR[1], {"method": "newton", "maxiter": 5000}
+        elif kind == "qr_lbfgs":
+            design, T, kw = QR[0], QR[1], {"method": "lbfgs", "maxiter": 5000}
+        elif kind == "irls":
+            design, T, kw = Xa, None, {"maxiter": maxiter}
+        elif kind == "irls_warm":
+            design, T, kw = Xa, None, {"maxiter": maxiter * 2, "start_params": warm_params()}
+        else:
+            design, T, kw = Xa, None, {"method": "lbfgs", "maxiter": 5000,
+                                       "start_params": warm_params()}
+
+        model = GLM(Y, design, family=new_family())
+        try:
+            raw = model.fit(**kw)
+        except Exception as exc:
+            print(f"  cloglog fit [{label}] raised {type(exc).__name__}: {str(exc)[:90]}")
+            continue
+
+        rel = rel_gradient(model, raw)
+        b = np.asarray(raw.params, dtype=float)
+        beta = (np.asarray(T, dtype=float) @ b) if T is not None else b
+        # statsmodels only sets `converged` on the IRLS path; the generic optimizers leave it
+        # None, which must read as "not reported" rather than "failed" -- the relative-gradient
+        # test below is the stronger criterion and decides those cases.
+        conv = getattr(raw, "converged", None)
+        ok = (conv is not False
+              and np.all(np.isfinite(beta))
+              and np.isfinite(getattr(raw, "llf", np.nan))
+              and np.abs(beta).max() < OVERFLOW_BETA
+              and np.isfinite(rel) and rel < REL_GRAD_TOL)
+        if ok:
+            fit = _CloglogFit(raw, beta, fisher_cov(Xa, beta), names)
+            if i:
+                print(f"  cloglog fit used fallback route [{label}] (rel. gradient {rel:.2g})")
+            mag = np.abs(beta)
+            if labels is not None and len(labels) == len(mag):
+                keep = [j for j, nm in enumerate(labels)
+                        if not str(nm).startswith(SEPARATION_SKIP_PREFIXES)]
+                worst, who = max(((mag[j], labels[j]) for j in keep), default=(0.0, None))
+            else:
+                worst, who = float(mag.max()), None
+            if worst >= SEPARATION_BETA:
+                print(f"  NOTE: largest non-spline |beta| = {worst:.3g}"
+                      f"{f' ({who})' if who else ''} - that covariate is probably separating, so "
+                      "its own coefficient is not interpretable (the intercept and the other "
+                      "terms still are).")
+            return fit
+        mx = np.abs(beta).max() if np.all(np.isfinite(beta)) else float("inf")
+        print(f"  cloglog fit [{label}] not usable (max|beta|={mx:.3g}, "
+              f"converged={conv}, rel. gradient={rel:.3g})")
+        # Kept only so the caller gets a result object (with converged=False) if nothing works.
+        last = _CloglogFit(raw, beta, fisher_cov(Xa, beta), names) if np.all(np.isfinite(beta)) else raw
+
+    if last is None:
+        raise RuntimeError("cloglog GLM could not be fit: every route raised (see messages above)")
+    print("  WARNING: cloglog GLM did not converge by any route - this site's coefficients are "
+          "NOT usable; check for a separating covariate before pooling this site.")
+    return last
+
+
+def inv_link(eta):
+    """cloglog inverse link: h = 1 - exp(-exp(eta)).  Clipped so exp cannot overflow."""
+    e = np.clip(np.asarray(eta, dtype=float), -500.0, 30.0)
+    return 1.0 - np.exp(-np.exp(e))
+
+
+def link(h):
+    """cloglog link: eta = log(-log(1 - h))."""
+    q = np.clip(np.asarray(h, dtype=float), 1e-12, 1.0 - 1e-12)
+    return np.log(-np.log(1.0 - q))
+
 
 # ── Configuration ─────────────────────────────────────────────────────────────
 BASE_DIR = Path(__file__).parent.parent
@@ -271,8 +539,8 @@ def _canon_icu_series(raw: pd.Series) -> pd.Series:
 
 def _dl_pool(alphas: np.ndarray, alpha_var: np.ndarray) -> dict:
     """DerSimonian-Laird random-effects pooling of K independent (alpha_k, se_k)
-    intercept estimates -> between-group variance tau2, ICC, and MOR (median
-    odds ratio) on the patient-level logistic residual variance pi^2/3.
+    intercept estimates -> between-group variance tau2, ICC, and MHR (median
+    hazard ratio) on the cloglog residual variance RESID_VAR = pi^2/6.
     """
     K = len(alphas)
     if K < 2:
@@ -286,10 +554,10 @@ def _dl_pool(alphas: np.ndarray, alpha_var: np.ndarray) -> dict:
     w_re = 1.0 / (alpha_var + tau2); ws_re = w_re.sum()
     theta_re = float((w_re * alphas).sum() / ws_re)
     se_re = float(np.sqrt(1.0 / ws_re))
-    icc = tau2 / (tau2 + np.pi ** 2 / 3)
-    mor = float(np.exp(np.sqrt(2 * tau2) * 0.6745)) if tau2 > 0 else 1.0
+    icc = tau2 / (tau2 + RESID_VAR)
+    mhr = float(np.exp(np.sqrt(2 * tau2) * 0.6745)) if tau2 > 0 else 1.0
 
-    return {"tau2": tau2, "icc": icc, "mor": mor, "pooled_alpha": theta_re, "se": se_re, "k": K, "q": Q}
+    return {"tau2": tau2, "icc": icc, "mhr": mhr, "pooled_alpha": theta_re, "se": se_re, "k": K, "q": Q}
 
 
 # ── RCS helpers ───────────────────────────────────────────────────────────────
@@ -331,13 +599,36 @@ def _rcs_knots(x: np.ndarray, df: int = 4) -> np.ndarray:
 _LOCF_COLS = ["p_f_ratio", "creatinine", "platelet", "bilirubin", "gcs"]
 
 
-def _prep_person_hours(cohort: pd.DataFrame, features: pd.DataFrame) -> pd.DataFrame:
+# NEE enters the model as the PREVIOUS hour's value (what the clinician could see; no vasopressin term yet).
+# The other covariates (labs / GCS / P-F / device / RRT) stay at the current hour: they are last-observed-value
+# carried forward, so they are not affected by the vasopressin start, and lagging them would drop ~40% of
+# initiators whose first P/F or device record falls in the hour of initiation. Set to the full list to lag all.
+_LAGGED_COLS = ["nee"]
+OUTCOME_NAME = "vaso_start_hazard"
+
+
+def _prep_person_hours(cohort: pd.DataFrame, features: pd.DataFrame, hazard: bool = True) -> pd.DataFrame:
+    """Person-hours for the initiation-hazard GLM.
+
+    1. vaso_on / vaso_start / at-risk flags are computed on the FULL hourly grid, before any row is lagged or
+       dropped (a dropped hour must not make a later 'already on' hour look like the first one).
+    2. NEE is replaced by its value in the previous hour (0 at the first hour).
+    3. With hazard=True (default) only at-risk hours are kept (hours up to and including the first
+       vasopressin hour) and the outcome column `vaso_on` is set to vaso_start.
+    """
     cols = (["stay_id", "time_hour", "vaso_dose", "nee", "rrt", "device_category"]
             + _LOCF_COLS)
     ph = features[cols].copy()
-    ph["vaso_on"] = (ph["vaso_dose"] > 0).astype(int)
     ph = ph.sort_values(["stay_id", "time_hour"])
+    ph["vaso_on"] = (ph["vaso_dose"] > 0).astype(int)
+    cum_before = ph.groupby("stay_id")["vaso_on"].cumsum() - ph["vaso_on"]
+    ph["vaso_start"] = ((ph["vaso_on"] == 1) & (cum_before == 0)).astype(int)
+    ph["_at_risk_start"] = (cum_before == 0).astype(int)
+
     ph[_LOCF_COLS] = ph.groupby("stay_id")[_LOCF_COLS].ffill()
+    ph[_LAGGED_COLS] = ph.groupby("stay_id")[_LAGGED_COLS].shift(1)        # state in the previous hour
+    # hour 0 = NE start: nothing was running in the hour before, so previous-hour NEE is 0
+    ph["nee"] = ph["nee"].fillna(0) if "nee" in _LAGGED_COLS else ph["nee"]
 
     # Merge static baseline features (age + binary comorbidities)
     _static = ["stay_id", "age"] + [c for c in _BIN_COLS_MODELS if c in cohort.columns]
@@ -365,15 +656,8 @@ def _prep_person_hours(cohort: pd.DataFrame, features: pd.DataFrame) -> pd.DataF
         ph["hospital_type"] = ph["hospital_type"].fillna("unknown")
 
     ph = ph.dropna(subset=["nee", "age", "rrt", "device_category"] + _LOCF_COLS).copy()
-
-    # For the vaso_start (initiation) outcome analysis:
-    # vaso_start = 1 only at the first hour vasopressin is on, 0 otherwise.
-    # _at_risk_start = 1 for all hours before (and including) the first vaso hour.
-    # After initiation the patient exits the risk set and those rows should be excluded.
-    cum_before = ph.groupby("stay_id")["vaso_on"].cumsum() - ph["vaso_on"]
-    ph["vaso_start"] = ((ph["vaso_on"] == 1) & (cum_before == 0)).astype(int)
-    ph["_at_risk_start"] = (cum_before == 0).astype(int)
-
+    if hazard:
+        ph = _filter_ph_for_outcome(ph, "start")
     return ph
 
 
@@ -390,7 +674,7 @@ def _build_design_matrix(
     candidate_bin_cols: list = None,  # if None, uses _BIN_COLS_MODELS
     extra_cont_cols: list = None,     # additional continuous covariates to standardise & include
 ):
-    """vaso_on ~ intercept + age_c + p_f_ratio_c + device_category + icu_type + creatinine_c
+    """vaso_start ~ intercept + age_c + p_f_ratio_c + device_category + icu_type + creatinine_c
     + rrt + platelet_c + bilirubin_c + gcs_c
     + [binary comorbidities: cirrhosis, liver_nocirrh, cad, aortic_stenosis, carotid_stenosis]
     + rcs(NEE,4) + rcs(time,4).
@@ -541,7 +825,7 @@ def _filter_ph_for_outcome(ph: pd.DataFrame, outcome: str) -> pd.DataFrame:
     return ph
 
 
-# ── Approach 1 & 2: Per-site logistic GLM ─────────────────────────────────────
+# ── Approach 1 & 2: Per-site discrete-time hazard GLM (cloglog) ───────────────
 _FIT_CACHE: dict = {}      # (cohort, site) -> statsmodels fit + design matrix, for run_site_diagnostics
 
 
@@ -552,16 +836,14 @@ def fit_site_logistic(
     bin_cols: list = None,
     extra_cont_cols: list = None,
 ) -> dict:
-    """Fit the shared logistic spec (see _build_design_matrix) independently
-    on this group's person-hours (its own knots/scaling/device categories).
+    """Fit the shared discrete-time hazard spec (see _build_design_matrix) with a
+    complementary log-log link, independently on this group's person-hours (its own
+    knots/scaling/device categories).
 
     bin_cols:        list of binary covariate names to include; defaults to _BIN_COLS_MODELS.
     extra_cont_cols: list of additional continuous covariate names (already in ph);
                      they are standardised and included alongside the base _CONT_COLS.
     """
-    from statsmodels.genmod.generalized_linear_model import GLM
-    from statsmodels.genmod import families as fam
-
     _cand  = bin_cols if bin_cols is not None else _BIN_COLS_MODELS
     _extra = list(extra_cont_cols) if extra_cont_cols else []
     _bin_present = [c for c in _cand if c in ph.columns]
@@ -590,12 +872,14 @@ def fit_site_logistic(
     )
     Y = df["vaso_on"].values.astype(np.float64)
 
-    fit = GLM(Y, X, family=fam.Binomial()).fit(maxiter=200)
+    fit = fit_cloglog(Y, X, maxiter=200, col_names=col_names)
     _FIT_CACHE[(cohort_label, site)] = {"fit": fit, "X": X, "Y": Y, "col_names": col_names, "df": df}
 
+    # exp(beta) under cloglog is a hazard ratio (ratio of hourly initiation hazards),
+    # not an odds ratio — the key is named "hr" so downstream readers cannot mislabel it.
     coef_out = {
         name: {"beta": float(fit.params[i]), "se": float(fit.bse[i]),
-               "or":   float(np.exp(fit.params[i]))}
+               "hr":   float(np.exp(fit.params[i]))}
         for i, name in enumerate(col_names)
     }
 
@@ -643,6 +927,10 @@ def fit_site_logistic(
         "n_patients":        int(df["stay_id"].nunique()),
         "n_ph_rows":         int(len(df)),
         "n_vaso_on":         int(Y.sum()),
+        "outcome":           OUTCOME_NAME,          # hazard of initiating vasopressin
+        "link":              LINK_NAME,             # complementary log-log
+        "resid_var":         RESID_VAR,             # pi^2/6, the cloglog latent residual variance
+        "covariate_timing":  "nee_previous_hour",
         "means":             means,
         "sds":               sds,
         "device_categories": device_categories,
@@ -710,7 +998,7 @@ def predict_p(
     for i in range(time_b.shape[1]):
         lp += coef[f"rcs_time_{i}"]["beta"] * time_b[:, i]
 
-    return 1.0 / (1.0 + np.exp(-lp))
+    return inv_link(lp)
 
 
 def predict_p_structural(
@@ -763,7 +1051,7 @@ def predict_p_structural(
         if hd_col in coef:
             lp += coef[hd_col]["beta"]
 
-    return 1.0 / (1.0 + np.exp(-lp))
+    return inv_link(lp)
 
 
 # ── Plot: Approach 2A — P(vaso) vs time ──────────────────────────────────────
@@ -781,7 +1069,7 @@ def plot_approach2_time(site_models: dict, out_dir: Path, cohort_label: str, pal
         ax.plot(time_grid, p_t, color=pal.get(s, "#888888"), linewidth=2.5, label=s)
 
     ax.set_xlabel("Hours from NE start", fontsize=11)
-    ax.set_ylabel("P(vasopressin on | hour)", fontsize=11)
+    ax.set_ylabel("P(vasopressin starts in the hour)", fontsize=11)
     ax.set_title(
         f"Approach 2A — Time-varying P(vasopressin)\n"
         f"Reference patient: age={REF_AGE}, p/f={REF_PF}, {REF_DEVICE}, NEE={REF_NEE} mcg/kg/min  "
@@ -826,8 +1114,8 @@ def plot_approach2_nee(
         p_nee = predict_p(m, REF_AGE, nee_grid, ref_time)
         ax.plot(nee_grid, p_nee, color=pal.get(s, "#888888"), linewidth=2.5, label=s)
 
-    ax.set_xlabel("NEE dose (mcg/kg/min)", fontsize=11)
-    ax.set_ylabel("P(vasopressin on)", fontsize=11)
+    ax.set_xlabel("NEE of the previous hour (mcg/kg/min)", fontsize=11)
+    ax.set_ylabel("P(vasopressin starts in the hour)", fontsize=11)
     ax.set_title(
         f"Approach 2B — P(vasopressin) vs. NEE dose\n"
         f"Reference patient: age={REF_AGE}, p/f={REF_PF}, {REF_DEVICE}, t={ref_time:.0f} h  "
@@ -857,6 +1145,7 @@ _COVAR_GROUPS: dict = {
     "GCS":             lambda c: c == "gcs_c",
     "RRT":             lambda c: c == "rrt",
     "Device category": lambda c: c.startswith("device_"),
+    "ICU type":        lambda c: c.startswith("icu_"),
     "NEE dose":        lambda c: c.startswith("rcs_nee_"),
     "Time on NE":      lambda c: c.startswith("rcs_time_"),
 }
@@ -927,17 +1216,17 @@ def build_icu_structure(model: dict, ph: pd.DataFrame) -> dict:
         "coefficients": coefs,
         "ward_effective_intercepts": ei,
         "hospital_effective_intercepts": {},
-        "tau2_hosp": None, "icc_hosp": None, "mor_hosp": None,
+        "tau2_hosp": None, "icc_hosp": None, "mhr_hosp": None,
     }
     stable = {g: v for g, v in ei.items() if v["stable"] and v["se"] > 0}
     dl = _dl_pool(np.array([v["alpha"] for v in stable.values()]),
                   np.array([v["se"] for v in stable.values()]) ** 2) if len(stable) >= 2 else {}
     if dl:
-        out.update({"tau2_ward": dl["tau2"], "icc_ward": dl["icc"], "mor_ward": dl["mor"]})
+        out.update({"tau2_ward": dl["tau2"], "icc_ward": dl["icc"], "mhr_ward": dl["mhr"]})
         print(f"    Within-site DL across ICU types: tau2={dl['tau2']:.4f}  ICC={dl['icc']:.3f}  "
-              f"MOR={dl['mor']:.3f}  (k={dl['k']})")
+              f"MHR={dl['mhr']:.3f}  (k={dl['k']})")
     else:
-        out.update({"tau2_ward": None, "icc_ward": None, "mor_ward": None})
+        out.update({"tau2_ward": None, "icc_ward": None, "mhr_ward": None})
         print("    Within-site DL across ICU types: <2 stable ICU types — tau2 not estimable")
     return out
 
@@ -948,26 +1237,24 @@ def compute_covariate_variance_explained(
     structural_models: dict,
     me_result: dict,
 ) -> dict:
-    """Variance of each covariate's linear predictor contribution, per site.
+    """Variance of each covariate group's linear-predictor contribution, per site.
 
-    For predictor group g:  σ²_g = Var(β_g ᵀ X_g) over all patient-hours.
+    Every term of the site GLM is in a group (see _COVAR_GROUPS), ICU type included (its dummies are
+    ordinary fixed effects). For group g:   σ²_g = Var_i( Σ_{j∈g} β_j x_ij )   over this site's patient-hours.
 
-    Total latent variance = Σ σ²_g + σ²_ward + σ²_hosp + σ²_site + π²/3
-    where:
-      • σ²_g  = Var(β_g X_g) from the Approach 1 model (shared logistic spec)
-      • σ²_ward = τ²_ward from DL pooling of Approach 3 effective intercepts
-      • σ²_hosp = τ²_hosp from DL pooling of Approach 3 effective intercepts
-      • σ²_site = dl_tau2 from cross-site mixed-effects pooling (Approach 1)
-      • π²/3  ≈ 3.29 = logistic latent-variable residual (fixed mathematical constant)
+    Total latent variance = Σ_g σ²_g + σ²_site + π²/6
+      • σ²_site  — between-site variance (DL τ² of the sites' reference-patient cloglog intercepts). It
+                   cannot be estimated inside one site's model, so it is 0 here and added by 08.
+      • π²/6 ≈ 1.64 — variance of the standard Gumbel distribution, the cloglog latent-variable residual
+                      (a logit model would use π²/3 ≈ 3.29 here)
 
-    This gives a single decomposition across all 4 levels summing to 100%.
+    R²_marginal    = Σ_g σ²_g / σ²_total
+    R²_conditional = (Σ_g σ²_g + σ²_site) / σ²_total
 
-    R²_marginal    = Σ σ²_g  / σ²_total   (covariate fixed effects only)
-    R²_conditional = (Σ σ²_g + σ²_ward + σ²_hosp + σ²_site) / σ²_total
-
-    Reference: Nakagawa & Schielzeth (2013) Methods Ecol Evol 4:133-142.
+    Reference: Nakagawa & Schielzeth (2013) Methods Ecol Evol 4:133-142. Σ_g Var(η_g) ignores the
+    covariances between groups, so the group shares only approximately partition Var(η).
     """
-    pi2_3 = float(np.pi ** 2 / 3)
+    resid_var = RESID_VAR            # pi^2/6: cloglog latent residual variance
     results: dict = {}
 
     for site in site_models:
@@ -977,8 +1264,10 @@ def compute_covariate_variance_explained(
         ph = ph_by_site[site].copy()
         _pbc = model.get("present_bin_cols", [])
         _bin_in_ph = [c for c in _pbc if c in ph.columns]
+        _icu_col = ["icu_type"] if "icu_type" in ph.columns else []
         ph = (ph[["stay_id", "time_hour", "vaso_on", "nee", "rrt",
-                   "device_category"] + _CONT_COLS + _bin_in_ph].dropna().copy())
+                   "device_category"] + _CONT_COLS + _bin_in_ph + _icu_col].dropna(
+                       subset=["nee", "rrt", "device_category"] + _CONT_COLS).copy())
         if ph.empty:
             continue
         ph["device_category"] = ph["device_category"].where(
@@ -993,6 +1282,7 @@ def compute_covariate_variance_explained(
                 sds=model["sds"],
                 device_categories=model["device_categories"],
                 present_bin_cols=_pbc,
+                icu_categories=model.get("icu_categories", []),
             )
         except Exception as exc:
             print(f"  [{site}] covariate variance skipped — {exc}")
@@ -1008,15 +1298,9 @@ def compute_covariate_variance_explained(
 
         sigma2_fixed = float(sum(group_sigma2.values()))
 
-        # Structural variance from Approach 3 DL pooling of effective intercepts
-        struct_s    = structural_models.get(site, {})
-        sigma2_ward = float(struct_s.get("tau2_ward") or 0.0)
-        sigma2_hosp = float(struct_s.get("tau2_hosp") or 0.0)
-        # Cross-site variance from Approach 1 DL pooling
+        # Between-site variance needs other sites: 0 inside a single-site model, added by 08.
         sigma2_site = float(me_result.get("dl_tau2") or 0.0)
-
-        sigma2_rand  = sigma2_ward + sigma2_hosp + sigma2_site
-        sigma2_total = sigma2_fixed + sigma2_rand + pi2_3
+        sigma2_total = sigma2_fixed + sigma2_site + resid_var
 
         def _pct(v: float) -> float:
             return v / sigma2_total * 100 if sigma2_total > 0 else 0.0
@@ -1025,18 +1309,14 @@ def compute_covariate_variance_explained(
             "n_patients":    model["n_patients"],
             "group_sigma2":  group_sigma2,
             "sigma2_fixed":  sigma2_fixed,
-            "sigma2_ward":   sigma2_ward,
-            "sigma2_hosp":   sigma2_hosp,
             "sigma2_site":   sigma2_site,
-            "sigma2_resid":  pi2_3,
+            "sigma2_resid":  resid_var,
             "sigma2_total":  sigma2_total,
             "r2_marginal":   sigma2_fixed / sigma2_total if sigma2_total > 0 else float("nan"),
-            "r2_conditional": (sigma2_fixed + sigma2_rand) / sigma2_total if sigma2_total > 0 else float("nan"),
+            "r2_conditional": (sigma2_fixed + sigma2_site) / sigma2_total if sigma2_total > 0 else float("nan"),
             "pct_groups":    {g: _pct(v) for g, v in group_sigma2.items()},
-            "pct_ward":      _pct(sigma2_ward),
-            "pct_hosp":      _pct(sigma2_hosp),
             "pct_site":      _pct(sigma2_site),
-            "pct_resid":     _pct(pi2_3),
+            "pct_resid":     _pct(resid_var),
         }
         print(f"  [{site}] R²_marginal={results[site]['r2_marginal']:.3f}  "
               f"R²_conditional={results[site]['r2_conditional']:.3f}")
@@ -1047,7 +1327,7 @@ def compute_covariate_variance_explained(
 def plot_group_intercepts(
     structural_model: dict, out_dir: Path, cohort_label: str, site: str, label: str
 ) -> None:
-    """Forest plot of each ward/ICU-type or hospital's effective logit intercept
+    """Forest plot of each ward/ICU-type or hospital's effective cloglog intercept
     ± 95% CI — computed via delta method from the single expanded structural model.
 
     structural_model: result of fit_site_logistic_with_structure for this site.
@@ -1078,7 +1358,7 @@ def plot_group_intercepts(
     ax.axvline(0, color="lightgrey", linestyle="--", linewidth=1)
     ax.set_yticks(y_pos)
     ax.set_yticklabels([f"{g}  (n={n:,})" for g, n in zip(groups, ns)], fontsize=9)
-    ax.set_xlabel("Effective logit intercept ± 95% CI\n(ref patient at site-wide mean covariates)", fontsize=9)
+    ax.set_xlabel("Effective complementary log-log intercept ± 95% CI\n(ref patient at site-wide mean covariates)", fontsize=9)
 
     tau2_key = "tau2_ward" if label == "ward" else "tau2_hosp"
     tau2     = structural_model.get(tau2_key)
@@ -1138,7 +1418,7 @@ def plot_approach2_time_by_group(
                 label=f"{grp}  (n={ei[grp]['n_patients']:,})")
 
     ax.set_xlabel("Hours from NE start", fontsize=11)
-    ax.set_ylabel("P(vasopressin on | hour)", fontsize=11)
+    ax.set_ylabel("P(vasopressin starts in the hour)", fontsize=11)
     ax.set_title(
         f"Approach 2A — Time-varying P(vasopressin) by {label}\n"
         f"Ref patient: age={REF_AGE}, p/f={REF_PF}, {REF_DEVICE}, NEE={REF_NEE} mcg/kg/min  "
@@ -1198,8 +1478,8 @@ def plot_approach2_nee_by_group(
         ax.plot(nee_grid, p_nee, color=color_map[grp], linewidth=2.0,
                 label=f"{grp}  (n={ei[grp]['n_patients']:,})")
 
-    ax.set_xlabel("NEE dose (mcg/kg/min)", fontsize=11)
-    ax.set_ylabel("P(vasopressin on)", fontsize=11)
+    ax.set_xlabel("NEE of the previous hour (mcg/kg/min)", fontsize=11)
+    ax.set_ylabel("P(vasopressin starts in the hour)", fontsize=11)
     ax.set_title(
         f"Approach 2B — P(vasopressin) vs NEE by {label}\n"
         f"Ref patient: age={REF_AGE}, p/f={REF_PF}, {REF_DEVICE}, t={ref_time:.0f} h  "
@@ -1655,7 +1935,10 @@ def plot_location_transition_outcome_heatmaps(
 
 # ── Interpretable coefficient / group-intercept tables ───────────────────────
 def export_coefficient_table(model: dict) -> pd.DataFrame:
-    """One row per fitted-model term: beta, SE, OR, 95% CI, p-value."""
+    """One row per fitted-model term: beta, SE, hazard ratio, 95% CI, p-value.
+
+    The link is cloglog, so exp(beta) is a hazard ratio for starting vasopressin in
+    the hour, not an odds ratio."""
     from scipy.stats import norm
 
     rows = []
@@ -1664,16 +1947,16 @@ def export_coefficient_table(model: dict) -> pd.DataFrame:
         z = beta / se if se else np.nan
         p = float(2 * (1 - norm.cdf(abs(z)))) if np.isfinite(z) else np.nan
         rows.append({
-            "term": term, "beta": beta, "se": se, "or": c["or"],
-            "or_ci_lo95": float(np.exp(beta - 1.96 * se)),
-            "or_ci_hi95": float(np.exp(beta + 1.96 * se)),
+            "term": term, "beta": beta, "se": se, "hr": c["hr"],
+            "hr_ci_lo95": float(np.exp(beta - 1.96 * se)),
+            "hr_ci_hi95": float(np.exp(beta + 1.96 * se)),
             "p_value": p,
         })
     return pd.DataFrame(rows)
 
 
 def export_group_intercept_table(structural_model: dict, label: str = "ward") -> pd.DataFrame:
-    """One row per ward/ICU-type or hospital: effective logit intercept (delta-method SE),
+    """One row per ward/ICU-type or hospital: effective cloglog intercept (delta-method SE),
     n_patients — from fit_site_logistic_with_structure's effective intercepts.
 
     label: "ward"     → reads ward_effective_intercepts
@@ -1692,11 +1975,10 @@ def export_group_intercept_table(structural_model: dict, label: str = "ward") ->
 
 
 def run_site_diagnostics(cohort_label: str, site: str, out_dir: Path, tau2_ward=None) -> None:
-    """Model diagnostics on the ONE fitted site GLM (same design matrix, same reference levels):
+    """Model diagnostics on the ONE fitted site cloglog GLM (same design matrix, same reference levels):
     convergence / singularity, residuals, VIF, covariate balance (vasopressin-on vs off hours),
     missing data, ICU-type cluster counts, leave-one-ICU-type-out sensitivity of the NEE spline term,
     plus a markdown summary. Written to <cohort>/diagnostics/."""
-    import statsmodels.api as sm
     cached = _FIT_CACHE.get((cohort_label, site))
     if cached is None:
         print("  [diagnostics] no cached fit — skipped")
@@ -1717,18 +1999,19 @@ def run_site_diagnostics(cohort_label: str, site: str, out_dir: Path, tau2_ward=
         # leave-one-ICU-type-out refit on the same design columns (drop all-zero dummies)
         Xs = df_sub[names]
         Xs = Xs.loc[:, (Xs != 0).any(axis=0)]
-        r = sm.GLM(df_sub["_y"].values, Xs, family=sm.families.Binomial()).fit(maxiter=100)
+        r = fit_cloglog(df_sub["_y"].values, Xs, maxiter=100)
         return {target: float(r.params.get(target, np.nan)), f"{target}_se": float(r.bse.get(target, np.nan))}
 
     md.run_model_diagnostics(
         sm_result=cached["fit"], X=diag_x, y=y,
-        model_name="site_logistic_vaso_on", script="05_site_variation_analysis.py",
+        model_name="site_cloglog_vaso_start", script="05_site_variation_analysis.py",
         out_dir=out_dir, cohort=cohort_label, site=site,
         group_col="vaso_on",
         cont_cols=[c for c in names if c.endswith("_c")],
         bin_cols=[c for c in ["rrt"] if c in names],
         cluster_col="icu_type",
         tau2_dict=({"ward (ICU type)": float(tau2_ward)} if tau2_ward is not None else None),
+        resid_var=RESID_VAR,
         fit_fn=_fit_without if target in names else None,
         target_coef=target if target in names else None,
         main_coef_override=float(cached["fit"].params[names.index(target)]) if target in names else None,
@@ -1754,7 +2037,7 @@ def run_for_cohort(cohort_label: str):
     site_features = site_features[site_features["stay_id"].isin(set(site_cohort["stay_id"]))].copy()
 
     # ── The one site GLM ──────────────────────────────────────────────────
-    print(f"\n[{SITE_NAME}] Fitting site-specific logistic GLM...")
+    print(f"\n[{SITE_NAME}] Fitting site-specific discrete-time hazard GLM (cloglog link)...")
     ph = _prep_person_hours(site_cohort, site_features)
     print(f"  person-hours after prep: {ph.shape}")
     if ph.empty:

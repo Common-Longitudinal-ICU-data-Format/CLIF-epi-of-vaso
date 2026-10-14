@@ -444,15 +444,30 @@ def write_baseline_table1(coh):
 # OUTPUT 4: feature_at_initiation.csv
 # ============================================================
 
+SNAPSHOT = "hour_before_initiation"
+
+
 def _initiation_rows(feat):
-    """First 0→1 vasopressin-action transition per patient, shared by both
-    the flat and the group-level feature-at-initiation writers."""
+    """One row per initiator: the clinical state in the HOUR BEFORE vasopressin started.
+
+    The first 0->1 vasopressin-action hour t is the initiation hour. Its own row already contains the
+    vasopressin contribution to NEE and any same-hour titration, so every "at initiation" feature is taken
+    from hour t-1 instead: the information the clinician was looking at before acting. `time_hour` stays t
+    (hours from NE start to vasopressin). Patients whose vasopressin starts in the first hour have no
+    earlier hour, so their features are missing (counted in n_missing).
+    Shared by the flat, group-level and profile writers; used by the 04 / cohort-table definitions too.
+    """
     fs = feat.sort_values(["stay_id", "time_hour"]).copy()
     fs["prev_vaso"] = fs.groupby("stay_id")["action_vaso"].shift(1).fillna(0)
-    return (
-        fs[(fs["action_vaso"] == 1) & (fs["prev_vaso"] == 0)]
-        .drop_duplicates(subset=["stay_id"], keep="first")
-    )
+    ev = (fs[(fs["action_vaso"] == 1) & (fs["prev_vaso"] == 0)]
+          .drop_duplicates(subset=["stay_id"], keep="first")[["stay_id", "time_hour"]]
+          .rename(columns={"time_hour": "vaso_hour"}))
+    snap = fs.drop(columns=["prev_vaso"]).copy()
+    snap["vaso_hour"] = snap["time_hour"] + 1               # the row of hour t-1, keyed to t
+    snap = snap.drop(columns=["time_hour"])
+    out = ev.merge(snap, on=["stay_id", "vaso_hour"], how="left")
+    out["time_hour"] = out["vaso_hour"]
+    return out.drop(columns=["vaso_hour"])
 
 
 def _feature_stats_row(arr: pd.Series, n_total: int, extra: dict | None = None) -> dict:
@@ -484,7 +499,7 @@ def write_feature_at_initiation(feat):
         if col not in init.columns:
             continue
         arr = pd.to_numeric(init[col], errors="coerce").dropna()
-        rows.append(_feature_stats_row(arr, n_total, extra={"feature": col}))
+        rows.append(_feature_stats_row(arr, n_total, extra={"feature": col, "snapshot": SNAPSHOT}))
 
     out = OUTPUT_DIR / "feature_at_initiation.csv"
     pd.DataFrame(rows).to_csv(out, index=False)
@@ -536,7 +551,7 @@ def write_feature_at_initiation_by_group(coh, feat):
         rows = []
         for grp, sub in merged.groupby(group_col):
             n_grp_total = len(sub)
-            extra = {"group_column": group_col, "group": grp}
+            extra = {"group_column": group_col, "group": grp, "snapshot": SNAPSHOT}
             if "hospital_type" in sub.columns:
                 modal = sub["hospital_type"].mode(dropna=True)
                 extra["hospital_type"] = modal.iloc[0] if len(modal) else None
@@ -557,19 +572,20 @@ def write_feature_at_initiation_by_group(coh, feat):
 # Who is where when vasopressin starts? One row per (ICU type x feature) plus an
 # "All ICU types" group, for the cross-site location heatmap (09). Population =
 # vasopressin initiators (prior-vasopressin patients excluded, as in the other
-# at-initiation outputs). ICU type = location at NE start.
+# at-initiation outputs). ICU type = location at NE start. The two timing rows are
+# anchored on the time septic shock criteria were met (cohort infection_dttm).
 INITIATION_PROFILE_FEATURES = [
     # (column, label)                                 source
-    ("mbp",                "MAP at initiation (mmHg)"),                # features, initiation hour
-    ("bun",                "BUN at initiation (mg/dL)"),
-    ("creatinine",         "Creatinine at initiation (mg/dL)"),
-    ("gcs",                "GCS at initiation"),
-    ("sofa",               "SOFA at initiation"),
+    ("mbp",                "MAP, hour before initiation (mmHg)"),      # features, hour before initiation
+    ("bun",                "BUN, hour before initiation (mg/dL)"),
+    ("creatinine",         "Creatinine, hour before initiation (mg/dL)"),
+    ("gcs",                "GCS, hour before initiation"),
+    ("sofa",               "SOFA, hour before initiation"),
     ("age",                "Age (years)"),                             # cohort
-    ("heart_rate",         "Heart rate at initiation (/min)"),
-    ("temperature",        "Temperature at initiation (C)"),
-    ("hosp_to_ne_hours",   "Hospital admission to NE start (h)"),      # cohort (01 / 01b)
-    ("hosp_to_vaso_hours", "Hospital admission to vasopressin start (h)"),
+    ("heart_rate",         "Heart rate, hour before initiation (/min)"),
+    ("temperature",        "Temperature, hour before initiation (C)"),
+    ("shock_to_ne_hours",   "Septic shock criteria to NE start (h)"),    # cohort (01 / 01b)
+    ("shock_to_vaso_hours", "Septic shock criteria to vasopressin start (h)"),
 ]
 
 
@@ -581,16 +597,24 @@ def write_initiation_profile_by_icu(coh, feat):
         miss = eff.isna() | eff.astype(str).str.lower().str.strip().isin(["none", "nan", ""])
         eff[miss] = c.loc[miss, "location_category"]
     c["_effective_location"] = _canon_icu_series(eff)
-    keep = ["stay_id", "_effective_location"] + [k for k in ("age", "hosp_to_ne_hours") if k in c.columns]
+    # Timing rows are anchored on the time septic shock criteria were met
+    # (infection_dttm: the presumed-infection anchor for Sepsis-3, the qualifying
+    # blood culture for Rhee), not on hospital admission.
+    if {"infection_dttm", "first_norepi_time"} <= set(c.columns):
+        _inf = pd.to_datetime(c["infection_dttm"], utc=True, errors="coerce")
+        _ne  = pd.to_datetime(c["first_norepi_time"], utc=True, errors="coerce")
+        c["shock_to_ne_hours"] = (_ne - _inf).dt.total_seconds() / 3600
+    keep = ["stay_id", "_effective_location"] + [k for k in ("age", "shock_to_ne_hours") if k in c.columns]
     merged = init.drop(columns=[k for k in ("age",) if k in init.columns]).merge(
         c[keep].dropna(subset=["_effective_location"]), on="stay_id", how="inner")
     if merged.empty:
         print("  SKIP initiation_profile_by_icu.csv: no initiating patients with a known ICU type")
         return
-    if "hosp_to_ne_hours" in merged.columns:
-        merged["hosp_to_vaso_hours"] = merged["hosp_to_ne_hours"] + merged["time_hour"]
+    if "shock_to_ne_hours" in merged.columns:
+        # time_hour = hours from NE start to vasopressin, so this chains to the shock anchor
+        merged["shock_to_vaso_hours"] = merged["shock_to_ne_hours"] + merged["time_hour"]
     else:
-        print("  NOTE: hosp_to_ne_hours not in cohort (re-run 01 / 01b) - admission-timing rows omitted")
+        print("  NOTE: infection_dttm not in cohort (re-run 01 / 01b) - shock-timing rows omitted")
 
     rows = []
     groups = [("All ICU types", merged)] + [(g, sub) for g, sub in merged.groupby("_effective_location")]
@@ -599,7 +623,8 @@ def write_initiation_profile_by_icu(coh, feat):
             if col not in sub.columns:
                 continue
             arr = pd.to_numeric(sub[col], errors="coerce").dropna()
-            rows.append(_feature_stats_row(arr, len(sub), extra={"group": grp, "feature": col, "label": label}))
+            rows.append(_feature_stats_row(arr, len(sub), extra={"group": grp, "feature": col, "label": label,
+                                                                  "snapshot": SNAPSHOT}))
     out = OUTPUT_DIR / "initiation_profile_by_icu.csv"
     pd.DataFrame(rows).to_csv(out, index=False)
     print(f"  Wrote   {out.name}")
@@ -795,7 +820,9 @@ def build_vaso_init_df(cohort_df, features_df):
         return None
     ever = ever[ever["stay_id"].isin(ever_ids)]
     at_init = features_df.merge(ever[["stay_id", "vaso_init_hour"]], on="stay_id")
-    at_init = at_init[at_init["time_hour"] == at_init["vaso_init_hour"]]
+    # clinical state in the HOUR BEFORE vasopressin started (vaso_init_hour stays = hour vasopressin started);
+    # patients whose vasopressin started in the first hour have no earlier hour and drop out of this table
+    at_init = at_init[at_init["time_hour"] == at_init["vaso_init_hour"] - 1]
     cohort_sub = cohort_df[cohort_df["stay_id"].isin(ever_ids)]
     return cohort_sub.merge(at_init, on="stay_id", how="inner")
 
@@ -905,6 +932,7 @@ def write_cohort_tables(coh_raw, feat_raw):
     payload = {
         "site":   SITE_NAME,
         "cohort": COHORT_NAME,
+        "definition": SNAPSHOT,            # Table 3 / "at initiation" values are from the hour before vasopressin
         "table1": build_table1(baseline),
         "table2": build_table2(baseline),
         "table3": build_table3(vaso_init, prehour),
@@ -1038,6 +1066,12 @@ def main():
     write_cohort_tables(coh_raw, feat_raw)
 
     write_readme()
+
+    import json as _json
+    _mk = OUTPUT_DIR / "definitions.json"
+    _cur = _json.loads(_mk.read_text(encoding="utf-8")) if _mk.exists() else {}
+    _cur["initiation_snapshot"] = SNAPSHOT
+    _mk.write_text(_json.dumps(_cur, indent=2), encoding="utf-8")
 
     print(f"\nDone. Outputs in {OUTPUT_DIR}:")
     for f in sorted(OUTPUT_DIR.iterdir()):
